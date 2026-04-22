@@ -26,6 +26,8 @@ add_executable(
         tracers/tracers.hpp
         utils/few_modes_ft.cpp
         utils/few_modes_ft.hpp
+	self_gravity/self_gravity.cpp
+	self_gravity/self_gravity_driver.cpp
 )
 
 add_subdirectory(pgen)

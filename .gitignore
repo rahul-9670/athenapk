@@ -41,3 +41,14 @@ Testing
 # generate_cluster_input.ipynb files
 inputs/cluster/generate_cluster_input.ipynb
 inputs/cluster/my_cluster.input
+
+# Run directories (scratch output) — added during self-gravity port work
+amr_adap_test/
+amr_test/
+be_test/
+sg_test/
+
+# Run artifacts not already covered
+*.hst
+*.rhdf
+*.log

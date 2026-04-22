@@ -26,6 +26,8 @@
 #include "glmmhd/glmmhd.hpp"
 #include "hydro.hpp"
 #include "hydro_driver.hpp"
+#include "../self_gravity/self_gravity.hpp"
+#include "../pgen/pgen.hpp"
 
 using namespace parthenon::driver::prelude;
 
@@ -536,36 +538,55 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
         mu1.get(), integrator->gam0[stage - 1], integrator->gam1[stage - 1],
         integrator->beta[stage - 1] * integrator->dt);
 
-    // Add non-operator split source terms.
-    // Note: Directly update the "cons" variables of mu0 based on the "prim" variables
-    // of mu0 as the "cons" variables have already been updated in this stage from the
-    // fluxes in the previous step.
+    // Add non-operator split source terms (cooling, MHD, problem-defined).
     auto source_unsplit = tl.AddTask(update, AddUnsplitSources, mu0.get(), tm,
                                      integrator->beta[stage - 1] * integrator->dt);
+    // BE collapse barotropic cooling (only active if problem_id = collapse_be)
+    auto after_cooling = source_unsplit;
+    {
+      auto hydro_pkg = pmesh->packages.Get("Hydro");
+      if (hydro_pkg->AllParams().hasKey("collapse_be_rhocrit")) {
+        after_cooling = tl.AddTask(source_unsplit, collapse_be::ApplyBarotropicCooling,
+                                   mu0.get(), tm,
+                                   integrator->beta[stage - 1] * integrator->dt);
+      }
+    }
+    // Then change the next task's dependency from source_unsplit to after_cooling
 
-    auto source_split_first_order = source_unsplit;
+    auto source_split_first_order = after_cooling;
 
     if (stage == integrator->nstages) {
-      // Add final Strang split source terms, i.e., a dt/2 update
-      // IMPORTANT: The tasks should work using `cons` variables as input as in the
-      // final step, `prim` are not updated yet from the flux calculation.
       auto source_split_strang_final =
           tl.AddTask(source_unsplit, AddSplitSourcesStrang, mu0.get(), tm);
-
-      // Add operator split source terms at first order, i.e., full dt update
-      // after all stages of the integration.
-      // Not recommended for but allows easy "reset" of variable for some
-      // problem types, see random blasts.
       source_split_first_order =
           tl.AddTask(source_split_strang_final, AddSplitSourcesFirstOrder, mu0.get(), tm);
     }
 
-    // Update ghost cells (local and non local), prolongate and apply bound cond.
-    // TODO(someone) experiment with split (local/nonlocal) comms with respect to
-    // performance for various tests (static, amr, block sizes) and then decide on the
-    // best impl. Go with default call (split local/nonlocal) for now.
     parthenon::AddBoundaryExchangeTasks(source_split_first_order | start_bnd, tl, mu0,
                                         pmesh->multilevel);
+  }
+  // --- END of single_tasklist_per_pack_region loop ---
+
+  // ------------------------------------------------------------------
+  // Self-gravity: solve Poisson and apply gravity on the final stage only.
+  // Must come BEFORE the boundary exchange above has cleared fluxes...
+  // actually, fluxes are held in mu0 and not cleared by the boundary exchange,
+  // so ordering is fine as long as we do this before the NEXT stage's calc_flux.
+  // ------------------------------------------------------------------
+  auto self_gravity_pkg = pmesh->packages.AllPackages().count("self_gravity") > 0
+                              ? pmesh->packages.Get("self_gravity")
+                              : nullptr;
+  if (stage == integrator->nstages && self_gravity_pkg != nullptr) {
+    // Solve Poisson: this adds its own TaskRegion with num_partitions task lists.
+    SelfGravity::SolvePoisson(tc, pmesh);
+
+    // Apply gravitational source term per partition.
+    TaskRegion &sg_source_region = tc.AddRegion(num_partitions);
+    for (int i = 0; i < num_partitions; i++) {
+      auto &tl = sg_source_region[i];
+      auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
+      tl.AddTask(none, SelfGravity::ApplyGravitySource, mu0.get(), tm, integrator->dt);
+    }
   }
 
   TaskRegion &single_tasklist_per_pack_region_3 = tc.AddRegion(num_partitions);

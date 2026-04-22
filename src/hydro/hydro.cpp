@@ -37,6 +37,7 @@
 #include "rsolvers/rsolvers.hpp"
 #include "srcterms/tabular_cooling.hpp"
 #include "utils/error_checking.hpp"
+#include "../self_gravity/self_gravity.hpp"
 
 using namespace parthenon::package::prelude;
 
@@ -56,6 +57,9 @@ parthenon::Packages_t ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
   parthenon::Packages_t packages;
   packages.Add(Hydro::Initialize(pin.get()));
   packages.Add(Tracers::Initialize(pin.get()));
+  if (pin->GetOrAddBoolean("physics", "self_gravity", false)) {
+    packages.Add(SelfGravity::Initialize(pin.get()));
+  }
   return packages;
 }
 

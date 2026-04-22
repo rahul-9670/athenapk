@@ -28,6 +28,13 @@ void UserWorkAfterLoop(Mesh *mesh, parthenon::ParameterInput *pin,
 void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
 } // namespace linear_wave_mhd
 
+namespace collapse_be {
+void ProblemGenerator(parthenon::MeshBlock *pmb, parthenon::ParameterInput *pin);
+parthenon::TaskStatus ApplyBarotropicCooling(parthenon::MeshData<parthenon::Real> *md,
+                                              const parthenon::SimTime &tm,
+                                              const parthenon::Real dt);
+} // namespace collapse_be
+
 namespace cpaw {
 using namespace parthenon::driver::prelude;
 
@@ -121,6 +128,12 @@ using namespace parthenon::driver::prelude;
 
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
 } // namespace sod
+
+namespace jeans {
+using namespace parthenon::driver::prelude;
+
+void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+} // namespace jeans
 
 namespace turbulence {
 using namespace parthenon::driver::prelude;

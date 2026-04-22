@@ -1,0 +1,320 @@
+//========================================================================================
+// AthenaPK - Self-gravity package
+// Ported from Artemis (LANL, BSD-licensed).
+// Licensed under the BSD 3-Clause License (the "LICENSE").
+//========================================================================================
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <bvals/boundary_conditions_generic.hpp>
+#include <coordinates/coordinates.hpp>
+#include <parthenon/driver.hpp>
+#include <parthenon/package.hpp>
+#include <solvers/bicgstab_solver.hpp>
+#include <solvers/mg_solver.hpp>
+#include <solvers/solver_utils.hpp>
+
+#include "../main.hpp"          // for IDN
+#include "self_gravity.hpp"
+#include "poisson_equation.hpp"
+#include <solvers/internal_prolongation.hpp>
+
+namespace SelfGravity {
+
+using namespace parthenon::BoundaryFunction;
+using namespace parthenon::package::prelude;
+
+// Selector for BC enrollment — matches any variable in the "grav" namespace.
+struct any_grav : public parthenon::variable_names::base_t<true> {
+  template <class... Ts>
+  KOKKOS_INLINE_FUNCTION any_grav(Ts &&...args)
+      : base_t<true>(std::forward<Ts>(args)...) {}
+  static std::string name() { return "grav[.].*"; }
+};
+
+// Zero Dirichlet (phi = 0 on face): FixedFace BC enforces phi(face) = 0 via
+// linear extrapolation into ghosts. Constant = 0 here.
+template <parthenon::CoordinateDirection DIR, BCSide SIDE>
+auto DirZ() {
+  return [](std::shared_ptr<MeshBlockData<Real>> &rc, bool coarse) -> void {
+    GenericBC<DIR, SIDE, BCType::FixedFace, any_grav>(rc, coarse, 0.0);
+  };
+}
+
+// Neumann (dphi/dn = 0): just copy from interior, which is Outflow semantics.
+template <parthenon::CoordinateDirection DIR, BCSide SIDE>
+auto NeuZ() {
+  return [](std::shared_ptr<MeshBlockData<Real>> &rc, bool coarse) -> void {
+    GenericBC<DIR, SIDE, BCType::Outflow, any_grav>(rc, coarse, 0.0);
+  };
+}
+
+std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
+  auto pkg = std::make_shared<StateDescriptor>("self_gravity");
+  const std::string block_name = "self_gravity";
+
+  // --- Coordinate system check -----------------------------------------------
+  // This port supports Cartesian only. AthenaPK currently only supports
+  // UniformCartesian anyway, so we just assert and move on.
+  // (Parthenon's Coordinates_t is a typedef; check it here at runtime.)
+  PARTHENON_REQUIRE(
+      typeid(parthenon::Coordinates_t) == typeid(parthenon::UniformCartesian),
+      "Self-gravity currently only supports UniformCartesian coordinates.");
+
+  // --- Multigrid required ----------------------------------------------------
+  const bool mg_enabled =
+      pin->GetOrAddBoolean("parthenon/mesh", "multigrid", false);
+  PARTHENON_REQUIRE(
+      mg_enabled,
+      "Self-gravity requires parthenon/mesh/multigrid = true. Set it in your input file.");
+
+  // --- 4 pi G ----------------------------------------------------------------
+  // v1: require units_override. Integrating with AthenaPK's Units class is a
+  // follow-on. For G in code units, user sets four_pi_G explicitly.
+  const bool units_override =
+      pin->GetOrAddBoolean(block_name, "units_override", true);
+  PARTHENON_REQUIRE(units_override,
+                    "self_gravity/units_override must be true in v1. "
+                    "Compute 4*pi*G in your code units and set four_pi_G directly.");
+  const Real four_pi_G = pin->GetOrAddReal(block_name, "four_pi_G", 1.0);
+  pkg->AddParam("four_pi_G", four_pi_G);
+
+  // --- Jeans swindle ---------------------------------------------------------
+  auto is_periodic = [&](const std::string &face) {
+    return pin->GetOrAddString("parthenon/mesh", face, "outflow") == "periodic";
+  };
+  const bool fully_periodic =
+      is_periodic("ix1_bc") && is_periodic("ox1_bc") &&
+      is_periodic("ix2_bc") && is_periodic("ox2_bc") &&
+      is_periodic("ix3_bc") && is_periodic("ox3_bc");
+  const bool use_swindle =
+      pin->GetOrAddBoolean(block_name, "use_swindle", fully_periodic);
+  PARTHENON_REQUIRE(!fully_periodic || use_swindle,
+                    "Fully periodic mesh BCs require Jeans swindle (use_swindle = true).");
+  if (use_swindle && !fully_periodic) {
+    PARTHENON_WARN("Jeans swindle enabled on non-fully-periodic mesh. Proceed carefully.");
+  }
+  pkg->AddParam("use_swindle", use_swindle);
+
+  // --- phi boundary condition enrollment -------------------------------------
+  auto valid_bc = [](const std::string &s) {
+    return s == "default" || s == "zero" || s == "neumann";
+  };
+  const std::string b_ix1 = pin->GetOrAddString(block_name, "ix1_bc", "default");
+  const std::string b_ox1 = pin->GetOrAddString(block_name, "ox1_bc", "default");
+  const std::string b_ix2 = pin->GetOrAddString(block_name, "ix2_bc", "default");
+  const std::string b_ox2 = pin->GetOrAddString(block_name, "ox2_bc", "default");
+  const std::string b_ix3 = pin->GetOrAddString(block_name, "ix3_bc", "default");
+  const std::string b_ox3 = pin->GetOrAddString(block_name, "ox3_bc", "default");
+  PARTHENON_REQUIRE(valid_bc(b_ix1), "Invalid self_gravity/ix1_bc: " + b_ix1);
+  PARTHENON_REQUIRE(valid_bc(b_ox1), "Invalid self_gravity/ox1_bc: " + b_ox1);
+  PARTHENON_REQUIRE(valid_bc(b_ix2), "Invalid self_gravity/ix2_bc: " + b_ix2);
+  PARTHENON_REQUIRE(valid_bc(b_ox2), "Invalid self_gravity/ox2_bc: " + b_ox2);
+  PARTHENON_REQUIRE(valid_bc(b_ix3), "Invalid self_gravity/ix3_bc: " + b_ix3);
+  PARTHENON_REQUIRE(valid_bc(b_ox3), "Invalid self_gravity/ox3_bc: " + b_ox3);
+
+  using BF = parthenon::BoundaryFace;
+  constexpr auto LL = BCSide::Inner;
+  constexpr auto RR = BCSide::Outer;
+  if (b_ix1 == "zero") pkg->UserBoundaryFunctions[BF::inner_x1].push_back(DirZ<parthenon::X1DIR, LL>());
+  if (b_ox1 == "zero") pkg->UserBoundaryFunctions[BF::outer_x1].push_back(DirZ<parthenon::X1DIR, RR>());
+  if (b_ix2 == "zero") pkg->UserBoundaryFunctions[BF::inner_x2].push_back(DirZ<parthenon::X2DIR, LL>());
+  if (b_ox2 == "zero") pkg->UserBoundaryFunctions[BF::outer_x2].push_back(DirZ<parthenon::X2DIR, RR>());
+  if (b_ix3 == "zero") pkg->UserBoundaryFunctions[BF::inner_x3].push_back(DirZ<parthenon::X3DIR, LL>());
+  if (b_ox3 == "zero") pkg->UserBoundaryFunctions[BF::outer_x3].push_back(DirZ<parthenon::X3DIR, RR>());
+  if (b_ix1 == "neumann") pkg->UserBoundaryFunctions[BF::inner_x1].push_back(NeuZ<parthenon::X1DIR, LL>());
+  if (b_ox1 == "neumann") pkg->UserBoundaryFunctions[BF::outer_x1].push_back(NeuZ<parthenon::X1DIR, RR>());
+  if (b_ix2 == "neumann") pkg->UserBoundaryFunctions[BF::inner_x2].push_back(NeuZ<parthenon::X2DIR, LL>());
+  if (b_ox2 == "neumann") pkg->UserBoundaryFunctions[BF::outer_x2].push_back(NeuZ<parthenon::X2DIR, RR>());
+  if (b_ix3 == "neumann") pkg->UserBoundaryFunctions[BF::inner_x3].push_back(NeuZ<parthenon::X3DIR, LL>());
+  if (b_ox3 == "neumann") pkg->UserBoundaryFunctions[BF::outer_x3].push_back(NeuZ<parthenon::X3DIR, RR>());
+
+  // --- Fields ----------------------------------------------------------------
+  // phi: solution variable. Needs ghost fill, fluxes, GMG prolong/restrict for AMR MG.
+  {
+    std::vector<parthenon::MetadataFlag> flags{
+        Metadata::Cell,       Metadata::Independent,   Metadata::FillGhost,
+        Metadata::WithFluxes, Metadata::GMGRestrict,   Metadata::GMGProlongate};
+    Metadata m(flags);
+    // GOTCHA: phi MG prolongation operator. Parthenon provides
+    // ProlongateSharedLinear / RestrictAverage as safe defaults for elliptic problems.
+    // Artemis uses "ArtemisUtils::EnrollArtemisRefinementOps". We don't have that —
+    // use Parthenon's built-ins. This is one of the most likely sources of AMR bugs.
+    m.RegisterRefinementOps<parthenon::refinement_ops::ProlongateSharedLinear,
+                            parthenon::refinement_ops::RestrictAverage>();
+    pkg->AddField<grav::phi>(m);
+  }
+  // rhs: source. Derived, OneCopy, needs ghost fill so solver reductions see ghost cells.
+  {
+    Metadata m({Metadata::Cell, Metadata::Derived, Metadata::OneCopy,
+                Metadata::FillGhost});
+    m.RegisterRefinementOps<parthenon::refinement_ops::ProlongateSharedLinear,
+                            parthenon::refinement_ops::RestrictAverage>();
+    pkg->AddField<grav::rhs>(m);
+  }
+
+  // --- FillDerived: compute rhs from density on every timestep ---------------
+  pkg->FillDerivedMesh = FillPoissonRHS;
+
+  // --- Solver construction ---------------------------------------------------
+  using PoissEq = PoissonEquation<grav::phi>;
+  using prolongator_t = parthenon::solvers::ProlongationBlockInteriorZeroDirichlet;
+  using preconditioner_t = parthenon::solvers::MGSolver<PoissEq, prolongator_t>;
+  const std::string solver_params_block = block_name + "/solver_params";
+  auto psolver =
+      std::make_shared<parthenon::solvers::BiCGSTABSolver<PoissEq, preconditioner_t>>(
+          /*container_base=*/"base",
+          /*container_u=*/"phi",
+          /*container_rhs=*/"rhs",
+          pin, solver_params_block, PoissEq(pin, block_name));
+  pkg->AddParam("solver_pointer",
+              std::static_pointer_cast<parthenon::solvers::SolverBase>(psolver));
+
+  return pkg;
+}
+
+// FillPoissonRHS: assemble rhs = 4 pi G (rho - rho_mean) from gas density.
+// Runs over ENTIRE (including ghosts) so solver sees consistent ghost values.
+void FillPoissonRHS(MeshData<Real> *md) {
+  auto pm = md->GetParentPointer();
+  auto &grav_pkg = pm->packages.Get("self_gravity");
+  const bool use_swindle = grav_pkg->Param<bool>("use_swindle");
+  const Real four_pi_G = grav_pkg->Param<Real>("four_pi_G");
+
+  const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
+  auto &resolved = pm->resolved_packages;
+  auto desc_rhs = parthenon::MakePackDescriptor<grav::rhs>(resolved.get());
+  auto rhs_pack = desc_rhs.GetPack(md);
+
+  IndexRange ib = md->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBoundsK(IndexDomain::interior);
+  IndexRange ibe = md->GetBoundsI(IndexDomain::entire);
+  IndexRange jbe = md->GetBoundsJ(IndexDomain::entire);
+  IndexRange kbe = md->GetBoundsK(IndexDomain::entire);
+  const int nblocks = md->NumBlocks();
+
+  // --- Mean density (for Jeans swindle) via par_reduce + MPI Allreduce -------
+  Real grav_mean_rho = 0.0;
+  if (use_swindle) {
+    Real total_mass = 0.0, total_volume = 0.0;
+    parthenon::par_reduce(
+        parthenon::loop_pattern_mdrange_tag, "SG::TotalMass",
+        parthenon::DevExecSpace(), 0, nblocks - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i,
+                      Real &lmass, Real &lvol) {
+          const auto &coords = prim_pack.GetCoords(b);
+          const Real vv = coords.CellVolume(k, j, i);
+          lvol += vv;
+          lmass += prim_pack(b, IDN, k, j, i) * vv;
+        },
+        Kokkos::Sum<Real>(total_mass), Kokkos::Sum<Real>(total_volume));
+    Kokkos::fence();
+#ifdef MPI_PARALLEL
+    Real buf[2] = {total_mass, total_volume};
+    PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, 2, MPI_PARTHENON_REAL,
+                                      MPI_SUM, MPI_COMM_WORLD));
+    total_mass = buf[0];
+    total_volume = buf[1];
+#endif
+    grav_mean_rho = total_mass / total_volume;
+  }
+
+  // --- Fill rhs over entire domain (incl. ghosts) ----------------------------
+  parthenon::par_for(
+      DEFAULT_LOOP_PATTERN, "SG::SetRHS", parthenon::DevExecSpace(), 0, nblocks - 1,
+      kbe.s, kbe.e, jbe.s, jbe.e, ibe.s, ibe.e,
+      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+        const Real rho = prim_pack(b, IDN, k, j, i);
+        rhs_pack(b, te, grav::rhs(), k, j, i) = four_pi_G * (rho - grav_mean_rho);
+      });
+}
+
+// ApplyGravitySource: momentum += rho * g * dt, energy += flux-weighted work.
+// Flux-weighted energy (Artemis style) uses the hydro mass flux across each face
+// to compute gravitational work. Requires hydro fluxes still be in memory.
+TaskStatus ApplyGravitySource(MeshData<Real> *md, const parthenon::SimTime &tm,
+                              const Real beta_dt) {
+  auto pm = md->GetParentPointer();
+
+  // Pack hydro cons + prim + phi, and cons-with-fluxes for mass flux access.
+  const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
+  const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
+  auto &resolved = pm->resolved_packages;
+  auto desc_phi = parthenon::MakePackDescriptor<grav::phi>(resolved.get());
+  auto phi_pack = desc_phi.GetPack(md);
+
+  // Mass flux: "cons" pack with fluxes (density flux = component IDN).
+  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
+  auto cons_flx_pack = md->PackVariablesAndFluxes(flags_ind);
+
+  IndexRange ib = md->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBoundsK(IndexDomain::interior);
+  const int nblocks = md->NumBlocks();
+  const int ndim = pm->ndim;
+  const bool multi_d = (ndim > 1);
+  const bool three_d = (ndim > 2);
+
+  parthenon::par_for(
+      DEFAULT_LOOP_PATTERN, "SG::ApplyGravity", parthenon::DevExecSpace(),
+      0, nblocks - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+        auto &cons = cons_pack(b);
+        auto &cons_flx = cons_flx_pack(b);
+        const auto &prim = prim_pack(b);
+        const auto &coords = cons_pack.GetCoords(b);
+
+        const Real dx1 = coords.Dxc<1>(k, j, i);
+        const Real dx2 = multi_d ? coords.Dxc<2>(k, j, i) : 1.0;
+        const Real dx3 = three_d ? coords.Dxc<3>(k, j, i) : 1.0;
+
+        const Real hdtodx1 = 0.5 * beta_dt / dx1;
+        const Real hdtodx2 = multi_d ? 0.5 * beta_dt / dx2 : 0.0;
+        const Real hdtodx3 = three_d ? 0.5 * beta_dt / dx3 : 0.0;
+
+        // phi differences (Artemis convention: dpl = -(phi_c - phi_{c-1}))
+        const Real phic = phi_pack(b, te, grav::phi(), k, j, i);
+        const Real dpl1 = -(phic - phi_pack(b, te, grav::phi(), k, j, i - 1));
+        const Real dpr1 = -(phi_pack(b, te, grav::phi(), k, j, i + 1) - phic);
+        const Real dpl2 = multi_d
+            ? -(phic - phi_pack(b, te, grav::phi(), k, j - 1, i))
+            : 0.0;
+        const Real dpr2 = multi_d
+            ? -(phi_pack(b, te, grav::phi(), k, j + 1, i) - phic)
+            : 0.0;
+        const Real dpl3 = three_d
+            ? -(phic - phi_pack(b, te, grav::phi(), k - 1, j, i))
+            : 0.0;
+        const Real dpr3 = three_d
+            ? -(phi_pack(b, te, grav::phi(), k + 1, j, i) - phic)
+            : 0.0;
+
+        // Momentum update: rho * g * dt, centered difference of phi.
+        const Real rho = prim(IDN, k, j, i);
+        cons(IM1, k, j, i) += rho * hdtodx1 * (dpl1 + dpr1);
+        if (multi_d) cons(IM2, k, j, i) += rho * hdtodx2 * (dpl2 + dpr2);
+        if (three_d) cons(IM3, k, j, i) += rho * hdtodx3 * (dpl3 + dpr3);
+
+        // Energy update: flux-weighted work.
+        // mass_flux(face) = cons.flux(IVn, IDN, k, j, i).
+        // Work done by gravity = sum over faces of (mass_flux * dphi/face) * (0.5 dt / dx).
+        Real de = hdtodx1 * (cons_flx.flux(X1DIR, IDN, k, j, i)     * dpl1 +
+                             cons_flx.flux(X1DIR, IDN, k, j, i + 1) * dpr1);
+        if (multi_d) {
+          de += hdtodx2 * (cons_flx.flux(X2DIR, IDN, k, j,     i) * dpl2 +
+                           cons_flx.flux(X2DIR, IDN, k, j + 1, i) * dpr2);
+        }
+        if (three_d) {
+          de += hdtodx3 * (cons_flx.flux(X3DIR, IDN, k,     j, i) * dpl3 +
+                           cons_flx.flux(X3DIR, IDN, k + 1, j, i) * dpr3);
+        }
+        cons(IEN, k, j, i) += de;
+      });
+
+  return TaskStatus::complete;
+}
+
+} // namespace SelfGravity

@@ -1,0 +1,93 @@
+<comment>
+problem = Bonnor-Ebert sphere collapse, hydro, zero-Dirichlet gravity BCs
+
+<job>
+problem_id = collapse_be
+
+<problem/collapse_be>
+mass        = 6.0
+temperature = 10.0
+f           = 5.0
+rhocrit     = 1.0e-13
+amp         = 0.0
+omegatff    = 0.02
+
+<parthenon/mesh>
+refinement = adaptive
+numlevel   = 6
+multigrid  = true
+
+# Large box: 4x sphere radius in each direction
+# rc = 6.45, so box from -26 to +26 gives 4x margin
+nx1    = 64
+x1min  = -26.0
+x1max  =  26.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 64
+x2min  = -26.0
+x2max  =  26.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 64
+x3min  = -26.0
+x3max  =  26.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<parthenon/meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<parthenon/time>
+integrator = vl2
+cfl        = 0.3
+tlim       = 1.5
+nlim       = -1
+
+<hydro>
+fluid          = euler
+eos            = adiabatic
+gamma          = 1.4
+riemann        = hllc
+reconstruction = plm
+
+<refinement>
+type = maxdensity
+maxdensity_refine_above = 10.0
+maxdensity_deref_below  = 5.0
+
+<physics>
+self_gravity = true
+
+<self_gravity>
+units_override = true
+four_pi_G      = 1.0
+# Zero-Dirichlet on all gravity faces (outflow hydro BCs, isolated gravity)
+use_swindle    = false
+ix1_bc         = zero
+ox1_bc         = zero
+ix2_bc         = zero
+ox2_bc         = zero
+ix3_bc         = zero
+ox3_bc         = zero
+
+<self_gravity/solver_params>
+max_iterations               = 200
+residual_tolerance           = 1.0e-10
+absolute_residual_tolerance  = 1.0e-10
+relative_residual            = true
+relative_residual_tolerance  = 1.0e-6
+preconditioner               = Multigrid
+
+<parthenon/output0>
+file_type = hdf5
+dt        = 0.02
+variables = prim, grav.phi, grav.rhs
+
+<parthenon/output1>
+file_type = hst
+dt        = 0.001
