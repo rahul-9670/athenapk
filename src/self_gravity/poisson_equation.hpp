@@ -40,7 +40,7 @@ class PoissonEquation {
     auto flux_res = tl.AddTask(depends_on, CalculateFluxes, md_in);
     // Flux correction at coarse-fine boundaries, but NOT inside MG composite grids
     // (MG has its own coarse-fine handling).
-    if (!(md_mat->grid.type() == parthenon::GridType::two_level_composite)) {
+    if (!(md_mat->grid.type == parthenon::GridType::two_level_composite)) {
       auto start_flxcor =
           tl.AddTask(flux_res, parthenon::StartReceiveFluxCorrections, md_in);
       auto send_flxcor =
