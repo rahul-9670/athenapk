@@ -21,6 +21,7 @@ using namespace parthenon::driver::prelude;
 
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   auto hydro_pkg = pmb->packages.Get("Hydro");
+  const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
   const Real gam = pin->GetReal("hydro", "gamma");
   const Real gm1 = gam - 1.0;
 
@@ -30,6 +31,7 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   const Real amp  = pin->GetOrAddReal("problem/jeans", "amp",  1.0e-4);
   // Wavenumber in units of 2*pi / Lx (so n_wave=1 means wavelength = Lx)
   const int  nwave = pin->GetOrAddInteger("problem/jeans", "nwave", 1);
+  const Real B0z = mhd ? pin->GetOrAddReal("problem/jeans", "B0z", 0.0) : 0.0;
 
   // Uniform pressure consistent with given rho0 and cs (adiabatic):
   //   c_s^2 = gamma * p / rho  ->  p = rho * c_s^2 / gamma
@@ -66,6 +68,13 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
         u(IM2, k, j, i) = rho * v2;
         u(IM3, k, j, i) = rho * v3;
         u(IEN, k, j, i) = p / gm1 + 0.5 * rho * (v1*v1 + v2*v2 + v3*v3);
+        if (mhd) {
+          u(IB1, k, j, i) = 0.0;
+          u(IB2, k, j, i) = 0.0;
+          u(IB3, k, j, i) = B0z;
+          u(IPS, k, j, i) = 0.0;
+          u(IEN, k, j, i) += 0.5 * B0z * B0z;  // add B^2/2 to total energy
+        }
       }
     }
   }
