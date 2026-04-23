@@ -93,8 +93,11 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   // Stash params in the hydro package for the cooling function to read.
   // (Only rank 0 prints; all ranks need the params.)
   auto hydro_pkg = pmb->packages.Get("Hydro");
+  const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
+  const Real B0z = mhd ? pin->GetOrAddReal("problem/collapse_be", "B0z", 0.0) : 0.0;
   if (!hydro_pkg->AllParams().hasKey("collapse_be_rhocrit")) {
     hydro_pkg->AddParam("collapse_be_rhocrit", rhocrit_code);
+    hydro_pkg->AddParam("collapse_be_mhd", mhd);            // <-- add this line
     hydro_pkg->AddParam("collapse_be_rc", rc_code);
     hydro_pkg->AddParam("collapse_be_gamma", gam);
   }
@@ -171,6 +174,13 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
         u(IM2, k, j, i) = rho * v2;
         u(IM3, k, j, i) = rho * v3;
         u(IEN, k, j, i) = p * igm1 + 0.5 * rho * (v1*v1 + v2*v2 + v3*v3);
+        if (mhd) {
+          u(IB1, k, j, i) = 0.0;
+          u(IB2, k, j, i) = 0.0;
+          u(IB3, k, j, i) = B0z;
+          u(IPS, k, j, i) = 0.0;
+          u(IEN, k, j, i) += 0.5 * B0z * B0z;
+        }
       }
     }
   }
@@ -194,6 +204,7 @@ TaskStatus ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &
   const Real rhocrit = hydro_pkg->Param<Real>("collapse_be_rhocrit");
   const Real rc = hydro_pkg->Param<Real>("collapse_be_rc");
   const Real gam = hydro_pkg->Param<Real>("collapse_be_gamma");
+  const bool mhd = hydro_pkg->Param<bool>("collapse_be_mhd");
   const Real gm1 = gam - 1.0;
   const Real igm1 = 1.0 / gm1;
   const Real rcsq = rc * rc;
@@ -228,8 +239,12 @@ TaskStatus ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &
         const Real ke = 0.5 / rho * (cons(IM1, k, j, i) * cons(IM1, k, j, i)
                                    + cons(IM2, k, j, i) * cons(IM2, k, j, i)
                                    + cons(IM3, k, j, i) * cons(IM3, k, j, i));
+        const Real me = mhd ? 0.5 * (cons(IB1, k, j, i) * cons(IB1, k, j, i)
+                                   + cons(IB2, k, j, i) * cons(IB2, k, j, i)
+                                   + cons(IB3, k, j, i) * cons(IB3, k, j, i))
+                             : 0.0;
         const Real te = igm1 * rho * std::sqrt(1.0 + std::pow(rho / rhocrit, 2.0 * gm1));
-        cons(IEN, k, j, i) = te + ke;
+        cons(IEN, k, j, i) = te + ke + me;
       });
   return TaskStatus::complete;
 }
