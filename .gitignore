@@ -52,3 +52,4 @@ sg_test/
 *.hst
 *.rhdf
 *.log
+be_jeans_test/
