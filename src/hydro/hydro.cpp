@@ -818,6 +818,12 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                       "refinement/maxdensity_refine_above");
     pkg->AddParam<Real>("refinement/maxdensity_deref_below", deref_below);
     pkg->AddParam<Real>("refinement/maxdensity_refine_above", refine_above);
+  } else if (refine_str == "jeans") {
+    pkg->CheckRefinementBlock = refinement::jeans::Jeans;
+    const auto njeans = pin->GetOrAddReal("refinement", "njeans", 0.0);
+    PARTHENON_REQUIRE(njeans > 0.,
+                      "Make sure to set refinement/njeans > 0 (typically 8-16).");
+    pkg->AddParam<Real>("refinement/njeans", njeans);
   } else if (refine_str == "user") {
     pkg->CheckRefinementBlock = Hydro::ProblemCheckRefinementBlock;
   }
@@ -1346,3 +1352,4 @@ TaskStatus FirstOrderFluxCorrect(MeshData<Real> *u0_data, MeshData<Real> *u1_dat
 }
 
 } // namespace Hydro
+
