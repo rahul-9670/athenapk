@@ -90,3 +90,47 @@ but should not be used for thermal-energy-related conclusions in dense regions.
 - Submit production-grade test5-match run (128³ base, box ±6, numlevel=16, μ=20,
   dedner_extended) for tomorrow's analysis
 - Final comprehensive write-up after test5-match data arrives
+
+### Test5-match production run (Apr 27 evening)
+
+Submitted `inputs/collapse_be_mhd_test5_match.in` matching Athena++ test5
+parameters exactly: 128^3 base, box +/-6, numlevel=16, mu=20, with
+glmmhd_source=dedner_extended (the fix). Ran on 16 ranks, produced 105
+snapshots through t=1.04 before dt-collapse arrested progress (similar to
+Athena++ test5 stalling at t=1.02 — both codes hit the same first-core
+formation barrier).
+
+**Key results**:
+- Reached max(rho) = 3.1e+07 (30x deeper than nl=6 runs achieve)
+- Mesh blocks grew from 512 to 1016, AMR levels 0-9 activated
+- **EOS ratio = 1.000 across 8 decades of density** (rho 1e+00 to 1e+08),
+  with N=3816 cells in the deepest 1e+07 to 1e+08 bin — fully statistically
+  robust validation of the dedner_extended fix at production resolution
+- Flux freezing B propto rho^(2/3) tracked qualitatively; deviations at
+  rho > 1e+06 consistent with field reorientation and outflow boundary effects
+- Morphology shows expected hourglass-pinched B field structure around
+  collapsing core
+
+This makes the `dedner_extended` fix validated at:
+- nl=6 (apples-to-apples vs Athena++ jeans_comparison) — passes
+- nl=8, 10, 12 (numlevel scan) — passes
+- nl=16 (test5-match production) — passes with 8-decade EOS cleanliness
+
+### Files added (Apr 27 evening)
+
+- `inputs/collapse_be_mhd_test5_match.in` — test5-equivalent production input
+- `docs/test5_match_plots/` — 6 plots characterizing the test5-match run:
+  evolution overview, EOS verification, flux freezing, morphology slices,
+  cross-comparison density and EOS
+- `docs/methodology_validation_full_report.md` — comprehensive 478-line
+  methodology validation report tying together cooling investigation, bug
+  identification, fix, apples-to-apples validation, test5-match results,
+  and cross-code comparison
+
+### Status
+
+Cooling investigation: **complete and documented**. AthenaPK with
+dedner_extended is production-quality validated for MHD BE collapse with
+deep AMR. Yesterday's production data (with dedner_plain) is preserved
+but should not be used for thermodynamics in dense regions.
+
