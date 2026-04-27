@@ -53,6 +53,7 @@ eos            = adiabatic
 gamma          = 1.4
 riemann        = hlld
 reconstruction = plm
+glmmhd_source  = dedner_extended
 dfloor         = 1.0e-6
 pfloor         = 1.0e-8
 
