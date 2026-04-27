@@ -40,3 +40,53 @@ Done at uniform grid (no AMR):
   - inputs/collapse_be_mhd_test.in       - laptop MHD BE with density AMR
   - inputs/collapse_be_mhd_jeans_test.in - laptop MHD BE with Jeans AMR (validation)
   - inputs/collapse_be_mhd_comparison.in - cluster comparison vs Athena++ (uniform)
+
+---
+
+## End of Apr 27, 2026
+
+### Cooling investigation: GLM-MHD over-heating identified and resolved
+
+**Bug**: First MHD BE collapse production run (numlevel=12, dedner_plain default)
+showed 30× over-heating in cells at ρ ∈ [10⁴, 10⁵] vs barotropic target,
+while Athena++ CT-MHD reference matched target to <1%.
+
+**Investigation** (rejected hypotheses):
+- Cooling math error — verified via single-cell `par_reduce` instrumentation
+  that AFTER cooling, ratio = 1.000 always
+- Cons → prim refresh timing — verified task graph order: flux → update →
+  source_unsplit → ApplyBarotropicCooling → FillDerived
+- VL2 stage averaging — single-cell trace shows ratio = 1.000 throughout 19
+  quiescent cycles, no stage artifact
+- Riemann/reconstruction — both codes use HLLD + PLM, same setup
+- Pure-hydro AthenaPK matches Athena++ to 1% — issue specific to GLM-MHD
+
+**Cause identified**: Default `glmmhd_source = dedner_plain` in AthenaPK only
+damps ψ scalar (`psi *= exp(-alpha c_h dt/dx)`), without corresponding
+non-conservative momentum/energy correction. At deep AMR on aggressive collapse,
+divB errors accumulate and ψ-damping silently discards energy → spurious heat.
+
+**Fix**: One-line input change. `glmmhd_source = dedner_extended` adds
+`cons(IM_i) -= dt·divB·B_i` and `cons(IEN) -= 0.5·dt·(B·∇ψ)`.
+
+**Validation**: Apples-to-apples comparison vs Athena++ jeans_comparison at
+matched parameters (μ=20, box ±20, 32³ base, nl=6, tlim=1.5) shows agreement
+to <0.1% in bulk EOS, identical B ∝ ρ^(2/3) flux freezing, peak density
+within 4% (APK=4.01e+05, APP=4.16e+05). See
+[docs/cooling_investigation_report.md](docs/cooling_investigation_report.md)
+for full investigation timeline and embedded plots.
+
+**Production input updated**: `glmmhd_source = dedner_extended` now in
+`collapse_be_mhd_production.in`. Yesterday's production data is still valid
+for kinematic flux-freezing analysis (which doesn't depend on thermodynamics)
+but should not be used for thermal-energy-related conclusions in dense regions.
+
+### Files added
+- `inputs/collapse_be_mhd_match_athena.in` — apples-to-apples validation input
+- `docs/cooling_investigation_report.md` — detailed investigation report
+- `docs/cooling_investigation_plots/` — 17 plots covering production run, scan, validation
+
+### Next steps
+- Submit production-grade test5-match run (128³ base, box ±6, numlevel=16, μ=20,
+  dedner_extended) for tomorrow's analysis
+- Final comprehensive write-up after test5-match data arrives
