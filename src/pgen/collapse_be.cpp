@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <fstream>
 #include <string>
 
 #include <parthenon/package.hpp>
@@ -97,9 +98,42 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   const Real B0z = mhd ? pin->GetOrAddReal("problem/collapse_be", "B0z", 0.0) : 0.0;
   if (!hydro_pkg->AllParams().hasKey("collapse_be_rhocrit")) {
     hydro_pkg->AddParam("collapse_be_rhocrit", rhocrit_code);
-    hydro_pkg->AddParam("collapse_be_mhd", mhd);            // <-- add this line
+    hydro_pkg->AddParam("collapse_be_mhd", mhd);
     hydro_pkg->AddParam("collapse_be_rc", rc_code);
     hydro_pkg->AddParam("collapse_be_gamma", gam);
+
+    // === Unit conversion factors to cgs ===
+    // Multiply a code-unit value by these to obtain cgs.
+    const Real code_length_cgs   = l0;
+    const Real code_time_cgs     = t0;
+    const Real code_mass_cgs     = m0;
+    const Real code_density_cgs  = rho0;
+    const Real code_velocity_cgs = l0 / t0;
+    const Real code_energy_cgs   = m0 * (l0/t0) * (l0/t0);
+    const Real code_bfield_cgs   = std::sqrt(rho0) * (l0 / t0);
+
+    hydro_pkg->AddParam("units/code_length_cgs",   code_length_cgs);
+    hydro_pkg->AddParam("units/code_time_cgs",     code_time_cgs);
+    hydro_pkg->AddParam("units/code_mass_cgs",     code_mass_cgs);
+    hydro_pkg->AddParam("units/code_density_cgs",  code_density_cgs);
+    hydro_pkg->AddParam("units/code_velocity_cgs", code_velocity_cgs);
+    hydro_pkg->AddParam("units/code_energy_cgs",   code_energy_cgs);
+    hydro_pkg->AddParam("units/code_bfield_cgs",   code_bfield_cgs);
+
+    // Sidecar JSON dump (rank 0 only; once per run).
+    if (parthenon::Globals::my_rank == 0) {
+      std::ofstream js("units.json");
+      js.precision(12);
+      js << "{\n"
+         << "  \"code_length_cgs\":   " << code_length_cgs   << ",\n"
+         << "  \"code_time_cgs\":     " << code_time_cgs     << ",\n"
+         << "  \"code_mass_cgs\":     " << code_mass_cgs     << ",\n"
+         << "  \"code_density_cgs\":  " << code_density_cgs  << ",\n"
+         << "  \"code_velocity_cgs\": " << code_velocity_cgs << ",\n"
+         << "  \"code_energy_cgs\":   " << code_energy_cgs   << ",\n"
+         << "  \"code_bfield_cgs\":   " << code_bfield_cgs   << "\n"
+         << "}\n";
+    }
   }
 
   // Log (rank 0 only)
