@@ -11,10 +11,13 @@
 //         ambient density = BE profile value at r = rc (pressure-continuous).
 
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <iostream>
 #include <fstream>
+#include <iostream>
+#include <random>
 #include <string>
+#include <vector>
 
 #include <parthenon/package.hpp>
 
@@ -215,6 +218,194 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
           u(IPS, k, j, i) = 0.0;
           u(IEN, k, j, i) += 0.5 * B0z * B0z;
         }
+      }
+    }
+  }
+  // ============================================================================
+  // Initial-only turbulent velocity field (gated by turb_mach > 0).
+  // Adds a random divergence-free + compressive velocity perturbation on top
+  // of the deterministic IC above. Mass-weighted RMS Mach in the chosen region
+  // is rescaled to match `turb_mach`. Mean velocity is subtracted so the
+  // cloud doesn't translate as a unit.
+  // ============================================================================
+  const Real turb_mach = pin->GetOrAddReal("problem/collapse_be", "turb_mach", 0.0);
+  if (turb_mach > 0.0) {
+    const int   k_min   = pin->GetOrAddInteger("problem/collapse_be", "turb_kmin", 2);
+    const int   k_max   = pin->GetOrAddInteger("problem/collapse_be", "turb_kmax", 6);
+    const int   nmodes  = pin->GetOrAddInteger("problem/collapse_be", "turb_nmodes", 64);
+    const Real  zeta    = pin->GetOrAddReal("problem/collapse_be", "turb_zeta", 0.5);
+    const Real  alpha_s = pin->GetOrAddReal("problem/collapse_be", "turb_alpha", 2.0);
+    const std::string region = pin->GetOrAddString(
+        "problem/collapse_be", "turb_region", std::string("sphere"));
+    const uint32_t seed = static_cast<uint32_t>(
+        pin->GetOrAddInteger("problem/collapse_be", "turb_seed", 12345));
+
+    const Real x1min_ = pin->GetReal("parthenon/mesh", "x1min");
+    const Real x1max_ = pin->GetReal("parthenon/mesh", "x1max");
+    const Real Lbox  = x1max_ - x1min_;
+    const Real two_pi_over_L = 2.0 * M_PI / Lbox;
+
+    // Build the SAME mode list on every rank (deterministic with seed).
+    std::mt19937 mrng(seed);
+    std::uniform_real_distribution<Real> uphase(0.0, 2.0 * M_PI);
+    std::uniform_real_distribution<Real> ucos(-1.0, 1.0);
+    std::uniform_real_distribution<Real> uang(0.0, 2.0 * M_PI);
+    std::uniform_real_distribution<Real> ukmag(static_cast<Real>(k_min),
+                                               static_cast<Real>(k_max));
+
+    std::vector<std::array<Real,3>> k_vec(nmodes), phase(nmodes),
+                                     eps_sol(nmodes), eps_comp(nmodes);
+    std::vector<Real> t_amp(nmodes);
+
+    for (int m = 0; m < nmodes; ++m) {
+      const Real kmag = ukmag(mrng);
+      const Real cos_t = ucos(mrng);
+      const Real sin_t = std::sqrt(std::max(0.0, 1.0 - cos_t * cos_t));
+      const Real phi_k = uang(mrng);
+      const Real kxh = sin_t * std::cos(phi_k);
+      const Real kyh = sin_t * std::sin(phi_k);
+      const Real kzh = cos_t;
+
+      k_vec[m] = {kmag * two_pi_over_L * kxh,
+                  kmag * two_pi_over_L * kyh,
+                  kmag * two_pi_over_L * kzh};
+      t_amp[m] = std::pow(kmag, -0.5 * alpha_s);
+      phase[m] = {uphase(mrng), uphase(mrng), uphase(mrng)};
+
+      // Solenoidal direction: pick non-aligned axis, cross with k_hat.
+      Real ax = 1.0, ay = 0.0, az = 0.0;
+      if (std::fabs(kxh) > std::fabs(kyh) && std::fabs(kxh) > std::fabs(kzh)) {
+        ax = 0.0; ay = 1.0; az = 0.0;
+      }
+      Real sx = ay * kzh - az * kyh;
+      Real sy = az * kxh - ax * kzh;
+      Real sz = ax * kyh - ay * kxh;
+      Real snorm = std::sqrt(sx*sx + sy*sy + sz*sz);
+      if (snorm < 1e-12) snorm = 1.0;
+      eps_sol[m]  = {sx/snorm, sy/snorm, sz/snorm};
+      eps_comp[m] = {kxh, kyh, kzh};
+    }
+
+    // Evaluate field on this block's local cells (host scratch).
+    const int nx_loc = ib.e - ib.s + 1;
+    const int ny_loc = jb.e - jb.s + 1;
+    const int nz_loc = kb.e - kb.s + 1;
+    std::vector<Real> v_turb(3 * nx_loc * ny_loc * nz_loc, 0.0);
+    auto vt = [&](int c, int kk, int jj, int ii) -> Real & {
+      return v_turb[((c * nz_loc + (kk - kb.s)) * ny_loc + (jj - jb.s)) * nx_loc
+                    + (ii - ib.s)];
+    };
+
+    for (int k = kb.s; k <= kb.e; ++k) {
+      const Real z = coords.Xc<3>(k);
+      for (int j = jb.s; j <= jb.e; ++j) {
+        const Real y = coords.Xc<2>(j);
+        for (int i = ib.s; i <= ib.e; ++i) {
+          const Real x = coords.Xc<1>(i);
+          Real vx_t = 0.0, vy_t = 0.0, vz_t = 0.0;
+          for (int m = 0; m < nmodes; ++m) {
+            const Real kdotr = k_vec[m][0] * x + k_vec[m][1] * y + k_vec[m][2] * z;
+            const Real w_sol  = std::sqrt(zeta) * t_amp[m]
+                              * std::cos(kdotr + phase[m][0]);
+            const Real w_comp = std::sqrt(1.0 - zeta) * t_amp[m]
+                              * std::cos(kdotr + phase[m][1]);
+            vx_t += w_sol * eps_sol[m][0]  + w_comp * eps_comp[m][0];
+            vy_t += w_sol * eps_sol[m][1]  + w_comp * eps_comp[m][1];
+            vz_t += w_sol * eps_sol[m][2]  + w_comp * eps_comp[m][2];
+          }
+          vt(0, k, j, i) = vx_t;
+          vt(1, k, j, i) = vy_t;
+          vt(2, k, j, i) = vz_t;
+        }
+      }
+    }
+
+    // Mass-weighted reduction over chosen region.
+    const bool in_sphere = (region == "sphere");
+    Real local_sums[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    for (int k = kb.s; k <= kb.e; ++k) {
+      const Real z = coords.Xc<3>(k);
+      for (int j = jb.s; j <= jb.e; ++j) {
+        const Real y = coords.Xc<2>(j);
+        for (int i = ib.s; i <= ib.e; ++i) {
+          const Real x = coords.Xc<1>(i);
+          if (in_sphere && (x*x + y*y + z*z) >= rc_code * rc_code) continue;
+          const Real rho = u(IDN, k, j, i);
+          const Real dV  = coords.CellVolume(k, j, i);
+          const Real mc  = rho * dV;
+          const Real ax_v = vt(0, k, j, i);
+          const Real ay_v = vt(1, k, j, i);
+          const Real az_v = vt(2, k, j, i);
+          local_sums[0] += mc;
+          local_sums[1] += mc * ax_v;
+          local_sums[2] += mc * ay_v;
+          local_sums[3] += mc * az_v;
+          local_sums[4] += mc * (ax_v*ax_v + ay_v*ay_v + az_v*az_v);
+        }
+      }
+    }
+
+    Real global_sums[5];
+#ifdef MPI_PARALLEL
+    MPI_Allreduce(local_sums, global_sums, 5, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+#else
+    for (int q = 0; q < 5; ++q) global_sums[q] = local_sums[q];
+#endif
+
+    const Real M_tot = global_sums[0];
+    if (M_tot > 0.0) {
+      const Real mean_vx = global_sums[1] / M_tot;
+      const Real mean_vy = global_sums[2] / M_tot;
+      const Real mean_vz = global_sums[3] / M_tot;
+      const Real msq_raw = global_sums[4] / M_tot;
+      const Real msq_centered = std::max(0.0,
+          msq_raw - (mean_vx*mean_vx + mean_vy*mean_vy + mean_vz*mean_vz));
+      const Real vrms_centered = std::sqrt(msq_centered);
+      const Real scale = (vrms_centered > 0.0) ? (turb_mach / vrms_centered) : 0.0;
+
+      if (parthenon::Globals::my_rank == 0 && pmb->gid == 0) {
+        std::cout << "\n--- Initial turbulence ---\n"
+                  << "Region              : " << region << "\n"
+                  << "Target Mach (RMS)   : " << turb_mach << "\n"
+                  << "Modes               : " << nmodes
+                  << "  k in [" << k_min << ", " << k_max << "]"
+                  << "  zeta=" << zeta << "  alpha=" << alpha_s << "\n"
+                  << "Pre-rescale RMS     : " << vrms_centered << " (code v)\n"
+                  << "Mean v subtracted   : (" << mean_vx << ", "
+                  << mean_vy << ", " << mean_vz << ")\n"
+                  << "Scale factor        : " << scale << std::endl;
+      }
+
+      for (int k = kb.s; k <= kb.e; ++k) {
+        const Real z = coords.Xc<3>(k);
+        for (int j = jb.s; j <= jb.e; ++j) {
+          const Real y = coords.Xc<2>(j);
+          for (int i = ib.s; i <= ib.e; ++i) {
+            const Real x = coords.Xc<1>(i);
+            if (in_sphere && (x*x + y*y + z*z) >= rc_code * rc_code) continue;
+            const Real dvx = (vt(0, k, j, i) - mean_vx) * scale;
+            const Real dvy = (vt(1, k, j, i) - mean_vy) * scale;
+            const Real dvz = (vt(2, k, j, i) - mean_vz) * scale;
+            const Real rho     = u(IDN, k, j, i);
+            const Real vx_old  = u(IM1, k, j, i) / rho;
+            const Real vy_old  = u(IM2, k, j, i) / rho;
+            const Real vz_old  = u(IM3, k, j, i) / rho;
+            const Real vx_new  = vx_old + dvx;
+            const Real vy_new  = vy_old + dvy;
+            const Real vz_new  = vz_old + dvz;
+            u(IM1, k, j, i) = rho * vx_new;
+            u(IM2, k, j, i) = rho * vy_new;
+            u(IM3, k, j, i) = rho * vz_new;
+            const Real ke_old = 0.5 * rho * (vx_old*vx_old + vy_old*vy_old + vz_old*vz_old);
+            const Real ke_new = 0.5 * rho * (vx_new*vx_new + vy_new*vy_new + vz_new*vz_new);
+            u(IEN, k, j, i) += (ke_new - ke_old);
+          }
+        }
+      }
+    } else {
+      if (parthenon::Globals::my_rank == 0 && pmb->gid == 0) {
+        std::cout << "[turbulence] WARNING: zero mass in region; skipping."
+                  << std::endl;
       }
     }
   }
