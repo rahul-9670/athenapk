@@ -56,3 +56,9 @@ be_jeans_test/
 __pycache__/
 *.pyc
 *.pdf
+
+# Local development backups (not for upstream)
+*.cpp.bak
+*.cpp.pre_fix_bak
+*.cpp.before_*
+inputs/*_test.in
