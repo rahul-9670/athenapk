@@ -138,10 +138,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         Metadata::Cell,       Metadata::Independent,   Metadata::FillGhost,
         Metadata::WithFluxes, Metadata::GMGRestrict,   Metadata::GMGProlongate};
     Metadata m(flags);
-    // GOTCHA: phi MG prolongation operator. Parthenon provides
-    // ProlongateSharedLinear / RestrictAverage as safe defaults for elliptic problems.
-    // Artemis uses "ArtemisUtils::EnrollArtemisRefinementOps". We don't have that —
-    // use Parthenon's built-ins. This is one of the most likely sources of AMR bugs.
+  
     m.RegisterRefinementOps<parthenon::refinement_ops::ProlongateSharedLinear,
                             parthenon::refinement_ops::RestrictAverage>();
     pkg->AddField<grav::phi>(m);
