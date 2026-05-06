@@ -91,8 +91,7 @@ class PoissonEquation {
   // the system  A.phi = rhs  is equivalent to  -grad^2(phi) = 4piG*rho,
   // i.e. phi here satisfies grad^2(phi) = -4piG*rho.
   // This is Artemis's convention. Acceleration = -grad(phi) in ApplyGravitySource
-  // is then correct (pulls toward overdensities). DO NOT change this without
-  // understanding what you're doing.
+  // is then correct (pulls toward overdensities). 
   static parthenon::TaskStatus
   CalculateFluxes(std::shared_ptr<parthenon::MeshData<Real>> &md) {
     using namespace parthenon;
