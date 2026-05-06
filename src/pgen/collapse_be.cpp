@@ -335,11 +335,11 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
     // For an isotropic random field with t_amp[m] = kmag^(-alpha/2),
     // unit-variance cos terms, and orthogonal sol/comp projections each
     // unit-norm, the per-component variance is:
-    //   <v_x²> = sum_m [zeta * <cos²> * eps_sol_x² + (1-zeta) * <cos²> * eps_comp_x²]
-    //          * t_amp[m]²
-    // Summed over (x,y,z), the eps² components sum to 1 for each mode (since
+    //   <v_x^2> = sum_m [zeta * <cos^2> * eps_sol_x^2 + (1-zeta) * <cos^2> * eps_comp_x^2]
+    //          * t_amp[m]^2
+    // Summed over (x,y,z), the eps^2 components sum to 1 for each mode (since
     // both eps_sol and eps_comp are unit vectors), so:
-    //   <|v|²> = sum_m t_amp[m]² * <cos²>(zeta + (1-zeta)) = 0.5 * sum_m t_amp[m]²
+    //   <|v|^2> = sum_m t_amp[m]^2 * <cos^2>(zeta + (1-zeta)) = 0.5 * sum_m t_amp[m]^2
     // -----------------------------------------------------------------------
     Real sum_amp_sq = 0.0;
     for (int m = 0; m < nmodes; ++m) {
@@ -397,7 +397,7 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
 // For rho << rhocrit: e_th ~ rho/(gamma-1) (isothermal, c_s = 1)
 // For rho >> rhocrit: e_th ~ (rho/(gamma-1)) * (rho/rhocrit)^(gamma-1) (adiabatic)
 // This OVERWRITES the thermal energy every step — it's a barotropic EOS
-// enforcement, not a differential cooling equation. Same as Athena++ setup.
+// enforcement, not a differential cooling equation.
 //
 // Also zeroes momentum outside the sphere (fixed boundary condition on velocity).
 // ---------------------------------------------------------------------------
