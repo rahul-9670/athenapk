@@ -145,23 +145,18 @@ int main(int argc, char *argv[]) {
 
   pman.ParthenonInitPackagesAndMesh();
 
-  // Startup the corresponding driver for the integrator
   if (parthenon::Globals::my_rank == 0) {
     std::cout << "Starting up hydro driver" << std::endl;
   }
 
-  // This needs to be scoped so that the driver object is destructed before Finalize
   {
     Hydro::HydroDriver driver(pman.pinput.get(), pman.app_input.get(), pman.pmesh.get());
 
-    // This line actually runs the simulation
     driver.Execute();
   }
 
-  // call MPI_Finalize and Kokkos::finalize if necessary
   pman.ParthenonFinalize();
 
-  // MPI and Kokkos can no longer be used
 
   return (0);
 }
