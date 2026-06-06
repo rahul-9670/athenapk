@@ -37,10 +37,10 @@ class PoissonEquation {
                        std::shared_ptr<parthenon::MeshData<Real>> &md_mat,
                        std::shared_ptr<parthenon::MeshData<Real>> &md_in,
                        std::shared_ptr<parthenon::MeshData<Real>> &md_out) {
-    auto flux_res = tl.AddTask(depends_on, CalculateFluxes, md_in);
+    auto flux_res = tl.AddTask(depends_on, CalculateFluxes, md_mat, md_in);
     // Flux correction at coarse-fine boundaries, but NOT inside MG composite grids
     // (MG has its own coarse-fine handling).
-    if (!(md_mat->grid.type == parthenon::GridType::two_level_composite)) {
+    if (!(md_mat->grid.type() == parthenon::GridType::two_level_composite)) {
       auto start_flxcor =
           tl.AddTask(flux_res, parthenon::StartReceiveFluxCorrections, md_in);
       auto send_flxcor =
@@ -67,19 +67,25 @@ class PoissonEquation {
         "SG::StoreDiagonal", 0, pack.GetNBlocks() - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
           const auto &coords = pack.GetCoordinates(b);
+          const Real Vol = coords.template Volume<parthenon::TopologicalElement::CC>(k, j, i);
           Real diag_elem = 0.0;
-          // X1
           {
             const Real dxc = coords.template Dxc<parthenon::X1DIR>(k, j, i);
-            diag_elem -= 2.0 / (dxc * dxc);
+            const Real Al = coords.template Volume<parthenon::TopologicalElement::F1>(k, j, i);
+            const Real Ar = coords.template Volume<parthenon::TopologicalElement::F1>(k, j, i + 1);
+            diag_elem -= (Al + Ar) / (dxc * Vol);
           }
           if (ndim > 1) {
             const Real dxc = coords.template Dxc<parthenon::X2DIR>(k, j, i);
-            diag_elem -= 2.0 / (dxc * dxc);
+            const Real Al = coords.template Volume<parthenon::TopologicalElement::F2>(k, j, i);
+            const Real Ar = coords.template Volume<parthenon::TopologicalElement::F2>(k, j + 1, i);
+            diag_elem -= (Al + Ar) / (dxc * Vol);
           }
           if (ndim > 2) {
             const Real dxc = coords.template Dxc<parthenon::X3DIR>(k, j, i);
-            diag_elem -= 2.0 / (dxc * dxc);
+            const Real Al = coords.template Volume<parthenon::TopologicalElement::F3>(k, j, i);
+            const Real Ar = coords.template Volume<parthenon::TopologicalElement::F3>(k + 1, j, i);
+            diag_elem -= (Al + Ar) / (dxc * Vol);
           }
           pack(b, te, var_t(), k, j, i) = diag_elem;
         });
@@ -93,7 +99,8 @@ class PoissonEquation {
   // This is Artemis's convention. Acceleration = -grad(phi) in ApplyGravitySource
   // is then correct (pulls toward overdensities). 
   static parthenon::TaskStatus
-  CalculateFluxes(std::shared_ptr<parthenon::MeshData<Real>> &md) {
+  CalculateFluxes(std::shared_ptr<parthenon::MeshData<Real>> &md_mat,
+                  std::shared_ptr<parthenon::MeshData<Real>> &md) {
     using namespace parthenon;
     const int ndim = md->GetMeshPointer()->ndim;
     IndexRange ib = md->GetBoundsI(IndexDomain::interior, te);

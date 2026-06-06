@@ -138,16 +138,20 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         Metadata::Cell,       Metadata::Independent,   Metadata::FillGhost,
         Metadata::WithFluxes, Metadata::GMGRestrict,   Metadata::GMGProlongate};
     Metadata m(flags);
-  
-    m.RegisterRefinementOps<parthenon::refinement_ops::ProlongateSharedLinear,
+    // phi MG prolongation/restriction ops. Artemis uses
+    // ArtemisUtils::EnrollArtemisRefinementOps; we use Parthenon's built-in
+    // ProlongatePiecewiseConstant / RestrictAverage, the safe elliptic defaults.
+    m.RegisterRefinementOps<parthenon::refinement_ops::ProlongatePiecewiseConstant,
                             parthenon::refinement_ops::RestrictAverage>();
     pkg->AddField<grav::phi>(m);
   }
-  // rhs: source. Derived, OneCopy, needs ghost fill so solver reductions see ghost cells.
+  // rhs: source. Derived, OneCopy. Matches upstream Parthenon poisson_gmg example.
+  // rhs carries FillGhost + refinement ops to match Artemis: the GMG V-cycle
+  // restricts/exchanges rhs across ranks, so it needs ghost data and AMR ops.
   {
     Metadata m({Metadata::Cell, Metadata::Derived, Metadata::OneCopy,
                 Metadata::FillGhost});
-    m.RegisterRefinementOps<parthenon::refinement_ops::ProlongateSharedLinear,
+    m.RegisterRefinementOps<parthenon::refinement_ops::ProlongatePiecewiseConstant,
                             parthenon::refinement_ops::RestrictAverage>();
     pkg->AddField<grav::rhs>(m);
   }
@@ -167,7 +171,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
           /*container_rhs=*/"rhs",
           pin, solver_params_block, PoissEq(pin, block_name));
   pkg->AddParam("solver_pointer",
-              std::static_pointer_cast<parthenon::solvers::SolverBase>(psolver));
+                std::static_pointer_cast<parthenon::solvers::SolverBase>(psolver));
 
   return pkg;
 }

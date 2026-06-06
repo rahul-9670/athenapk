@@ -25,6 +25,11 @@ using SolverT = parthenon::solvers::BiCGSTABSolver<PoissEq, preconditioner_t>;
 
 namespace SelfGravity {
 
+// NOTE: Multi-rank GPU runs of the GMG-preconditioned BiCGSTAB solver require
+// CUDA_LAUNCH_BLOCKING=1 at runtime. Without it, an asynchronous-execution race
+// in Parthenon's GMG V-cycle (cross-rank ghost exchange vs. dependent kernels)
+// causes the preconditioned solve to diverge (grav.phi -> NaN). CPU and single-
+// rank GPU runs are unaffected. This is a Parthenon-side issue, not the operator.
 void SolvePoisson(TaskCollection &tc, Mesh *pmesh) {
   using namespace parthenon;
   TaskID none(0);
