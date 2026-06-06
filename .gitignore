@@ -62,3 +62,6 @@ __pycache__/
 *.cpp.pre_fix_bak
 *.cpp.before_*
 inputs/*_test.in
+run_diagnostics_dump/
+*.bak_pre_cxx20
+*.bak
