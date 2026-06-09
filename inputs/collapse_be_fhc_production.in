@@ -1,0 +1,108 @@
+<comment>
+problem = First Hydrostatic Core production
+
+<job>
+problem_id = collapse_be
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 1.5
+nlim = -1
+ncycle_out = 1
+
+<parthenon/mesh>
+refinement = adaptive
+numlevel = 12
+multigrid = true
+nx1 = 256
+x1min = -26.0
+x1max = 26.0
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 256
+x2min = -26.0
+x2max = 26.0
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 256
+x3min = -26.0
+x3max = 26.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<parthenon/meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<hydro>
+fluid = glmmhd
+eos = adiabatic
+gamma = 1.4
+riemann = hlld
+reconstruction = plm
+glmmhd_source = dedner_extended
+dfloor = 1.0e-6
+pfloor = 1.0e-8
+
+<refinement>
+type = jeans
+njeans = 8
+
+<physics>
+self_gravity = true
+
+<self_gravity>
+units_override = true
+four_pi_G = 1.0
+use_swindle = false
+ix1_bc = zero
+ox1_bc = zero
+ix2_bc = zero
+ox2_bc = zero
+ix3_bc = zero
+ox3_bc = zero
+
+<self_gravity/solver_params>
+solver = BiCGSTAB
+max_iterations = 200
+residual_tolerance = 1.0e-10
+do_FAS = true
+max_coarsenings = 20
+smoother = SRJ1
+presmoother = SRJ1
+postsmoother = SRJ1
+preconditioner = Multigrid
+
+<problem/collapse_be>
+mass = 6.0
+temperature = 10.0
+f = 5.0
+rhocrit = 1.0e-13
+amp = 0.0
+omegatff = 0.02
+B0z = 0.15
+turb_mach = 0.5
+turb_alpha = 3.667
+turb_seed = 42
+turb_kmin = 1
+turb_kmax = 8
+turb_nmodes = 128
+turb_zeta = 0.5
+turb_region = sphere
+
+<parthenon/output0>
+file_type = hst
+dt = 0.001
+
+<parthenon/output1>
+file_type = hdf5
+dt = 0.02
+variables = prim, grav.phi
+single_precision_output = 1
+
+<parthenon/output2>
+file_type = rst
+dt = 0.02
+
