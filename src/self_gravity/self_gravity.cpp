@@ -4,6 +4,7 @@
 // Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -141,6 +142,20 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   if (b_ox3 == "neumann")
     pkg->UserBoundaryFunctions[BF::outer_x3].push_back(NeuZ<parthenon::X3DIR, RR>());
 
+  // Cache the per-face BC type (0=default/other, 1=zero/Dirichlet, 2=neumann/outflow) so
+  // the packed PoissonEquation::SetBoundary can apply them without the per-block BC
+  // dispatch. Order matches parthenon::BoundaryFace:
+  // inner_x1,outer_x1,inner_x2,outer_x2,inner_x3,outer_x3.
+  auto bc_code = [](const std::string &s) {
+    return s == "zero" ? 1 : (s == "neumann" ? 2 : 0);
+  };
+  std::array<int, 6> grav_bc_face_type = {bc_code(b_ix1), bc_code(b_ox1), bc_code(b_ix2),
+                                          bc_code(b_ox2), bc_code(b_ix3), bc_code(b_ox3)};
+  pkg->AddParam("grav_bc_face_type", grav_bc_face_type);
+  // Runtime escape hatch / A-B switch: self_gravity/packed_bc=false forces the original
+  // per-block ApplyBoundaryConditionsOnCoarseOrFineMD path inside SetBoundary.
+  pkg->AddParam("grav_packed_bc", pin->GetOrAddBoolean(block_name, "packed_bc", true));
+
   // --- Fields ----------------------------------------------------------------
   // phi: solution variable. Needs ghost fill, fluxes, GMG prolong/restrict for AMR MG.
   {
@@ -174,13 +189,33 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   using prolongator_t = parthenon::solvers::ProlongationBlockInteriorZeroDirichlet;
   using preconditioner_t = parthenon::solvers::MGSolver<PoissEq, prolongator_t>;
   const std::string solver_params_block = block_name + "/solver_params";
-  auto psolver =
-      std::make_shared<parthenon::solvers::BiCGSTABSolver<PoissEq, preconditioner_t>>(
-          /*container_base=*/"base",
-          /*container_u=*/"phi",
-          /*container_rhs=*/"rhs", pin, solver_params_block, PoissEq(pin, block_name));
-  pkg->AddParam("solver_pointer",
-                std::static_pointer_cast<parthenon::solvers::SolverBase>(psolver));
+  // Runtime-selectable solver. Default "BiCGSTAB" reproduces production behaviour
+  // bit-for-bit. "MG" / "Multigrid" uses the *pure* geometric multigrid solver,
+  // which has no global inner-products (BiCGSTAB needs ~2 all-reduces/iteration),
+  // attacking the latency-bound bottleneck of the GPU self-gravity solve.
+  // NOTE: solver=MG (pure multigrid) needs an adequate smoother on AMR. SRJ1 (one
+  // weighted-Jacobi sweep) is enough on a UNIFORM grid but NOT across AMR fine-coarse
+  // boundaries, where the coarse-grid correction injects high-frequency error each
+  // V-cycle (the standalone V-cycle then has spectral radius > 1 and diverges). Use
+  // SRJ2/SRJ3 for MG on AMR; SRJ2 is the parthenon MGParams default and converges in
+  // ~6 V-cycles. BiCGSTAB tolerates SRJ1 because its Krylov outer loop stabilises a
+  // non-contractive preconditioner.
+  const std::string solver_type =
+      pin->GetOrAddString(solver_params_block, "solver", "BiCGSTAB");
+  std::shared_ptr<parthenon::solvers::SolverBase> psolver;
+  if (solver_type == "MG" || solver_type == "Multigrid") {
+    psolver = std::make_shared<parthenon::solvers::MGSolver<PoissEq, prolongator_t>>(
+        /*container_base=*/"base",
+        /*container_u=*/"phi",
+        /*container_rhs=*/"rhs", pin, solver_params_block, PoissEq(pin, block_name));
+  } else {
+    psolver =
+        std::make_shared<parthenon::solvers::BiCGSTABSolver<PoissEq, preconditioner_t>>(
+            /*container_base=*/"base",
+            /*container_u=*/"phi",
+            /*container_rhs=*/"rhs", pin, solver_params_block, PoissEq(pin, block_name));
+  }
+  pkg->AddParam("solver_pointer", psolver);
 
   return pkg;
 }

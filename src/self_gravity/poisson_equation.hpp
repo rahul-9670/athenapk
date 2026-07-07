@@ -7,10 +7,14 @@
 #ifndef SELF_GRAVITY_POISSON_EQUATION_HPP_
 #define SELF_GRAVITY_POISSON_EQUATION_HPP_
 
+#include <array>
 #include <memory>
+#include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
+#include <bvals/boundary_conditions.hpp>
 #include <coordinates/coordinates.hpp>
 #include <kokkos_abstraction.hpp>
 #include <parthenon/package.hpp>
@@ -206,6 +210,127 @@ class PoissonEquation {
           }
           pack_out(b, te, var_t(), k, j, i) = out;
         });
+    return TaskStatus::complete;
+  }
+
+  // Packed physical-boundary application for the solver BCFunc. The solver detects this
+  // static method (has_SetBoundary trait) and uses it INSTEAD of the per-block
+  // ApplyBoundaryConditionsOnCoarseOrFineMD, which loops over every block and launches a
+  // separate tiny physical-BC kernel per (block, face). In the deeply-refined collapse
+  // that per-block dispatch dominates the GPU launch/sync latency (Grete 2026-07: ~7e5
+  // GenericBC launches in a 4-cycle trace). Here we apply the self-gravity phi BCs
+  // (zero-Dirichlet / Neumann-outflow, uniform Cartesian) to the WHOLE MeshData in ONE
+  // par_for per face, gated by a per-block physical-boundary flag. The per-face iteration
+  // space and the FixedFace / outflow ghost formulas are taken verbatim from parthenon's
+  // GenericBC, so the result is bit-identical to the per-block path. Any
+  // non-(zero|neumann) face -> delegate to the original per-block path so correctness is
+  // never at risk.
+  static parthenon::TaskStatus SetBoundary(std::shared_ptr<parthenon::MeshData<Real>> &md,
+                                           bool coarse) {
+    using namespace parthenon;
+    auto pkg = md->GetBlockData(0)->GetBlockPointer()->packages.Get("self_gravity");
+    // Per-face BC type: 0 = other/default (delegate), 1 = zero (FixedFace 0), 2 =
+    // neumann.
+    const auto &bctype = pkg->Param<std::array<int, 6>>("grav_bc_face_type");
+    const bool use_packed = pkg->Param<bool>("grav_packed_bc");
+
+    const int ndim = md->GetMeshPointer()->ndim;
+    auto face_active = [&](int f) -> bool {
+      if (ndim < 3 && (f == 4 || f == 5)) return false;
+      if (ndim < 2 && (f == 2 || f == 3)) return false;
+      return true;
+    };
+    // Delegate whenever the packed path is disabled or any active face is not
+    // zero/neumann.
+    bool packable = use_packed;
+    for (int f = 0; f < 6 && packable; ++f)
+      if (face_active(f) && bctype[f] != 1 && bctype[f] != 2) packable = false;
+    if (!packable) return ApplyBoundaryConditionsOnCoarseOrFineMD(md, coarse);
+
+    std::set<PDOpt> opts = coarse ? std::set<PDOpt>{PDOpt::Coarse} : std::set<PDOpt>{};
+    auto desc = parthenon::MakePackDescriptor<var_t>(md.get(), {}, opts);
+    auto q = desc.GetPack(md.get());
+    const int npb = q.GetNBlocks();
+
+    // Build the physical-boundary flags indexed by PACK block. On two_level_composite MG
+    // grids the pack covers only the subset of md blocks where phi is allocated (npb < md
+    // NumBlocks), so we map each pack block to its MeshBlock by GID (q.GetGIDHost) rather
+    // than assuming a 1:1 md-block correspondence. Blocks not carrying phi are simply not
+    // in the pack and (correctly) receive no BC -- the per-block path skips them too.
+    // This lets the packed path cover the multigrid levels as well as the leaf grid.
+    std::unordered_map<int, parthenon::MeshBlock *> gid2mb;
+    for (int b = 0; b < md->NumBlocks(); ++b) {
+      auto *pmb = md->GetBlockData(b)->GetBlockPointer();
+      gid2mb[pmb->gid] = pmb;
+    }
+    Kokkos::View<bool **> phys("SG::phys_bnd", npb, 6);
+    auto phys_h = Kokkos::create_mirror_view(phys);
+    bool any_face[6] = {false, false, false, false, false, false};
+    for (int pb = 0; pb < npb; ++pb) {
+      auto it = gid2mb.find(q.GetGIDHost(pb));
+      parthenon::MeshBlock *pmb = (it != gid2mb.end()) ? it->second : nullptr;
+      // On the coarse buffer only blocks with coarser neighbors have it allocated (the
+      // per-block ApplyBoundaryConditionsOnCoarseOrFine skips the rest,
+      // boundary_conditions .cpp:46) -- touching an unallocated coarse buffer is illegal,
+      // so gate on it here.
+      const bool coarse_ok = pmb && ((!coarse) || pmb->HasCoarserNeighbors());
+      for (int f = 0; f < 6; ++f) {
+        const bool p =
+            coarse_ok && face_active(f) && (pmb->boundary_flag[f] == BoundaryFlag::user);
+        phys_h(pb, f) = p;
+        if (p) any_face[f] = true;
+      }
+    }
+    Kokkos::deep_copy(phys, phys_h);
+
+    auto *pmb0 = md->GetBlockData(0)->GetBlockPointer();
+    const auto &cb = coarse ? pmb0->c_cellbounds : pmb0->cellbounds;
+
+    // Canonical face order (inner_x1, outer_x1, inner_x2, ...) so corner ghosts fill from
+    // earlier faces exactly as ApplyBoundaryConditionsOnCoarseOrFine's face loop does.
+    const IndexDomain doms[6] = {IndexDomain::inner_x1, IndexDomain::outer_x1,
+                                 IndexDomain::inner_x2, IndexDomain::outer_x2,
+                                 IndexDomain::inner_x3, IndexDomain::outer_x3};
+    for (int f = 0; f < 6; ++f) {
+      if (!any_face[f]) continue;
+      const int dir = f / 2; // 0->x1, 1->x2, 2->x3
+      const bool inner = (f % 2 == 0);
+      const int type = bctype[f]; // 1 zero (FixedFace), 2 neumann (outflow)
+
+      // Iteration space: the library's boundary domain (identical to GenericBC's
+      // par_for_bndry).
+      const IndexRange ib = cb.GetBoundsI(doms[f], te);
+      const IndexRange jb = cb.GetBoundsJ(doms[f], te);
+      const IndexRange kb = cb.GetBoundsK(doms[f], te);
+      // ref = interior boundary index in DIR; offset for the odd reflection (GenericBC).
+      const IndexRange in_i = cb.GetBoundsI(IndexDomain::interior, te);
+      const IndexRange in_j = cb.GetBoundsJ(IndexDomain::interior, te);
+      const IndexRange in_k = cb.GetBoundsK(IndexDomain::interior, te);
+      const int ref = (dir == 0) ? (inner ? in_i.s : in_i.e)
+                                 : ((dir == 1) ? (inner ? in_j.s : in_j.e)
+                                               : (inner ? in_k.s : in_k.e));
+      const int offset = 2 * ref + (inner ? -1 : 1);
+      const int ff = f, dd = dir, tt = type, offc = offset, refc = ref;
+
+      parthenon::par_for(
+          "SG::SetBoundaryPacked", 0, npb - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+          KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+            if (!phys(b, ff)) return;
+            if (!q.Contains(b, var_t())) return; // phi not allocated on this block (skip)
+            if (tt ==
+                1) { // zero-Dirichlet FixedFace(val=0): ghost = 2*0 - mirror(interior)
+              const int km = (dd == 2) ? offc - k : k;
+              const int jm = (dd == 1) ? offc - j : j;
+              const int im = (dd == 0) ? offc - i : i;
+              q(b, te, var_t(), k, j, i) = -q(b, te, var_t(), km, jm, im);
+            } else { // neumann / outflow: copy the interior boundary cell along DIR
+              const int kr = (dd == 2) ? refc : k;
+              const int jr = (dd == 1) ? refc : j;
+              const int ir = (dd == 0) ? refc : i;
+              q(b, te, var_t(), k, j, i) = q(b, te, var_t(), kr, jr, ir);
+            }
+          });
+    }
     return TaskStatus::complete;
   }
 };
