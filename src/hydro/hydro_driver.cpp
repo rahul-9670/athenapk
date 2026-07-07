@@ -21,6 +21,8 @@
 #include "../eos/adiabatic_hydro.hpp"
 #include "../pgen/cluster/agn_triggering.hpp"
 #include "../pgen/cluster/magnetic_tower.hpp"
+#include "../pgen/pgen.hpp"
+#include "../self_gravity/self_gravity.hpp"
 #include "../tracers/tracers.hpp"
 #include "diffusion/diffusion.hpp"
 #include "glmmhd/glmmhd.hpp"
@@ -543,7 +545,20 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     auto source_unsplit = tl.AddTask(update, AddUnsplitSources, mu0.get(), tm,
                                      integrator->beta[stage - 1] * integrator->dt);
 
-    auto source_split_first_order = source_unsplit;
+    // Barotropic cooling for the BE-sphere collapse problem. This is an unsplit
+    // source term applied only when the collapse_be problem generator is active
+    // (detected via a parameter it registers on the Hydro package).
+    auto after_cooling = source_unsplit;
+    {
+      auto hydro_pkg = pmesh->packages.Get("Hydro");
+      if (hydro_pkg->AllParams().hasKey("collapse_be_rhocrit")) {
+        after_cooling =
+            tl.AddTask(source_unsplit, collapse_be::ApplyBarotropicCooling, mu0.get(), tm,
+                       integrator->beta[stage - 1] * integrator->dt);
+      }
+    }
+
+    auto source_split_first_order = after_cooling;
 
     if (stage == integrator->nstages) {
       // Add final Strang split source terms, i.e., a dt/2 update
@@ -566,6 +581,27 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     // best impl. Go with default call (split local/nonlocal) for now.
     parthenon::AddBoundaryExchangeTasks(source_split_first_order | start_bnd, tl, mu0,
                                         pmesh->multilevel);
+  }
+
+  // Self-gravity: on the final stage, solve the Poisson equation for the
+  // gravitational potential and apply the gravitational acceleration as an
+  // unsplit source term. The fluxes are held in mu0 and are not cleared by the
+  // boundary exchange above, so applying gravity here (before the next stage's
+  // flux calculation) is consistent.
+  auto self_gravity_pkg = pmesh->packages.AllPackages().count("self_gravity") > 0
+                              ? pmesh->packages.Get("self_gravity")
+                              : nullptr;
+  if (stage == integrator->nstages && self_gravity_pkg != nullptr) {
+    // Solve Poisson: this adds its own TaskRegion with num_partitions task lists.
+    SelfGravity::SolvePoisson(tc, pmesh);
+
+    // Apply gravitational source term per partition.
+    TaskRegion &sg_source_region = tc.AddRegion(num_partitions);
+    for (int i = 0; i < num_partitions; i++) {
+      auto &tl = sg_source_region[i];
+      auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
+      tl.AddTask(none, SelfGravity::ApplyGravitySource, mu0.get(), tm, integrator->dt);
+    }
   }
 
   TaskRegion &single_tasklist_per_pack_region_3 = tc.AddRegion(num_partitions);
