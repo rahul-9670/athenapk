@@ -32,6 +32,7 @@
 #include "../units/physical_units.hpp"       // flagship Phase 1: one unit system
 #include "../units/ionization_environment.hpp" // flagship Phase 1: shared CR rate
 #include "defs.hpp"
+#include "ct/ct.hpp"
 #include "diffusion/diffusion.hpp"
 #include "glmmhd/glmmhd.hpp"
 #include "hydro.hpp"
@@ -413,6 +414,26 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   pkg->AddParam<>("fluid", fluid);
   pkg->AddParam<>("nhydro", nhydro);
   pkg->AddParam<>("calc_c_h", calc_c_h);
+
+  // Divergence control (Phase 2). "glm" = current GLM/Dedner path (default, bit-identical
+  // to the previous behavior). "ct" = staggered Constrained Transport (increment 1: ideal
+  // MHD, single level). On the CT path a face-centered Bf field is the primary magnetic
+  // variable and IB1..IB3 become its projection; the GLM machinery (psi flux + Dedner
+  // damping) is left running but decoupled -- the induction update comes from the CT curl
+  // and the projection overwrites the cell-centered B each substage. See docs/CT_DESIGN.md.
+  const auto divergence_control_str =
+      pin->GetOrAddString("hydro", "divergence_control", "glm");
+  bool use_ct = false;
+  if (divergence_control_str == "glm") {
+    use_ct = false;
+  } else if (divergence_control_str == "ct") {
+    PARTHENON_REQUIRE(fluid == Fluid::glmmhd,
+                      "hydro/divergence_control=ct requires fluid=glmmhd.");
+    use_ct = true;
+  } else {
+    PARTHENON_FAIL("AthenaPK hydro: Unknown divergence_control (use 'glm' or 'ct').");
+  }
+  pkg->AddParam<>("use_ct", use_ct);
   // Following params should (currently) be present independent of solver because
   // they're all used in the main loop.
   // TODO(pgrete) think about which approach (selective versus always is preferable)
@@ -1283,6 +1304,25 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   m = Metadata({Metadata::Cell, Metadata::Derived}, std::vector<int>({nhydro + nscalars}),
                prim_labels);
   pkg->AddField("prim", m);
+
+  // CT (Phase 2): face-centered primary magnetic field. Registered with the div-free
+  // AMR refinement ops (Toth & Roe internal prolongation) even though increment 1 is
+  // single level, per docs/CT_DESIGN.md sec 3.1. The edge-flux slots (WithFluxes) hold
+  // the CT EMF; FillGhost exchanges the staggered ghosts.
+  if (use_ct) {
+    auto m_bf = Metadata({Metadata::Face, Metadata::Independent, Metadata::WithFluxes,
+                          Metadata::FillGhost});
+    m_bf.RegisterRefinementOps<parthenon::refinement_ops::ProlongateSharedMinMod,
+                               parthenon::refinement_ops::RestrictAverage,
+                               parthenon::refinement_ops::ProlongateInternalTothAndRoe>();
+    pkg->AddField<Hydro::CT::Bf>(m_bf);
+
+    // Face-divergence history diagnostic (max |div B|*dx/|B|); ~round-off on the CT path.
+    auto hst_vars = pkg->Param<parthenon::HstVar_list>(parthenon::hist_param_key);
+    hst_vars.emplace_back(parthenon::HistoryOutputVar(
+        parthenon::UserHistoryOperation::max, Hydro::CT::CT_MaxRelFaceDivB, "ct_maxRelDivB"));
+    pkg->UpdateParam(parthenon::hist_param_key, hst_vars);
+  }
 
   const auto refine_str = pin->GetOrAddString("refinement", "type", "unset");
   if (refine_str == "pressure_gradient") {

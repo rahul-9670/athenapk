@@ -45,6 +45,7 @@
 #include <parthenon/package.hpp>
 
 // Athena headers
+#include "../hydro/ct/ct.hpp"
 #include "../main.hpp"
 #include "outputs/outputs.hpp"
 
@@ -323,6 +324,64 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
   }
   // copy initialized vars to device
   u_dev.DeepCopy(u);
+
+  // ---- Constrained Transport: initialize the face-centered field Bf ----
+  // Only iprob=1 (loop in the x1-x2 plane, A = A_z e_z) is wired for CT here; the
+  // face field is the discrete curl of the analytic vector potential evaluated at the
+  // cell edges, so div(B)_face = 0 to round-off by construction.
+  auto hydro_pkg = pmb->packages.Get("Hydro");
+  if (hydro_pkg->Param<bool>("use_ct")) {
+    PARTHENON_REQUIRE(iprob == 1,
+                      "field_loop CT face-init currently supports iprob=1 only.");
+    using TE = parthenon::TopologicalElement;
+    const Real amp_l = amp;
+    const Real rad_l = rad;
+    auto desc = parthenon::MakePackDescriptor<Hydro::CT::Bf>(mbd.get());
+    auto pack = desc.GetPack(mbd.get());
+    const int bidx = 0;
+    // A_z(x,y) = amp*(rad - r) inside the loop, 0 outside.
+    auto Az = KOKKOS_LAMBDA(const Real x, const Real y)->Real {
+      const Real r = std::sqrt(x * x + y * y);
+      return (r < rad_l) ? amp_l * (rad_l - r) : 0.0;
+    };
+    // Bf.F1 = dA_z/dy  (x-face)
+    IndexRange fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F1);
+    IndexRange fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F1);
+    IndexRange fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F1);
+    pmb->par_for(
+        "field_loop CT F1", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
+        KOKKOS_LAMBDA(const int k, const int j, const int i) {
+          const auto &c = pack.GetCoordinates(bidx);
+          const Real x = c.X<X1DIR, TE::F1>(k, j, i);
+          const Real ylo = c.X<X2DIR, TE::F2>(k, j, i);
+          const Real yhi = c.X<X2DIR, TE::F2>(k, j + 1, i);
+          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) =
+              (Az(x, yhi) - Az(x, ylo)) / (yhi - ylo);
+        });
+    // Bf.F2 = -dA_z/dx  (y-face)
+    fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F2);
+    fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F2);
+    fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F2);
+    pmb->par_for(
+        "field_loop CT F2", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
+        KOKKOS_LAMBDA(const int k, const int j, const int i) {
+          const auto &c = pack.GetCoordinates(bidx);
+          const Real y = c.X<X2DIR, TE::F2>(k, j, i);
+          const Real xlo = c.X<X1DIR, TE::F1>(k, j, i);
+          const Real xhi = c.X<X1DIR, TE::F1>(k, j, i + 1);
+          pack(bidx, TE::F2, Hydro::CT::Bf(), k, j, i) =
+              -(Az(xhi, y) - Az(xlo, y)) / (xhi - xlo);
+        });
+    // Bf.F3 = B_z = 0 in the plane.
+    fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F3);
+    fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F3);
+    fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F3);
+    pmb->par_for(
+        "field_loop CT F3", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
+        KOKKOS_LAMBDA(const int k, const int j, const int i) {
+          pack(bidx, TE::F3, Hydro::CT::Bf(), k, j, i) = 0.0;
+        });
+  }
 }
 
 } // namespace field_loop

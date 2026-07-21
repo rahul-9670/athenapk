@@ -19,6 +19,8 @@ add_executable(
         hydro/diffusion/viscosity.cpp
         hydro/hydro_driver.cpp
         hydro/hydro.cpp
+        hydro/ct/ct.cpp
+        hydro/ct/ct.hpp
         hydro/glmmhd/dedner_source.cpp
         hydro/prolongation/custom_ops.hpp
         hydro/srcterms/gravitational_field.hpp

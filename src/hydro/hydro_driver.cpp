@@ -23,6 +23,7 @@
 #include "../pgen/cluster/magnetic_tower.hpp"
 #include "../tracers/tracers.hpp"
 #include "../sinks/sinks.hpp"
+#include "ct/ct.hpp"
 #include "diffusion/diffusion.hpp"
 #include "glmmhd/glmmhd.hpp"
 #include "hydro.hpp"
@@ -367,6 +368,7 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
 TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
   TaskCollection tc;
   auto hydro_pkg = blocks[0]->packages.Get("Hydro");
+  const bool use_ct = hydro_pkg->Param<bool>("use_ct");
 
   TaskID none(0);
   // Number of task lists that can be executed indepenently and thus *may*
@@ -499,18 +501,26 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     // init u1, see (11) in Athena++ method paper
     if (stage == 1) {
       auto &u1 = pmb->meshblock_data.Get("u1");
+      const bool use_ct_snap = hydro_pkg->Param<bool>("use_ct");
       auto init_u1 = tl.AddTask(
           none,
-          [](MeshBlockData<Real> *u0, MeshBlockData<Real> *u1, bool copy_prim) {
+          [](MeshBlockData<Real> *u0, MeshBlockData<Real> *u1, bool copy_prim,
+             bool use_ct) {
             u1->Get("cons").data.DeepCopy(u0->Get("cons").data);
             if (copy_prim) {
               u1->Get("prim").data.DeepCopy(u0->Get("prim").data);
+            }
+            // CT: the face field Bf is a separate Independent variable (not part of
+            // "cons"), so it needs its own stage-start snapshot for the VL2 combine.
+            if (use_ct) {
+              u1->Get("Bf").data.DeepCopy(u0->Get("Bf").data);
             }
             return TaskStatus::complete;
           },
           // First order flux correction needs the original prim variables in the
           // during the correction.
-          u0.get(), u1.get(), hydro_pkg->Param<bool>("first_order_flux_correct"));
+          u0.get(), u1.get(), hydro_pkg->Param<bool>("first_order_flux_correct"),
+          use_ct_snap);
     }
   }
 
@@ -571,7 +581,26 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     }
     // Then change the next task's dependency from source_unsplit to after_cooling
 
-    auto source_split_first_order = after_cooling;
+    // Constrained Transport (Phase 2). Assemble the edge EMF from the primitive state,
+    // advance the face field Bf by its curl (VL2 combine), and project Bf onto the
+    // cell-centered IB1..IB3 -- overwriting the flux-divergence update of B done above,
+    // so the induction half of the step is divergence-free by construction. The Bf
+    // ghost exchange rides along in the AddBoundaryExchangeTasks call below (Bf is
+    // FillGhost). GLM path (use_ct=false) is untouched and bit-identical.
+    auto after_ct = after_cooling;
+    if (use_ct) {
+      const Real gam0 = integrator->gam0[stage - 1];
+      const Real gam1 = integrator->gam1[stage - 1];
+      const Real bdt = integrator->beta[stage - 1] * integrator->dt;
+      auto emf = tl.AddTask(set_flx, Hydro::CT::CT_AssembleEMF, mu0.get());
+      auto ct_update =
+          tl.AddTask(emf | update, Hydro::CT::CT_UpdateBf, mu0.get(), mu1.get(), gam0,
+                     gam1, bdt);
+      after_ct = tl.AddTask(ct_update | after_cooling, Hydro::CT::CT_ProjectBfToCC,
+                            mu0.get());
+    }
+
+    auto source_split_first_order = after_ct;
 
     if (stage == integrator->nstages) {
       // Audit fix #7: the Strang split source must depend on after_cooling, NOT
@@ -580,7 +609,7 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
       // race on the ambient momentum that barotropic cooling zeroes). Single chain:
       // update -> source_unsplit -> (cooling) -> strang -> first_order -> bnd_exchange.
       auto source_split_strang_final =
-          tl.AddTask(after_cooling, AddSplitSourcesStrang, mu0.get(), tm);
+          tl.AddTask(after_ct, AddSplitSourcesStrang, mu0.get(), tm);
       source_split_first_order =
           tl.AddTask(source_split_strang_final, AddSplitSourcesFirstOrder, mu0.get(), tm);
     }

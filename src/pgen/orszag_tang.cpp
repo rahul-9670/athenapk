@@ -17,6 +17,7 @@
 #include <parthenon/package.hpp>
 
 // AthenaPK headers
+#include "../hydro/ct/ct.hpp"
 #include "../main.hpp"
 
 namespace orszag_tang {
@@ -60,5 +61,55 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
                    (SQR(u(IM1, k, j, i)) + SQR(u(IM2, k, j, i)) + SQR(u(IM3, k, j, i))) /
                        u(IDN, k, j, i));
       });
+
+  // ---- Constrained Transport: face field Bf from the analytic vector potential ----
+  // A_z(x,y) = B0/(4 pi) cos(4 pi x) - B0/(2 pi) cos(2 pi y); B = curl(A_z e_z) recovers
+  // the cell-centered field above. Discrete curl of nodal A_z => div(B)_face = 0.
+  auto hydro_pkg = pmb->packages.Get("Hydro");
+  if (hydro_pkg->Param<bool>("use_ct")) {
+    using TE = parthenon::TopologicalElement;
+    const Real B0_l = B0;
+    auto desc = parthenon::MakePackDescriptor<Hydro::CT::Bf>(mbd.get());
+    auto pack = desc.GetPack(mbd.get());
+    const int bidx = 0;
+    auto Az = KOKKOS_LAMBDA(const Real x, const Real y)->Real {
+      return B0_l / (4.0 * M_PI) * std::cos(4.0 * M_PI * x) -
+             B0_l / (2.0 * M_PI) * std::cos(2.0 * M_PI * y);
+    };
+    IndexRange fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F1);
+    IndexRange fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F1);
+    IndexRange fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F1);
+    pmb->par_for(
+        "OT CT F1", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
+        KOKKOS_LAMBDA(const int k, const int j, const int i) {
+          const auto &c = pack.GetCoordinates(bidx);
+          const Real x = c.X<X1DIR, TE::F1>(k, j, i);
+          const Real ylo = c.X<X2DIR, TE::F2>(k, j, i);
+          const Real yhi = c.X<X2DIR, TE::F2>(k, j + 1, i);
+          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) =
+              (Az(x, yhi) - Az(x, ylo)) / (yhi - ylo);
+        });
+    fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F2);
+    fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F2);
+    fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F2);
+    pmb->par_for(
+        "OT CT F2", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
+        KOKKOS_LAMBDA(const int k, const int j, const int i) {
+          const auto &c = pack.GetCoordinates(bidx);
+          const Real y = c.X<X2DIR, TE::F2>(k, j, i);
+          const Real xlo = c.X<X1DIR, TE::F1>(k, j, i);
+          const Real xhi = c.X<X1DIR, TE::F1>(k, j, i + 1);
+          pack(bidx, TE::F2, Hydro::CT::Bf(), k, j, i) =
+              -(Az(xhi, y) - Az(xlo, y)) / (xhi - xlo);
+        });
+    fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F3);
+    fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F3);
+    fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F3);
+    pmb->par_for(
+        "OT CT F3", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
+        KOKKOS_LAMBDA(const int k, const int j, const int i) {
+          pack(bidx, TE::F3, Hydro::CT::Bf(), k, j, i) = 0.0;
+        });
+  }
 }
 } // namespace orszag_tang
