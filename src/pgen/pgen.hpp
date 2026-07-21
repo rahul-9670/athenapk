@@ -35,6 +35,16 @@ parthenon::TaskStatus ApplyBarotropicCooling(parthenon::MeshData<parthenon::Real
                                               const parthenon::Real dt);
 } // namespace collapse_be
 
+namespace poisson_test {
+using namespace parthenon::driver::prelude;
+void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+} // namespace poisson_test
+
+namespace rad_pulse {
+using namespace parthenon::driver::prelude;
+void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+} // namespace rad_pulse
+
 namespace cpaw {
 using namespace parthenon::driver::prelude;
 
@@ -79,7 +89,15 @@ namespace diffusion {
 using namespace parthenon::driver::prelude;
 
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+void UserWorkAfterLoop(Mesh *mesh, parthenon::ParameterInput *pin,
+                       parthenon::SimTime &tm);
 } // namespace diffusion
+
+namespace cshock {
+using namespace parthenon::driver::prelude;
+
+void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+} // namespace cshock
 
 namespace field_loop {
 using namespace parthenon::driver::prelude;
@@ -141,6 +159,12 @@ using namespace parthenon::driver::prelude;
 
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
 } // namespace jeans
+
+namespace polytrope {
+using namespace parthenon::driver::prelude;
+
+void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+} // namespace polytrope
 
 namespace turbulence {
 using namespace parthenon::driver::prelude;

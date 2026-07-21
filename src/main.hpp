@@ -42,10 +42,19 @@ enum class ConductionCoeff { none, fixed, spitzer };
 enum class Viscosity { none, isotropic };
 enum class ViscosityCoeff { none, fixed };
 enum class Resistivity { none, ohmic };
-enum class ResistivityCoeff { none, fixed, spitzer };
+// ionization = equilibrium self-consistent x_e(rho,T); ionization_chem = use the
+// time-dependent x_e evolved by the chemistry package (gow17_reduced) in the Wardle tensor.
+enum class ResistivityCoeff { none, fixed, spitzer, ionization, ionization_chem };
+enum class Ambipolar { none, ambipolar };
+// ionization = equilibrium self-consistent x_e(rho,T); ionization_chem = use the
+// time-dependent x_e evolved by the chemistry package (gow17_reduced) for rho_i.
+enum class AmbipolarCoeff { none, fixed, ionization, ionization_chem };
+enum class Hall { none, hall };
+// ionization = equilibrium x_e(rho,T); ionization_chem = chemistry-evolved x_e in the tensor.
+enum class HallCoeff { none, fixed, ionization, ionization_chem };
 enum class DiffInt { none, unsplit, rkl2 };
 
-enum class Hst { idx, ekin, emag, divb };
+enum class Hst { idx, ekin, emag, divb, divb_max };
 
 enum class CartesianDir { x, y, z };
 

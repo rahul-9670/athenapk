@@ -15,12 +15,14 @@ target_sources(athenaPK PRIVATE
     cluster/snia_feedback.cpp
     cluster/stellar_feedback.cpp
     cpaw.cpp
+    cshock.cpp
     diffusion.cpp
     field_loop.cpp
     kh.cpp
     linear_wave.cpp
     linear_wave_mhd.cpp
     jeans.cpp
+    polytrope.cpp
     lw_implode.cpp
     orszag_tang.cpp
     rand_blast.cpp
@@ -28,4 +30,6 @@ target_sources(athenaPK PRIVATE
     shattering.cpp
     turbulence.cpp
     collapse_be.cpp
+    poisson_test.cpp
+    rad_pulse.cpp
     )

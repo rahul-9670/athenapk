@@ -22,11 +22,15 @@
 #include "../pgen/cluster/agn_triggering.hpp"
 #include "../pgen/cluster/magnetic_tower.hpp"
 #include "../tracers/tracers.hpp"
+#include "../sinks/sinks.hpp"
 #include "diffusion/diffusion.hpp"
 #include "glmmhd/glmmhd.hpp"
 #include "hydro.hpp"
 #include "hydro_driver.hpp"
 #include "../self_gravity/self_gravity.hpp"
+#include "../radiation/radiation.hpp"
+#include "../chemistry/chemistry.hpp"
+#include "../dust/dust_pkg.hpp"
 #include "../pgen/pgen.hpp"
 
 using namespace parthenon::driver::prelude;
@@ -105,13 +109,17 @@ TaskStatus RKL2StepFirst(MeshData<Real> *md_Y0, MeshData<Real> *md_Yjm1,
                     (static_cast<Real>(s_rkl) * static_cast<Real>(s_rkl) +
                      static_cast<Real>(s_rkl) - 2.);
 
-  // In principle, we'd only need to pack Metadata::WithFluxes here, but
-  // choosing to mirror other use in the code so that the packs are already cached.
-  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
-  auto Y0 = md_Y0->PackVariablesAndFluxes(flags_ind);
-  auto Yjm1 = md_Yjm1->PackVariablesAndFluxes(flags_ind);
-  auto Yjm2 = md_Yjm2->PackVariablesAndFluxes(flags_ind);
-  auto MY0 = md_MY0->PackVariablesAndFluxes(flags_ind);
+  // Pack by NAME ("cons"), not by {Metadata::Independent}: the diffusion terms update
+  // only the gas conserved variables, but the Independent flag also matches rad.Er/Fr
+  // (radiation) and grav.phi. Since Yjm1 aliases "base" and the Y0 snapshot ("u1") only
+  // deep-copies cons/prim, a flag-based pack overwrites the radiation fields and phi in
+  // base with the u1 container's stale/zero content on every STS call (this silently
+  // zeroed rad.Er for the whole run past cycle 71000, see DEV_LOG 2026-07-15).
+  const std::vector<std::string> sts_vars{"cons"};
+  auto Y0 = md_Y0->PackVariablesAndFluxes(sts_vars, sts_vars);
+  auto Yjm1 = md_Yjm1->PackVariablesAndFluxes(sts_vars, sts_vars);
+  auto Yjm2 = md_Yjm2->PackVariablesAndFluxes(sts_vars, sts_vars);
+  auto MY0 = md_MY0->PackVariablesAndFluxes(sts_vars, sts_vars);
 
   // Using separate loops for each dim as the launch overhead should be hidden
   // by enough work over the entire pack and it allows to not use any conditionals.
@@ -136,13 +144,14 @@ TaskStatus RKL2StepOther(MeshData<Real> *md_Y0, MeshData<Real> *md_Yjm1,
   IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
   IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
 
-  // In principle, we'd only need to pack Metadata::WithFluxes here, but
-  // choosing to mirror other use in the code so that the packs are already cached.
-  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
-  auto Y0 = md_Y0->PackVariablesAndFluxes(flags_ind);
-  auto Yjm1 = md_Yjm1->PackVariablesAndFluxes(flags_ind);
-  auto Yjm2 = md_Yjm2->PackVariablesAndFluxes(flags_ind);
-  auto MY0 = md_MY0->PackVariablesAndFluxes(flags_ind);
+  // Pack by NAME ("cons") — same constraint as RKL2StepFirst above: a flag-based
+  // {Independent} pack pulls in rad.Er/Fr and grav.phi and corrupts them via the
+  // cons/prim-only u1 snapshot.
+  const std::vector<std::string> sts_vars{"cons"};
+  auto Y0 = md_Y0->PackVariablesAndFluxes(sts_vars, sts_vars);
+  auto Yjm1 = md_Yjm1->PackVariablesAndFluxes(sts_vars, sts_vars);
+  auto Yjm2 = md_Yjm2->PackVariablesAndFluxes(sts_vars, sts_vars);
+  auto MY0 = md_MY0->PackVariablesAndFluxes(sts_vars, sts_vars);
 
   const int ndim = pmb->pmy_mesh->ndim;
   // Using separate loops for each dim as the launch overhead should be hidden
@@ -174,6 +183,9 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
 
   auto hydro_pkg = blocks[0]->packages.Get("Hydro");
   auto mindt_diff = hydro_pkg->Param<Real>("dt_diff");
+  // With diffusion/rkl2_freeze_eta the stage-init below refreshes the non-ideal eta
+  // cache from the half-start state and the stages jj=2..s reuse it (refill=false).
+  const bool refill_eta_stages = !hydro_pkg->Param<bool>("rkl2_freeze_eta");
 
   // get number of RKL steps
   // eq (21) using half hyperbolic timestep due to Strang split
@@ -238,9 +250,12 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
 
     // Calculate the diffusive fluxes for Y0 (here still "base" as nothing has been
     // updated yet) so that we can store the result as MY0 and reuse later
-    // (in every subsetp).
-    auto hydro_diff_fluxes =
-        tl.AddTask(reset_fluxes, CalcDiffFluxes, hydro_pkg.get(), base.get());
+    // (in every subsetp). Parabolic terms only: in the mixed rkl2+Hall mode the
+    // dispersive Hall EMF is applied unsplit with the hyperbolic fluxes, not here.
+    // Always refreshes the eta cache (refill=true): this is the half-start state the
+    // frozen stages reuse.
+    auto hydro_diff_fluxes = tl.AddTask(reset_fluxes, CalcDiffFluxes, hydro_pkg.get(),
+                                        base.get(), DiffTermSet::parabolic, true);
 
     auto send_flx =
         tl.AddTask(hydro_diff_fluxes, parthenon::LoadAndSendFluxCorrections, base);
@@ -308,9 +323,12 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
       // Reset flux arrays (not guaranteed to be zero)
       auto reset_fluxes = tl.AddTask(none, ResetFluxes, base.get());
 
-      // Calculate the diffusive fluxes for Yjm1 (here u1)
-      auto hydro_diff_fluxes =
-          tl.AddTask(reset_fluxes, CalcDiffFluxes, hydro_pkg.get(), base.get());
+      // Calculate the diffusive fluxes for Yjm1 (here u1); parabolic terms only (the
+      // dispersive Hall EMF is never super-time-stepped, see AddSTSTasks stage-init).
+      // refill_eta_stages=false (diffusion/rkl2_freeze_eta) reuses the half-start eta.
+      auto hydro_diff_fluxes = tl.AddTask(reset_fluxes, CalcDiffFluxes, hydro_pkg.get(),
+                                          base.get(), DiffTermSet::parabolic,
+                                          refill_eta_stages);
 
       auto send_flx =
           tl.AddTask(hydro_diff_fluxes, parthenon::LoadAndSendFluxCorrections, base);
@@ -556,8 +574,13 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     auto source_split_first_order = after_cooling;
 
     if (stage == integrator->nstages) {
+      // Audit fix #7: the Strang split source must depend on after_cooling, NOT
+      // source_unsplit. Both cooling and the split sources mutate cons; branching the
+      // split chain from source_unsplit left them as unordered siblings (a GPU-async
+      // race on the ambient momentum that barotropic cooling zeroes). Single chain:
+      // update -> source_unsplit -> (cooling) -> strang -> first_order -> bnd_exchange.
       auto source_split_strang_final =
-          tl.AddTask(source_unsplit, AddSplitSourcesStrang, mu0.get(), tm);
+          tl.AddTask(after_cooling, AddSplitSourcesStrang, mu0.get(), tm);
       source_split_first_order =
           tl.AddTask(source_split_strang_final, AddSplitSourcesFirstOrder, mu0.get(), tm);
     }
@@ -576,25 +599,88 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
   auto self_gravity_pkg = pmesh->packages.AllPackages().count("self_gravity") > 0
                               ? pmesh->packages.Get("self_gravity")
                               : nullptr;
-  if (stage == integrator->nstages && self_gravity_pkg != nullptr) {
+  // Audit fix #2: self-gravity is applied as a STAGE-CONSISTENT source. Poisson is solved
+  // from each stage's updated density and the gravitational kick uses that stage's
+  // beta*dt weight (matching the hydro flux update and the other unsplit sources), instead
+  // of a single lagged full-dt kick on the final stage only. This restores ~2nd-order time
+  // coupling for the VL2 integrator (predictor AND corrector feel gravity), and the
+  // flux-weighted gravitational work now uses each stage's contemporaneous mass flux
+  // (ApplyGravitySource already takes a per-stage beta_dt). Cost: one extra Poisson solve
+  // per step. NOTE: this changes collapse timing/energetics vs the old scheme -- validate
+  // against the gravity test hierarchy and re-baseline before quoting as production physics.
+  if (self_gravity_pkg != nullptr) {
     // Solve Poisson: this adds its own TaskRegion with num_partitions task lists.
     SelfGravity::SolvePoisson(tc, pmesh);
 
-    // Apply gravitational source term per partition.
+    // Apply gravitational source term per partition, weighted by this stage's beta*dt.
     TaskRegion &sg_source_region = tc.AddRegion(num_partitions);
     for (int i = 0; i < num_partitions; i++) {
       auto &tl = sg_source_region[i];
       auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
-      tl.AddTask(none, SelfGravity::ApplyGravitySource, mu0.get(), tm, integrator->dt);
+      tl.AddTask(none, SelfGravity::ApplyGravitySource, mu0.get(), tm,
+                 integrator->beta[stage - 1] * integrator->dt);
     }
   }
 
+  // Sink-particle gravity on the gas (WS-1 increment 2): gather the global sink list, then
+  // add each sink's softened point-mass force as an operator-split source on the final stage.
+  if (stage == integrator->nstages &&
+      pmesh->packages.Get("sinks")->Param<bool>("enabled")) {
+    TaskRegion &sk_grav_region = tc.AddRegion(num_partitions);
+    for (int i = 0; i < num_partitions; i++) {
+      auto &tl = sk_grav_region[i];
+      auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
+      auto gather = tl.AddTask(none, Sinks::GatherSinks, mu0.get());
+      auto grav = tl.AddTask(gather, Sinks::ApplySinkGravity, mu0.get(), tm, integrator->dt);
+      // Creation runs after the gather (needs the existing-sink list for the 2*r_acc test);
+      // accretion runs after creation so a just-formed sink can accrete this step.
+      auto create = tl.AddTask(grav, Sinks::CreateSinks, mu0.get(), tm);
+      tl.AddTask(create, Sinks::AccreteSinks, mu0.get(), tm, integrator->dt);
+    }
+  }
+
+  // Radiation (M1): operator-split, sub-cycled transport on the final stage only.
+  auto radiation_pkg = pmesh->packages.AllPackages().count("radiation") > 0
+                           ? pmesh->packages.Get("radiation")
+                           : nullptr;
+  if (stage == integrator->nstages && radiation_pkg != nullptr) {
+    // Adds its own TaskRegion(s); sub-cycles at the radiation CFL over the hydro dt.
+    Radiation::AddRadiationTasks(tc, pmesh, integrator->dt);
+  }
+
+  // Chemistry: operator-split reaction source on the passive scalars, final stage
+  // only. Runs after RT (which sets the gas temperature the rates depend on) and
+  // before FillDerived (so the primitive scalars pick up the reacted abundances).
+  auto chemistry_pkg = pmesh->packages.AllPackages().count("chemistry") > 0
+                           ? pmesh->packages.Get("chemistry")
+                           : nullptr;
+  if (stage == integrator->nstages && chemistry_pkg != nullptr) {
+    Chemistry::AddChemistryTasks(tc, pmesh, integrator->dt);
+  }
+  auto dust_pkg = pmesh->packages.AllPackages().count("dust") > 0
+                      ? pmesh->packages.Get("dust")
+                      : nullptr;
+  if (stage == integrator->nstages && dust_pkg != nullptr) {
+    Dust::AddDustTasks(tc, pmesh, integrator->dt);
+  }
+
   TaskRegion &single_tasklist_per_pack_region_3 = tc.AddRegion(num_partitions);
+  // Audit fix A3 (+ #2 stage-consistent gravity): operator-split sources modify INTERIOR
+  // conserved variables AFTER the stage boundary exchange above -- self-gravity on EVERY
+  // stage now (#2), and RT matter coupling + chemistry on the final stage. Refresh ghosts
+  // before FillDerived so the primitive ghosts (notably the x_e scalar read one cell into
+  // the ghost zone by the first RKL2 non-ideal flux, and the gravity-updated momentum used
+  // by the next stage's reconstruction) reflect the sourced interior, not stale ghosts.
+  const bool sourced_interior =
+      (stage == integrator->nstages) || (self_gravity_pkg != nullptr);
   for (int i = 0; i < num_partitions; i++) {
     auto &tl = single_tasklist_per_pack_region_3[i];
     auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
+    TaskID pre = none;
+    if (sourced_interior)
+      pre = parthenon::AddBoundaryExchangeTasks(none, tl, mu0, pmesh->multilevel);
     auto fill_derived =
-        tl.AddTask(none, parthenon::Update::FillDerived<MeshData<Real>>, mu0.get());
+        tl.AddTask(pre, parthenon::Update::FillDerived<MeshData<Real>>, mu0.get());
   }
   const auto &diffint = hydro_pkg->Param<DiffInt>("diffint");
   // If any tasks modify the conserved variables before this place and after FillDerived,
@@ -677,6 +763,36 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
         fill =
             tl.AddTask(fill, Tracers::ProblemFillTracers, mu0.get(), tm, integrator->dt);
       }
+    }
+  }
+
+  // First-order operator-split sink-particle advance (WS-1 increment 1: inert ballistic
+  // drift + swarm migration). Mirrors the tracer block above.
+  auto sinks_pkg = pmesh->packages.Get("sinks");
+  if (stage == integrator->nstages && sinks_pkg->Param<bool>("enabled")) {
+    TaskRegion &sync_region_sk = tc.AddRegion(1);
+    {
+      for (auto &pmb : blocks) {
+        auto &tl = sync_region_sk[0];
+        auto &sd = pmb->meshblock_data.Get()->GetSwarmData();
+        tl.AddTask(none, &SwarmContainer::ResetCommunication, sd.get());
+      }
+    }
+    // N-body advance is a single mesh-level task (all sinks interact); it must run after the
+    // per-block ResetCommunication above and before the per-block Send/Receive below.
+    TaskRegion &advance_region_sk = tc.AddRegion(1);
+    {
+      auto &tl = advance_region_sk[0];
+      auto &mu0 = pmesh->mesh_data.GetOrAdd("base", 0);
+      tl.AddTask(none, Sinks::AdvanceSinksNBody, mu0.get(), integrator->dt);
+    }
+    TaskRegion &async_region_sk = tc.AddRegion(blocks.size());
+    for (int n = 0; n < blocks.size(); n++) {
+      auto &tl = async_region_sk[n];
+      auto &pmb = blocks[n];
+      auto &sd = pmb->meshblock_data.Get()->GetSwarmData();
+      auto send = tl.AddTask(none, &SwarmContainer::Send, sd.get(), BoundaryCommSubset::all);
+      tl.AddTask(send, &SwarmContainer::Receive, sd.get(), BoundaryCommSubset::all);
     }
   }
 

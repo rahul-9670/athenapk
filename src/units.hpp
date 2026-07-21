@@ -90,8 +90,19 @@ class Units {
     return code_energy_cgs() / kev_cgs * code_length_cgs() * code_length_cgs();
   }
   parthenon::Real code_magnetic_cgs() const {
-    return std::sqrt(4.0 * M_PI) * sqrt(code_mass_cgs()) / sqrt(code_length_cgs()) /
-           code_time_cgs();
+    return CodeMagneticCgs(code_mass_cgs(), code_length_cgs(), code_time_cgs());
+  }
+
+  // Heaviside-Lorentz magnetic unit (cgs per code B) from explicit mass/length/time
+  // scales, WITHOUT needing a constructed Units object. This is the ONE definition of
+  // the code-B -> gauss conversion in the code base (audit finding #3: it carries the
+  // sqrt(4*pi) that P_mag = B^2/2 implies; B_cgs = sqrt(4*pi*rho)*v = sqrt(4*pi)*
+  // sqrt(mass)/sqrt(length)/time). PhysicalUnits (src/units/physical_units.hpp) and the
+  // collapse problem generator both route their B conversion through here.
+  static parthenon::Real CodeMagneticCgs(parthenon::Real mass_cgs,
+                                         parthenon::Real length_cgs,
+                                         parthenon::Real time_cgs) {
+    return std::sqrt(4.0 * M_PI) * std::sqrt(mass_cgs) / std::sqrt(length_cgs) / time_cgs;
   }
 
   // Physical Constants in code units

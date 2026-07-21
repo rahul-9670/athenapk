@@ -48,9 +48,10 @@ struct Riemann<Fluid::glmmhd, RiemannSolver::hlld> {
     const int iBy = ivy - 1 + NHYDRO;
     const int iBz = ivz - 1 + NHYDRO;
 
-    const auto gamma = eos.GetGamma();
-    const auto gm1 = gamma - 1.0;
-    const auto igm1 = 1.0 / gm1;
+    // Internal energy is reconstructed from pressure via the EOS (eos.InternalEnergyFromPres
+    // = P/(gamma-1) for the ideal gas, or the Saha inversion for the H2-dissociation EOS).
+    // The HLLD star-state algebra below is EOS-independent (Rankine-Hugoniot + constant
+    // total pressure across the middle waves), so only this P->e conversion needs the EOS.
 
     // TODO(pgrete) move to a more central center and add logic
     constexpr int NGLMMHD = 9;
@@ -105,7 +106,7 @@ struct Riemann<Fluid::glmmhd, RiemannSolver::hlld> {
       ul.mx = wli[IV1] * ul.d;
       ul.my = wli[IV2] * ul.d;
       ul.mz = wli[IV3] * ul.d;
-      ul.e = wli[IPR] * igm1 + kel + pbl;
+      ul.e = eos.InternalEnergyFromPres(wli[IDN], wli[IPR]) + kel + pbl;
       ul.by = wli[IB2];
       ul.bz = wli[IB3];
 
@@ -113,7 +114,7 @@ struct Riemann<Fluid::glmmhd, RiemannSolver::hlld> {
       ur.mx = wri[IV1] * ur.d;
       ur.my = wri[IV2] * ur.d;
       ur.mz = wri[IV3] * ur.d;
-      ur.e = wri[IPR] * igm1 + ker + pbr;
+      ur.e = eos.InternalEnergyFromPres(wri[IDN], wri[IPR]) + ker + pbr;
       ur.by = wri[IB2];
       ur.bz = wri[IB3];
 

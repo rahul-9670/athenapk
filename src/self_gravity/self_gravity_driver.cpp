@@ -25,11 +25,17 @@ using SolverT = parthenon::solvers::BiCGSTABSolver<PoissEq, preconditioner_t>;
 
 namespace SelfGravity {
 
-// NOTE: Multi-rank GPU runs of the GMG-preconditioned BiCGSTAB solver require
-// CUDA_LAUNCH_BLOCKING=1 at runtime. Without it, an asynchronous-execution race
-// in Parthenon's GMG V-cycle (cross-rank ghost exchange vs. dependent kernels)
-// causes the preconditioned solve to diverge (grav.phi -> NaN). CPU and single-
-// rank GPU runs are unaffected. This is a Parthenon-side issue, not the operator.
+// NOTE (resolved): Multi-rank GPU runs of the GMG-preconditioned BiCGSTAB solver
+// once required CUDA_LAUNCH_BLOCKING=1 at runtime to avoid an asynchronous-execution
+// race in Parthenon's boundary exchange (a sender posted its MPI send before the
+// device-side buffer-pack kernel had completed, so a neighbor rank received garbage
+// ghost data and the preconditioned solve diverged to grav.phi -> NaN).
+// This is now FIXED at the source by a Kokkos::fence() before the MPI send in
+// external/parthenon/src/bvals/comms/boundary_communication.cpp (~line 158, plus an
+// unpack-side fence ~line 358). CUDA_LAUNCH_BLOCKING is therefore NO LONGER NEEDED
+// and should be removed from submit scripts (it serializes every kernel and badly
+// throttles the many small multigrid kernels). Verified: launch-blocking-off multi-
+// rank GPU runs are bit-identical to the old launch-blocking baseline (no NaN).
 void SolvePoisson(TaskCollection &tc, Mesh *pmesh) {
   using namespace parthenon;
   TaskID none(0);

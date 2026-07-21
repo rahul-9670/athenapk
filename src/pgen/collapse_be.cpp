@@ -22,6 +22,7 @@
 #include <parthenon/package.hpp>
 
 #include "../main.hpp"
+#include "../units.hpp" // canonical Heaviside-Lorentz magnetic-unit definition (audit #3)
 #include "pgen.hpp"
 
 namespace collapse_be {
@@ -68,9 +69,15 @@ Real BEProfile(Real r) {
 // outside has zero velocity and ambient density = rho(rc).
 // ---------------------------------------------------------------------------
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
+  // For the tabulated protostellar EOS, cold molecular H2 (10 K, rotation frozen) is
+  // monatomic-like: e_int = 1.5 p (gamma=5/3), not p/(gamma-1). Seeding the ideal value
+  // would make the table read the IC as hot. (At 10 K the table's pressure already equals
+  // the isothermal p=rho since it uses the same mu=2.33; only the energy differs.)
+  const bool use_h2diss = (pin->GetOrAddString("hydro", "eos", "adiabatic") == "hydrogen");
   const Real gam = pin->GetReal("hydro", "gamma");
   const Real gm1 = gam - 1.0;
   const Real igm1 = 1.0 / gm1;
+  const Real e_int_over_p = use_h2diss ? 1.5 : igm1; // e_int = e_int_over_p * p
 
   // Read problem params
   const Real mass_msun = pin->GetReal("problem/collapse_be", "mass");
@@ -113,7 +120,14 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
     const Real code_density_cgs  = rho0;
     const Real code_velocity_cgs = l0 / t0;
     const Real code_energy_cgs   = m0 * (l0/t0) * (l0/t0);
-    const Real code_bfield_cgs   = std::sqrt(rho0) * (l0 / t0);
+    // Audit fix #3 / flagship Phase 1: the Heaviside-Lorentz magnetic unit
+    // B_cgs = sqrt(4*pi*rho0)*v0 (P_mag = B^2/2) is now taken from the ONE definition in
+    // units.hpp (Units::CodeMagneticCgs), the same formula PhysicalUnits uses -- so this
+    // sidecar cannot drift from the code's internal B convention. The BE derivation gives
+    // mass_unit = rho0*l0^3 exactly, so CodeMagneticCgs(m0,l0,t0) == sqrt(4*pi*rho0)*v0.
+    // (Previously the sqrt(4*pi) was dropped, under-reporting physical B by ~3.545.)
+    const Real code_bfield_cgs   = Units::CodeMagneticCgs(code_mass_cgs, code_length_cgs,
+                                                          code_time_cgs);
 
     hydro_pkg->AddParam("units/code_length_cgs",   code_length_cgs);
     hydro_pkg->AddParam("units/code_time_cgs",     code_time_cgs);
@@ -178,6 +192,13 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   // Ambient density: BE profile value at r = rc (pressure-continuous)
   const Real rho_amb = f * BEProfile(rc_code);
 
+  // Chemistry species ICs (gated on passive scalars). Species ride on the passive
+  // scalars as scalar_density_i = rho * x_i; seed all-atomic hydrogen (x_H=1, x_H2=0)
+  // so a chemistry run starts from a physical, H-nucleus-conserving state. The first
+  // scalar_density component sits just past the hydro vars in the cons pack.
+  const int nscalars_ic = pin->GetOrAddInteger("hydro", "nscalars", 0);
+  const int iscal0 = mhd ? (IPS + 1) : NHYDRO;
+
   for (int k = kb.s; k <= kb.e; ++k) {
     Real z = coords.Xc<3>(k);
     for (int j = jb.s; j <= jb.e; ++j) {
@@ -202,15 +223,19 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
           v3 = 0.0;
         }
 
-        // Pressure: c_s = 1 everywhere initially (isothermal T=10K-equivalent)
-        // p = rho * c_s^2 / gamma (adiabatic relation — cooling fn will enforce barotropic)
-        const Real p = rho / gam;
+        // Pressure: isothermal c_s = 1 (T=10K), so the BE-equilibrium pressure is
+        // p = rho * c_s^2 = rho. This matches the barotropic floor the cooling source
+        // enforces every step (e_th = rho/(gamma-1) for rho << rhocrit  =>  p = rho),
+        // so there is no factor-gamma transient on the first step. NOTE: the initial
+        // pressure is cosmetic — the barotropic cooling overwrites e_th on step 1, so
+        // p=rho vs p=rho/gam give bit-identical evolution (verified A/B 2026-06-22).
+        const Real p = rho;
 
         u(IDN, k, j, i) = rho;
         u(IM1, k, j, i) = rho * v1;
         u(IM2, k, j, i) = rho * v2;
         u(IM3, k, j, i) = rho * v3;
-        u(IEN, k, j, i) = p * igm1 + 0.5 * rho * (v1*v1 + v2*v2 + v3*v3);
+        u(IEN, k, j, i) = p * e_int_over_p + 0.5 * rho * (v1*v1 + v2*v2 + v3*v3);
         if (mhd) {
           u(IB1, k, j, i) = 0.0;
           u(IB2, k, j, i) = 0.0;
@@ -218,15 +243,32 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
           u(IPS, k, j, i) = 0.0;
           u(IEN, k, j, i) += 0.5 * B0z * B0z;
         }
+        // Species ICs: scalar_density_i = rho * x_i. Layout depends on the chemistry
+        // network (selected by the number of scalars):
+        //   >=5 -> gow17_reduced {H2,H+,C+,CO,e-}: molecular-cloud core (H in H2, C in C+)
+        //   ==2 -> H2 {H,H2}: all-atomic hydrogen
+        if (nscalars_ic >= 5) {
+          u(iscal0 + 0, k, j, i) = rho * 0.5;     // x_H2 = 0.5 (all H molecular)
+          u(iscal0 + 1, k, j, i) = rho * 1.0e-8;  // x_H+
+          u(iscal0 + 2, k, j, i) = rho * 1.6e-4;  // x_C+  = total gas-phase C
+          u(iscal0 + 3, k, j, i) = rho * 1.0e-20; // x_CO
+          u(iscal0 + 4, k, j, i) = rho * 1.6e-4;  // x_e   ~ x_C+ (+ x_H+)
+          for (int s = 5; s < nscalars_ic; ++s) u(iscal0 + s, k, j, i) = 0.0;
+        } else if (nscalars_ic >= 2) {
+          u(iscal0 + 0, k, j, i) = rho; // x_H  = 1
+          u(iscal0 + 1, k, j, i) = 0.0; // x_H2 = 0
+          for (int s = 2; s < nscalars_ic; ++s) u(iscal0 + s, k, j, i) = 0.0;
+        }
       }
     }
   }
   // ============================================================================
   // Initial-only turbulent velocity field (gated by turb_mach > 0).
   // Adds a random divergence-free + compressive velocity perturbation on top
-  // of the deterministic IC above. Mass-weighted RMS Mach in the chosen region
-  // is rescaled to match `turb_mach`. Mean velocity is subtracted so the
-  // cloud doesn't translate as a unit.
+  // of the deterministic IC above. The field is scaled to `turb_mach` via the
+  // ANALYTIC ensemble RMS of the mode spectrum, and the ANALYTIC region-mean
+  // velocity is subtracted so the cloud doesn't translate as a unit (both are
+  // closed-form so every rank/block applies identical factors; see notes below).
   // ============================================================================
   const Real turb_mach = pin->GetOrAddReal("problem/collapse_be", "turb_mach", 0.0);
   if (turb_mach > 0.0) {
@@ -348,6 +390,49 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
     const Real vrms_analytic = std::sqrt(0.5 * sum_amp_sq);
     const Real scale = (vrms_analytic > 0.0) ? (turb_mach / vrms_analytic) : 0.0;
 
+    // -----------------------------------------------------------------------
+    // Analytic mean of the mode-sum field over the application region, subtracted
+    // before scaling so the cloud receives no net momentum kick (for ~64 modes the
+    // sphere-restricted mean is O(a few %) of v_rms). Computed analytically -- so it
+    // is deterministic and identical on every rank -- for the same reason as the RMS
+    // normalization above: a mesh-wide reduction is not per-block consistent here.
+    //   sphere (centered on origin): <cos(k.r + phi)> = cos(phi) * W(|k| rc),
+    //       W(x) = 3 (sin x - x cos x) / x^3   (-> 1 as x -> 0)
+    //   box:  <cos(k.r + phi)> = cos(k.r_c + phi) * prod_d sinc(k_d L/2)
+    // -----------------------------------------------------------------------
+    const bool in_sphere = (region == "sphere");
+    Real vmean[3] = {0.0, 0.0, 0.0};
+    for (int m = 0; m < nmodes; ++m) {
+      Real wcos_sol, wcos_comp; // region-mean of the sol/comp cosine terms
+      if (in_sphere) {
+        const Real kmagp =
+            std::sqrt(k_vec[m][0] * k_vec[m][0] + k_vec[m][1] * k_vec[m][1] +
+                      k_vec[m][2] * k_vec[m][2]);
+        const Real x = kmagp * rc_code;
+        const Real W =
+            (x < 1.0e-4) ? 1.0 : 3.0 * (std::sin(x) - x * std::cos(x)) / (x * x * x);
+        wcos_sol = W * std::cos(phase[m][0]);
+        wcos_comp = W * std::cos(phase[m][1]);
+      } else {
+        // Cubic box; same center in each dimension (matches the k-space setup above).
+        const Real xc = 0.5 * (x1min_ + x1max_);
+        Real sincs = 1.0;
+        Real kdotc = 0.0;
+        for (int d = 0; d < 3; ++d) {
+          const Real arg = 0.5 * k_vec[m][d] * Lbox;
+          sincs *= (std::fabs(arg) < 1.0e-8) ? 1.0 : std::sin(arg) / arg;
+          kdotc += k_vec[m][d] * xc;
+        }
+        wcos_sol = sincs * std::cos(kdotc + phase[m][0]);
+        wcos_comp = sincs * std::cos(kdotc + phase[m][1]);
+      }
+      const Real a_sol = std::sqrt(zeta) * t_amp[m] * wcos_sol;
+      const Real a_comp = std::sqrt(1.0 - zeta) * t_amp[m] * wcos_comp;
+      for (int c = 0; c < 3; ++c) {
+        vmean[c] += a_sol * eps_sol[m][c] + a_comp * eps_comp[m][c];
+      }
+    }
+
     if (parthenon::Globals::my_rank == 0 && pmb->gid == 0) {
       std::cout << "\n--- Initial turbulence ---\n"
                 << "Region              : " << region << "\n"
@@ -356,11 +441,13 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
                 << "  k in [" << k_min << ", " << k_max << "]"
                 << "  zeta=" << zeta << "  alpha=" << alpha_s << "\n"
                 << "Analytic vrms       : " << vrms_analytic << " (code v)\n"
-                << "Scale factor        : " << scale << std::endl;
+                << "Scale factor        : " << scale << "\n"
+                << "Mean subtracted     : (" << vmean[0] * scale << ", "
+                << vmean[1] * scale << ", " << vmean[2] * scale << ") (code v)"
+                << std::endl;
     }
 
-    // Apply the scaled turbulent velocity to all sphere cells in this block.
-    const bool in_sphere = (region == "sphere");
+    // Apply the scaled, mean-subtracted turbulent velocity to the region's cells.
     for (int k = kb.s; k <= kb.e; ++k) {
       const Real z = coords.Xc<3>(k);
       for (int j = jb.s; j <= jb.e; ++j) {
@@ -368,9 +455,9 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
         for (int i = ib.s; i <= ib.e; ++i) {
           const Real x = coords.Xc<1>(i);
           if (in_sphere && (x*x + y*y + z*z) >= rc_code * rc_code) continue;
-          const Real dvx = vt(0, k, j, i) * scale;
-          const Real dvy = vt(1, k, j, i) * scale;
-          const Real dvz = vt(2, k, j, i) * scale;
+          const Real dvx = (vt(0, k, j, i) - vmean[0]) * scale;
+          const Real dvy = (vt(1, k, j, i) - vmean[1]) * scale;
+          const Real dvz = (vt(2, k, j, i) - vmean[2]) * scale;
           const Real rho     = u(IDN, k, j, i);
           const Real vx_old  = u(IM1, k, j, i) / rho;
           const Real vy_old  = u(IM2, k, j, i) / rho;
@@ -389,6 +476,48 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
     }
   }
   u_dev.DeepCopy(u);
+
+  // ============================================================================
+  // Seed the M1 radiation field in LTE with the initial gas (only when the
+  // radiation package is active). Er = arad * T^4, isotropic (Fr = 0). Without
+  // this, Er defaults to 0 and the matter-coupling solve would drain a ~arad*T^4
+  // chunk of gas thermal energy on the first step (a spurious t=0 cooling
+  // transient). Mirrors the ir = T^4 seed used in the Athena++ collapse_rad pgen.
+  // ============================================================================
+  if (pmb->packages.AllPackages().count("radiation") > 0) {
+    auto rad_pkg = pmb->packages.Get("radiation");
+    const Real arad = rad_pkg->Param<Real>("arad");
+    auto Er = data->Get("rad.Er").data.GetHostMirrorAndCopy();
+    auto Fx = data->Get("rad.Fr1").data.GetHostMirrorAndCopy();
+    auto Fy = data->Get("rad.Fr2").data.GetHostMirrorAndCopy();
+    auto Fz = data->Get("rad.Fr3").data.GetHostMirrorAndCopy();
+    for (int k = kb.s; k <= kb.e; ++k) {
+      for (int j = jb.s; j <= jb.e; ++j) {
+        for (int i = ib.s; i <= ib.e; ++i) {
+          const Real rho = u(IDN, k, j, i);
+          const Real ke  = 0.5 / rho * (u(IM1, k, j, i) * u(IM1, k, j, i)
+                                      + u(IM2, k, j, i) * u(IM2, k, j, i)
+                                      + u(IM3, k, j, i) * u(IM3, k, j, i));
+          const Real me  = mhd ? 0.5 * (u(IB1, k, j, i) * u(IB1, k, j, i)
+                                      + u(IB2, k, j, i) * u(IB2, k, j, i)
+                                      + u(IB3, k, j, i) * u(IB3, k, j, i))
+                               : 0.0;
+          const Real p   = gm1 * (u(IEN, k, j, i) - ke - me);
+          // T_code (= 1 at the 10 K IC). For the tabulated EOS the ideal relation p/rho
+          // does not hold; the BE-sphere IC is isothermal at 10 K everywhere => T_code=1.
+          const Real T   = use_h2diss ? 1.0 : p / rho;
+          Er(0, k, j, i) = arad * T * T * T * T;
+          Fx(0, k, j, i) = 0.0;
+          Fy(0, k, j, i) = 0.0;
+          Fz(0, k, j, i) = 0.0;
+        }
+      }
+    }
+    data->Get("rad.Er").data.DeepCopy(Er);
+    data->Get("rad.Fr1").data.DeepCopy(Fx);
+    data->Get("rad.Fr2").data.DeepCopy(Fy);
+    data->Get("rad.Fr3").data.DeepCopy(Fz);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +542,11 @@ TaskStatus ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &
   const Real igm1 = 1.0 / gm1;
   const Real rcsq = rc * rc;
 
+  // When the M1 radiation package is active it OWNS the gas thermal energy: skip the
+  // barotropic e_th overwrite (Radiation::MatterCoupling sets T from absorption/emission
+  // instead). The outside-sphere momentum BC below still applies in both cases.
+  const bool rad_owns_energy = pm->packages.AllPackages().count("radiation") > 0;
+
   const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
 
   parthenon::IndexRange ib = md->GetBoundsI(parthenon::IndexDomain::interior);
@@ -433,22 +567,37 @@ TaskStatus ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &
 
         // Outside sphere: zero velocity (fixed BC on momentum)
         if (r2 > rcsq) {
+          // When radiation owns the gas energy the barotropic overwrite below is skipped,
+          // so the kinetic energy of the killed momentum must be removed from IEN too --
+          // otherwise it is silently converted to heat (a spurious secular heating of the
+          // ambient gas every step). In the non-RT branch IEN is fully overwritten below,
+          // so this subtraction is a no-op there by construction.
+          if (rad_owns_energy) {
+            const Real rho_bc = cons(IDN, k, j, i);
+            cons(IEN, k, j, i) -=
+                0.5 / rho_bc *
+                (cons(IM1, k, j, i) * cons(IM1, k, j, i) +
+                 cons(IM2, k, j, i) * cons(IM2, k, j, i) +
+                 cons(IM3, k, j, i) * cons(IM3, k, j, i));
+          }
           cons(IM1, k, j, i) = 0.0;
           cons(IM2, k, j, i) = 0.0;
           cons(IM3, k, j, i) = 0.0;
         }
 
-        // Barotropic EOS enforcement (everywhere)
-        const Real rho = cons(IDN, k, j, i);
-        const Real ke = 0.5 / rho * (cons(IM1, k, j, i) * cons(IM1, k, j, i)
-                                   + cons(IM2, k, j, i) * cons(IM2, k, j, i)
-                                   + cons(IM3, k, j, i) * cons(IM3, k, j, i));
-        const Real me = mhd ? 0.5 * (cons(IB1, k, j, i) * cons(IB1, k, j, i)
-                                   + cons(IB2, k, j, i) * cons(IB2, k, j, i)
-                                   + cons(IB3, k, j, i) * cons(IB3, k, j, i))
-                             : 0.0;
-        const Real te = igm1 * rho * std::sqrt(1.0 + std::pow(rho / rhocrit, 2.0 * gm1));
-        cons(IEN, k, j, i) = te + ke + me;
+        // Barotropic EOS enforcement (everywhere) -- SKIPPED when radiation owns energy.
+        if (!rad_owns_energy) {
+          const Real rho = cons(IDN, k, j, i);
+          const Real ke = 0.5 / rho * (cons(IM1, k, j, i) * cons(IM1, k, j, i)
+                                     + cons(IM2, k, j, i) * cons(IM2, k, j, i)
+                                     + cons(IM3, k, j, i) * cons(IM3, k, j, i));
+          const Real me = mhd ? 0.5 * (cons(IB1, k, j, i) * cons(IB1, k, j, i)
+                                     + cons(IB2, k, j, i) * cons(IB2, k, j, i)
+                                     + cons(IB3, k, j, i) * cons(IB3, k, j, i))
+                               : 0.0;
+          const Real te = igm1 * rho * std::sqrt(1.0 + std::pow(rho / rhocrit, 2.0 * gm1));
+          cons(IEN, k, j, i) = te + ke + me;
+        }
       });
   return TaskStatus::complete;
 }

@@ -65,3 +65,6 @@ inputs/*_test.in
 run_diagnostics_dump/
 *.bak_pre_cxx20
 *.bak
+
+# simulation run instances (data, logs, restarts) -- not source
+runs/

@@ -219,6 +219,61 @@ resistivity_coeff = fixed
 ohm_diff_coeff_code = 0.25  # fixed coefficent of the magnetic (ohmic) diffusivity code units (code_length^2/code_time)
 ```
 
+#### Ambipolar diffusion
+
+Ambipolar diffusion (ion-neutral drift) is implemented for MHD following the
+constant-coefficient model of Athena++. The ambipolar diffusivity is
+$`\eta_\mathrm{A} = Q_\mathrm{A}\,B^2`$ and the corresponding electric field is the
+perpendicular current $`\mathbf{E}_\mathrm{A} = \eta_\mathrm{A}(\mathbf{J} - (\mathbf{J}\cdot\hat{\mathbf{b}})\hat{\mathbf{b}})`$.
+It is parabolic and therefore works with both the `unsplit` and `rkl2` integrators.
+To enable set (in the `<diffusion>` block)
+```
+ambipolar = ambipolar
+ambipolar_coeff = fixed
+ambipolar_coeff_code = 0.5  # Q_A such that eta_A = Q_A * B^2 (code units)
+```
+
+#### Hall effect
+
+The Hall effect is implemented for MHD with the constant-coefficient Hall diffusivity
+$`\eta_\mathrm{H} = Q_\mathrm{H}\,B/\rho`$ and the (non-dissipative) Hall EMF
+$`\mathbf{E}_\mathrm{H} = \eta_\mathrm{H}(\mathbf{J}\times\mathbf{B})/|\mathbf{B}|`$.
+The Hall term is **dispersive** (whistler waves) and is therefore restricted to the
+`unsplit` integrator — it is *not* compatible with the `rkl2` super-time-stepping scheme
+(enabling Hall with `integrator = rkl2` raises an error). Because the field is stored
+cell-centered, the Hall term can be numerically demanding; it is strongly recommended to
+run with some Ohmic resistivity (`resistivity = ohmic`) or to set an Ohmic stabilization
+floor via `hall_ohmic_floor_code`, and possibly a reduced `cfl`. The whistler timestep
+scales as $`\Delta t \propto \Delta x^2 / \eta_\mathrm{H}`$, which can be restrictive at
+high resolution (this is physical, not a bug).
+To enable set (in the `<diffusion>` block)
+```
+integrator = unsplit          # required for the Hall effect
+hall = hall
+hall_coeff = fixed
+hall_coeff_code = 0.1         # Q_H such that eta_H = Q_H * B / rho (code units)
+hall_ohmic_floor_code = 0.0  # optional Ohmic resistivity added inside the Hall kernel for stabilization
+```
+Note that `hall_ohmic_floor_code` is a real parabolic diffusion: it enters the diffusive
+timestep with the (stricter) parabolic factor, summed with the Ohmic $`\eta_\mathrm{O}`$
+in the fused estimator.
+
+#### Non-ideal performance options
+
+Parameter: `eta_cache` (bool) in `<diffusion>` block
+- Default: `true` when any active non-ideal term uses an `ionization`-type coefficient,
+  `false` otherwise. When enabled, the cell-centered $`(\eta_\mathrm{O}, \eta_\mathrm{H},
+  \eta_\mathrm{A})`$ are precomputed once per stage into the derived field `nonideal_eta`
+  and the flux kernels use the arithmetic average of the two adjacent cell values at each
+  face — instead of re-running the (expensive) ionization solve per face per term. This is
+  the Athena++ pattern (cell-centered diffusivity, then face averaging); same order of
+  accuracy, but not bit-identical to the per-face evaluation. Set `eta_cache = false` to
+  restore the per-face path for A/B validation.
+
+Parameter: `fused_nonideal_dt` (bool) in `<diffusion>` block
+- Default: `true` when every active non-ideal term uses the plain `ionization`
+  coefficient. Reduces the Ohmic/ambipolar/Hall diffusive-timestep constraints with a
+  single conductivity-tensor evaluation per cell instead of three.
 
 ### Additional MHD options in `<hydro>` block
 

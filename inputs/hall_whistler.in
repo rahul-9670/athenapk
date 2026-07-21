@@ -1,0 +1,71 @@
+# AthenaPK - a performance portable block structured AMR MHD code
+# Copyright (c) 2024, Athena Parthenon Collaboration. All rights reserved.
+# Licensed under the BSD 3-Clause License (the "LICENSE");
+
+<comment>
+problem = Hall whistler / ion-cyclotron circularly polarized dispersion test
+
+<job>
+problem_id = diffusion
+
+<problem/diffusion>
+iprob = 60       # Hall circularly polarized eigenmode
+Bx    = 1.0      # uniform guide field B0 along x
+By    = 0.0      # (unused)
+amp   = 1.0e-6   # perturbation amplitude (linear regime)
+nwave = 1.0      # wavelengths across the domain
+helicity = -1.0  # -1 = whistler (fast), +1 = ion-cyclotron (slow)
+
+<parthenon/mesh>
+refinement = none
+nghost = 2
+
+nx1 = 128
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2 = 1
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 128
+nx2 = 1
+nx3 = 1
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 0.05
+nlim = 10000000
+
+<hydro>
+fluid = glmmhd
+riemann = hlld
+eos = adiabatic
+reconstruction = plm
+gamma = 2.0
+
+<diffusion>
+integrator = unsplit          # required for the Hall effect
+cfl = 0.3
+hall = hall
+hall_coeff = fixed
+hall_coeff_code = 0.5         # Q_H : eta_H = Q_H * B / rho
+hall_ohmic_floor_code = 0.05  # small Ohmic floor to stabilize Hall on the cell-centered grid
+
+<parthenon/output0>
+file_type = hdf5
+dt = 0.05
+variables = prim
+id = prim

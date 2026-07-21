@@ -68,8 +68,14 @@ int main(int argc, char *argv[]) {
     Hydro::ProblemInitPackageData = linear_wave_mhd::ProblemInitPackageData;
   } else if (problem == "jeans") {
     pman.app_input->ProblemGenerator = jeans::ProblemGenerator;
+  } else if (problem == "polytrope") {
+    pman.app_input->ProblemGenerator = polytrope::ProblemGenerator;
   } else if (problem == "collapse_be") {
     pman.app_input->ProblemGenerator = collapse_be::ProblemGenerator;
+  } else if (problem == "poisson_test") {
+    pman.app_input->ProblemGenerator = poisson_test::ProblemGenerator;
+  } else if (problem == "rad_pulse") {
+    pman.app_input->ProblemGenerator = rad_pulse::ProblemGenerator;
   } else if (problem == "cpaw") {
     pman.app_input->InitUserMeshData = cpaw::InitUserMeshData;
     pman.app_input->ProblemGenerator = cpaw::ProblemGenerator;
@@ -91,6 +97,9 @@ int main(int argc, char *argv[]) {
     pman.app_input->ProblemGenerator = orszag_tang::ProblemGenerator;
   } else if (problem == "diffusion") {
     pman.app_input->ProblemGenerator = diffusion::ProblemGenerator;
+    pman.app_input->UserWorkAfterLoop = diffusion::UserWorkAfterLoop;
+  } else if (problem == "cshock") {
+    pman.app_input->ProblemGenerator = cshock::ProblemGenerator;
   } else if (problem == "field_loop") {
     pman.app_input->ProblemGenerator = field_loop::ProblemGenerator;
     Hydro::ProblemInitPackageData = field_loop::ProblemInitPackageData;

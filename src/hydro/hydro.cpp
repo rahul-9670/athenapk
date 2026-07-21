@@ -5,6 +5,7 @@
 //========================================================================================
 
 #include <algorithm>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -26,7 +27,10 @@
 #include "../recon/wenoz_simple.hpp"
 #include "../refinement/refinement.hpp"
 #include "../tracers/tracers.hpp"
+#include "../sinks/sinks.hpp"
 #include "../units.hpp"
+#include "../units/physical_units.hpp"       // flagship Phase 1: one unit system
+#include "../units/ionization_environment.hpp" // flagship Phase 1: shared CR rate
 #include "defs.hpp"
 #include "diffusion/diffusion.hpp"
 #include "glmmhd/glmmhd.hpp"
@@ -38,6 +42,9 @@
 #include "srcterms/tabular_cooling.hpp"
 #include "utils/error_checking.hpp"
 #include "../self_gravity/self_gravity.hpp"
+#include "../radiation/radiation.hpp"
+#include "../chemistry/chemistry.hpp"
+#include "../dust/dust_pkg.hpp"
 
 using namespace parthenon::package::prelude;
 
@@ -57,8 +64,18 @@ parthenon::Packages_t ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
   parthenon::Packages_t packages;
   packages.Add(Hydro::Initialize(pin.get()));
   packages.Add(Tracers::Initialize(pin.get()));
+  packages.Add(Sinks::Initialize(pin.get()));
   if (pin->GetOrAddBoolean("physics", "self_gravity", false)) {
     packages.Add(SelfGravity::Initialize(pin.get()));
+  }
+  if (pin->GetOrAddBoolean("physics", "radiation", false)) {
+    packages.Add(Radiation::Initialize(pin.get()));
+  }
+  if (pin->GetOrAddBoolean("physics", "chemistry", false)) {
+    packages.Add(Chemistry::Initialize(pin.get()));
+  }
+  if (pin->GetOrAddBoolean("physics", "dust", false)) {
+    packages.Add(Dust::Initialize(pin.get()));
   }
   return packages;
 }
@@ -211,6 +228,45 @@ Real HydroHst(MeshData<Real> *md) {
   return sum;
 }
 
+// WS-5c: peak (max over all cells) of the relative divergence error L*|div(B)|/|B|, for the
+// div B fidelity audit. Registered with UserHistoryOperation::max so Parthenon takes the
+// global max across blocks/ranks. Reports the WORST-cell cleaning error (the "relDivB" sum
+// above is a volume integral -> a mean; near first-core formation the peak is what matters).
+Real HydroHstMaxDivB(MeshData<Real> *md) {
+  const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
+  const bool three_d = cons_pack.GetNdim() == 3;
+  IndexRange ib = md->GetBlockData(0)->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBlockData(0)->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBlockData(0)->GetBoundsK(IndexDomain::interior);
+
+  Real vmax = 0.0;
+  Kokkos::parallel_reduce(
+      "HydroHstMaxDivB",
+      Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+          DevExecSpace(), {0, kb.s, jb.s, ib.s},
+          {cons_pack.GetDim(5), kb.e + 1, jb.e + 1, ib.e + 1},
+          {1, 1, 1, ib.e + 1 - ib.s}),
+      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &lmax) {
+        const auto &cons = cons_pack(b);
+        const auto &coords = cons_pack.GetCoords(b);
+        Real divb =
+            (cons(IB1, k, j, i + 1) - cons(IB1, k, j, i - 1)) / coords.Dxc<1>(k, j, i) +
+            (cons(IB2, k, j + 1, i) - cons(IB2, k, j - 1, i)) / coords.Dxc<2>(k, j, i);
+        if (three_d) {
+          divb += (cons(IB3, k + 1, j, i) - cons(IB3, k - 1, j, i)) / coords.Dxc<3>(k, j, i);
+        }
+        const Real abs_b = std::sqrt(SQR(cons(IB1, k, j, i)) + SQR(cons(IB2, k, j, i)) +
+                                     SQR(cons(IB3, k, j, i)));
+        const Real dx = 0.5 * std::sqrt(SQR(coords.Dxc<1>(k, j, i)) +
+                                        SQR(coords.Dxc<2>(k, j, i)) +
+                                        SQR(coords.Dxc<3>(k, j, i)));
+        const Real rel = (abs_b != 0.0) ? dx * std::abs(divb) / abs_b : 0.0;
+        if (rel > lmax) lmax = rel;
+      },
+      Kokkos::Max<Real>(vmax));
+  return vmax;
+}
+
 // TOOD(pgrete) check is we can enlist this with FillDerived directly
 // this is the package registered function to fill derived, here, convert the
 // conserved variables to primitives
@@ -264,6 +320,58 @@ TaskStatus AddSplitSourcesStrang(MeshData<Real> *md, const SimTime &tm) {
   }
   return TaskStatus::complete;
 }
+
+//----------------------------------------------------------------------------------------
+//! Build the reduced CR+thermal+grain ionization model (NICIL-class, MRN charged grains)
+//! shared by the ambipolar / Ohmic / Hall non-ideal terms when their coefficient is
+//! "ionization". Reads <diffusion> ion_* keys; all default to the shared FHC code-unit
+//! calibration. The MRN grain bins are filled host-side here.
+namespace {
+Ionization::IonizationModel BuildIonizationModel(ParameterInput *pin) {
+  Ionization::IonizationModel ion;
+  // Flagship Phase 1: unit conversions come from the single authoritative unit system
+  // (was: ion_rho_unit_cgs/ion_T_unit_K/ion_B_unit_G/ion_eta_unit hardcoded defaults here,
+  // duplicating chemistry.cpp/radiation.cpp). rho_unit/T_unit bit-identical with chemistry;
+  // B_unit now the exact sqrt(4*pi*rho)*v (audit #3); eta_unit = time/length^2.
+  const auto U = PhysUnits::BuildPhysicalUnits(pin);
+  ion.rho_unit = U.rho_unit;
+  ion.T_unit = U.temperature_unit;
+  ion.B_unit = U.magnetic_unit;
+  ion.eta_unit = U.diffusivity_unit;
+  // Cosmic-ray rate + neutral composition from the shared IonizationEnvironment: the same
+  // object chemistry consumes, so Ohm/Hall/AD and the chemistry x_e describe one charge
+  // population (audit fix #1, now a shared object rather than an init-time assertion).
+  const auto env = PhysUnits::BuildIonizationEnvironment(pin);
+  ion.zeta = env.zeta_cr_cgs;
+  ion.mu_n = env.mu_n;
+  ion.m_ion = pin->GetOrAddReal("diffusion", "ion_m_ion", ion.m_ion);
+  ion.alpha0 = pin->GetOrAddReal("diffusion", "ion_alpha0", ion.alpha0);
+  ion.sigma_en = pin->GetOrAddReal("diffusion", "ion_sigma_en", ion.sigma_en);
+  ion.sigv_in = pin->GetOrAddReal("diffusion", "ion_sigv_in", ion.sigv_in);
+  ion.gamma_AD = pin->GetOrAddReal("diffusion", "ion_gamma_AD", ion.gamma_AD);
+  // grains (MRN distribution)
+  ion.f_dg = pin->GetOrAddReal("diffusion", "ion_f_dg", ion.f_dg);
+  ion.rho_grain = pin->GetOrAddReal("diffusion", "ion_rho_grain", ion.rho_grain);
+  ion.T_subl = pin->GetOrAddReal("diffusion", "ion_T_subl", ion.T_subl);
+  const Real a_min = pin->GetOrAddReal("diffusion", "ion_a_min_cm", 5.0e-7);
+  const Real a_max = pin->GetOrAddReal("diffusion", "ion_a_max_cm", 2.5e-5);
+  const Real mrn_p = pin->GetOrAddReal("diffusion", "ion_mrn_p", 3.5);
+  Ionization::SetupGrainBins(ion, a_min, a_max, mrn_p);
+  // thermal Saha
+  ion.x_K = pin->GetOrAddReal("diffusion", "ion_x_K", ion.x_K);
+  ion.chi_K = pin->GetOrAddReal("diffusion", "ion_chi_K", ion.chi_K);
+  // ambipolar closure: single_fluid (Athena++-matched, default) or tensor (grain-modified)
+  const auto cl = pin->GetOrAddString("diffusion", "ion_ad_closure", "single_fluid");
+  if (cl == "tensor") {
+    ion.ad_closure = Ionization::ADClosure::tensor;
+  } else if (cl == "single_fluid") {
+    ion.ad_closure = Ionization::ADClosure::single_fluid;
+  } else {
+    PARTHENON_FAIL("diffusion/ion_ad_closure must be 'single_fluid' or 'tensor'.");
+  }
+  return ion;
+}
+} // namespace
 
 std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   auto pkg = std::make_shared<StateDescriptor>("Hydro");
@@ -441,6 +549,9 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                                            HydroHst<Hst::emag>, "ME"));
     hst_vars.emplace_back(HistoryOutputVar(parthenon::UserHistoryOperation::sum,
                                            HydroHst<Hst::divb>, "relDivB"));
+    // WS-5c: peak relative div B error (max over cells), for the div B fidelity audit.
+    hst_vars.emplace_back(HistoryOutputVar(parthenon::UserHistoryOperation::max,
+                                           HydroHstMaxDivB, "maxRelDivB"));
   }
   pkg->AddParam<>(parthenon::hist_param_key, hst_vars, true);
 
@@ -488,9 +599,38 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   }
 
   auto eos_str = pin->GetString("hydro", "eos");
-  if (eos_str == "adiabatic") {
+  if (eos_str == "adiabatic" || eos_str == "hydrogen") {
     Real gamma = pin->GetReal("hydro", "gamma");
     pkg->AddParam<>("AdiabaticIndex", gamma);
+
+    // Optional tabulated protostellar EOS (second-core physics). eos=hydrogen loads the
+    // offline full-Saha table (src/eos/gen_eos_table.py: H2 dissociation + H ionization +
+    // He/He+ ionization + H2 rot/vib + inert He, in FHC code units) and interpolates it for
+    // pressure/sound-speed/internal-energy. Requires riemann=hlld.
+    const bool use_h2diss = (eos_str == "hydrogen");
+    EOSTable::EosTable eos_tab;
+    if (use_h2diss) {
+      const auto tabfile = pin->GetOrAddString(
+          "hydro", "eos_table_file",
+          "/beegfs/u/bbg6470/athenapk/src/eos/eos_table.bin");
+      eos_tab.Load(tabfile);
+      const auto riem = pin->GetOrAddString("hydro", "riemann", "hlld");
+      PARTHENON_REQUIRE(riem == "hlld",
+                        "Tabulated protostellar EOS (eos=hydrogen) requires riemann=hlld "
+                        "(HLLE's Roe average bakes in a constant gamma).");
+      // The table EOS owns the gas thermodynamics; without the M1 RT package the pgen's
+      // barotropic source overwrites e_th with an ideal-gamma law inconsistent with the
+      // table. Require radiation on (RT then owns the energy; barotropic is skipped).
+      PARTHENON_REQUIRE(pin->GetOrAddBoolean("physics", "radiation", false),
+                        "eos=hydrogen requires <physics> radiation=true (else the "
+                        "barotropic cooling overwrites the table EOS thermal energy).");
+      if (parthenon::Globals::my_rank == 0) {
+        std::cout << "## EOS: tabulated protostellar EOS ACTIVE (second-core). table="
+                  << tabfile << " grid " << eos_tab.nr_ << "x" << eos_tab.ne_
+                  << " (rho,esp), " << eos_tab.nr_ << "x" << eos_tab.nT_ << " (rho,T)"
+                  << std::endl;
+      }
+    }
 
     if (pin->DoesParameterExist("hydro", "He_mass_fraction") &&
         pkg->AllParams().hasKey("units")) {
@@ -662,6 +802,11 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       auto resistivity_coeff_str =
           pin->GetOrAddString("diffusion", "resistivity_coeff", "none");
       auto resistivity_coeff = ResistivityCoeff::none;
+      // Ceiling on the ionization-model eta_O (code units; default disabled). Bounds the
+      // parabolic dt in the diffusion-decoupled first-core interior; ignored for
+      // resistivity_coeff=fixed. See OhmicDiffusivity::eta_cap_.
+      const Real eta_ohm_cap_code = pin->GetOrAddReal(
+          "diffusion", "eta_ohm_cap_code", std::numeric_limits<Real>::max());
 
       if (resistivity_coeff_str == "spitzer") {
         // If this is implemented, check how the Spitzer coeff for thermal conduction is
@@ -675,13 +820,118 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                                          ohm_diff_coeff_code, 0.0, 0.0, 0.0);
         pkg->AddParam<>("ohm_diff", ohm_diff);
 
+      } else if (resistivity_coeff_str == "ionization") {
+        // Self-consistent Ohmic resistivity eta_O = c^2/(4 pi sigma_O) from the reduced
+        // CR+thermal+grain ionization model (no ohm_diff_coeff_code needed).
+        resistivity_coeff = ResistivityCoeff::ionization;
+        Ionization::IonizationModel ion = BuildIonizationModel(pin);
+        auto ohm_diff = OhmicDiffusivity(resistivity, resistivity_coeff, 0.0, 0.0, 0.0,
+                                         0.0, ion, -1, eta_ohm_cap_code);
+        pkg->AddParam<>("ohm_diff", ohm_diff);
+        if (parthenon::Globals::my_rank == 0) {
+          std::cout << "## Ohmic resistivity: self-consistent ionization model "
+                       "(conductivity-tensor sigma_O)"
+                    << std::endl;
+          if (eta_ohm_cap_code < std::numeric_limits<Real>::max()) {
+            std::cout << "## Ohmic eta_O cap: " << eta_ohm_cap_code << " (code units)"
+                      << std::endl;
+          }
+        }
+
+      } else if (resistivity_coeff_str == "ionization_chem") {
+        // Ohmic eta_O = c^2/(4 pi sigma_O) from the conductivity tensor built on the
+        // TIME-DEPENDENT electron abundance evolved by the chemistry package
+        // (network=gow17_reduced). x_e is prim component nhydro + xe_scalar_index.
+        resistivity_coeff = ResistivityCoeff::ionization_chem;
+        Ionization::IonizationModel ion = BuildIonizationModel(pin);
+        const int xe_scalar = pin->GetOrAddInteger("diffusion", "xe_scalar_index", 4);
+        const int i_xe_prim = nhydro + xe_scalar;
+        auto ohm_diff = OhmicDiffusivity(resistivity, resistivity_coeff, 0.0, 0.0, 0.0, 0.0,
+                                         ion, i_xe_prim, eta_ohm_cap_code);
+        pkg->AddParam<>("ohm_diff", ohm_diff);
+        if (parthenon::Globals::my_rank == 0) {
+          std::cout << "## Ohmic resistivity: chemistry-coupled x_e (conductivity-tensor "
+                       "sigma_O, x_e from prim scalar index "
+                    << i_xe_prim << ")" << std::endl;
+          if (eta_ohm_cap_code < std::numeric_limits<Real>::max()) {
+            std::cout << "## Ohmic eta_O cap: " << eta_ohm_cap_code << " (code units)"
+                      << std::endl;
+          }
+        }
+
       } else {
-        PARTHENON_FAIL("Resistivity is enabled but no coefficient is set. Please "
-                       "set diffusion/resistivity_coeff to 'fixed' and "
-                       "diffusion/ohm_diff_coeff_code to the desired value.");
+        PARTHENON_FAIL("Resistivity is enabled but no valid coefficient is set. Set "
+                       "diffusion/resistivity_coeff to 'fixed' (+ohm_diff_coeff_code), "
+                       "'ionization', or 'ionization_chem'.");
       }
     }
     pkg->AddParam<>("resistivity", resistivity);
+
+    auto ambipolar = Ambipolar::none;
+    auto ambipolar_str = pin->GetOrAddString("diffusion", "ambipolar", "none");
+    if (ambipolar_str == "ambipolar") {
+      ambipolar = Ambipolar::ambipolar;
+    } else if (ambipolar_str != "none") {
+      PARTHENON_FAIL("Unknown ambipolar method. Options are: none, ambipolar");
+    }
+    // If ambipolar diffusion is enabled, process supported coefficients
+    if (ambipolar != Ambipolar::none) {
+      PARTHENON_REQUIRE_THROWS(fluid == Fluid::glmmhd,
+                               "Ambipolar diffusion requires MHD (hydro/fluid=glmmhd).");
+      auto ambipolar_coeff_str =
+          pin->GetOrAddString("diffusion", "ambipolar_coeff", "none");
+      auto ambipolar_coeff = AmbipolarCoeff::none;
+
+      if (ambipolar_coeff_str == "fixed") {
+        ambipolar_coeff = AmbipolarCoeff::fixed;
+        Real ambipolar_coeff_code = pin->GetReal("diffusion", "ambipolar_coeff_code");
+        auto ad_diff = AmbipolarDiffusivity(ambipolar, ambipolar_coeff,
+                                            ambipolar_coeff_code, 0.0, 0.0, 0.0);
+        pkg->AddParam<>("ad_diff", ad_diff);
+
+      } else if (ambipolar_coeff_str == "ionization") {
+        // Self-consistent eta_A = B^2/(4 pi gamma_AD rho_i rho) with rho_i from the
+        // reduced CR+thermal+grain ionization model (replaces the constant Q_A). Defaults
+        // are the shared FHC code-unit calibration; override per <diffusion> ion_* keys.
+        ambipolar_coeff = AmbipolarCoeff::ionization;
+        Ionization::IonizationModel ion = BuildIonizationModel(pin);
+        auto ad_diff =
+            AmbipolarDiffusivity(ambipolar, ambipolar_coeff, 0.0, 0.0, 0.0, 0.0, ion);
+        pkg->AddParam<>("ad_diff", ad_diff);
+        if (parthenon::Globals::my_rank == 0) {
+          const bool tensor = ion.ad_closure == Ionization::ADClosure::tensor;
+          std::cout << "## Ambipolar diffusion: self-consistent ionization model"
+                    << " (CR zeta=" << ion.zeta << " s^-1, MRN dust f_dg=" << ion.f_dg
+                    << ", thermal K x_K=" << ion.x_K
+                    << ", AD closure=" << (tensor ? "tensor" : "single_fluid") << ")"
+                    << std::endl;
+        }
+
+      } else if (ambipolar_coeff_str == "ionization_chem") {
+        // Single-fluid eta_A = B^2/(4 pi gamma_AD rho_i rho) with rho_i set by the
+        // TIME-DEPENDENT electron abundance evolved by the chemistry package
+        // (network=gow17_reduced). The x_e scalar is prim component nhydro + xe_scalar_index
+        // (the gow17_reduced electron species sits at scalar index 4 by default).
+        ambipolar_coeff = AmbipolarCoeff::ionization_chem;
+        Ionization::IonizationModel ion = BuildIonizationModel(pin);
+        const int xe_scalar = pin->GetOrAddInteger("diffusion", "xe_scalar_index", 4);
+        const int i_xe_prim = nhydro + xe_scalar;
+        auto ad_diff = AmbipolarDiffusivity(ambipolar, ambipolar_coeff, 0.0, 0.0, 0.0, 0.0,
+                                            ion, i_xe_prim);
+        pkg->AddParam<>("ad_diff", ad_diff);
+        if (parthenon::Globals::my_rank == 0) {
+          std::cout << "## Ambipolar diffusion: chemistry-coupled x_e (single_fluid eta_A,"
+                    << " x_e from prim scalar index " << i_xe_prim << ", gamma_AD="
+                    << ion.gamma_AD << ")" << std::endl;
+        }
+
+      } else {
+        PARTHENON_FAIL("Ambipolar diffusion is enabled but no valid coefficient is set. "
+                       "Set diffusion/ambipolar_coeff to 'fixed' (+ambipolar_coeff_code), "
+                       "'ionization', or 'ionization_chem'.");
+      }
+    }
+    pkg->AddParam<>("ambipolar", ambipolar);
 
     auto diffint_str = pin->GetOrAddString("diffusion", "integrator", "none");
     auto diffint = DiffInt::none;
@@ -705,13 +955,258 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                         Params::Mutability::Mutable); // diffusive timestep constraint
     pkg->AddParam<>("diffint", diffint);
 
+    auto hall = Hall::none;
+    auto hall_str = pin->GetOrAddString("diffusion", "hall", "none");
+    if (hall_str == "hall") {
+      hall = Hall::hall;
+    } else if (hall_str != "none") {
+      PARTHENON_FAIL("Unknown hall method. Options are: none, hall");
+    }
+    // If the Hall effect is enabled, process supported coefficients. Hall is dispersive
+    // and is never super-time-stepped: with integrator=unsplit everything is unsplit;
+    // with integrator=rkl2 the parabolic terms go into RKL2 while the Hall EMF is applied
+    // unsplit under its own (whistler) strict dt -- the mixed mode.
+    if (hall != Hall::none) {
+      PARTHENON_REQUIRE_THROWS(fluid == Fluid::glmmhd,
+                               "The Hall effect requires MHD (hydro/fluid=glmmhd).");
+      PARTHENON_REQUIRE_THROWS(
+          diffint != DiffInt::none,
+          "The Hall effect needs a diffusion integrator. Set diffusion/integrator to "
+          "'unsplit' (everything unsplit) or 'rkl2' (mixed mode: parabolic terms "
+          "super-time-stepped, dispersive Hall EMF unsplit at its whistler dt).");
+      // Placement of the Ohmic stabilizer floor in the mixed rkl2+Hall mode:
+      // 'unsplit' (default) keeps eta_floor*J with the unsplit Hall EMF, which retains
+      // the strict parabolic ceiling dt <~ cfl_diff*dx^2/(6 eta_floor) on the step;
+      // 'rkl2' moves the floor into the RKL2 parabolic set, lifting that ceiling so the
+      // step is whistler-limited (validate against the whistler eigenmode before use).
+      const auto hall_floor_int_str =
+          pin->GetOrAddString("diffusion", "hall_floor_integrator", "unsplit");
+      PARTHENON_REQUIRE_THROWS(hall_floor_int_str == "unsplit" ||
+                                   hall_floor_int_str == "rkl2",
+                               "Unknown diffusion/hall_floor_integrator. Options are: "
+                               "unsplit, rkl2 (the latter only with integrator=rkl2).");
+      pkg->AddParam<>("hall_floor_int_rkl2",
+                      diffint == DiffInt::rkl2 && hall_floor_int_str == "rkl2");
+      if (diffint == DiffInt::rkl2 && parthenon::Globals::my_rank == 0) {
+        std::cout << "## Mixed diffusion integrator: parabolic terms via RKL2 STS, "
+                     "dispersive Hall EMF unsplit (whistler dt strict); Ohmic floor "
+                  << (hall_floor_int_str == "rkl2" ? "in the RKL2 set" : "unsplit")
+                  << std::endl;
+      }
+      auto hall_coeff_str = pin->GetOrAddString("diffusion", "hall_coeff", "none");
+      auto hall_coeff = HallCoeff::none;
+
+      // Ceiling on |eta_H| (code units; default disabled), the Hall analogue of
+      // diffusion/eta_ohm_cap_code. Bounds the strict whistler dt (~dx^2/|eta_H|) where
+      // the ionization-model |eta_H| ~ B/n_e runs away in the Ohmic-dominated interior;
+      // signed clamp, ignored for hall_coeff=fixed. See HallDiffusivity::eta_cap_.
+      const Real eta_hall_cap_code = pin->GetOrAddReal(
+          "diffusion", "eta_hall_cap_code", std::numeric_limits<Real>::max());
+
+      if (hall_coeff_str == "fixed") {
+        hall_coeff = HallCoeff::fixed;
+        Real hall_coeff_code = pin->GetReal("diffusion", "hall_coeff_code");
+        Real hall_ohmic_floor_code =
+            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_code", 0.0);
+        auto hall_diff = HallDiffusivity(hall, hall_coeff, hall_coeff_code,
+                                         hall_ohmic_floor_code, 0.0, 0.0, 0.0);
+        pkg->AddParam<>("hall_diff", hall_diff);
+
+        if ((resistivity == Resistivity::none) && (hall_ohmic_floor_code <= 0.0) &&
+            (parthenon::Globals::my_rank == 0)) {
+          std::cout << "### WARNING: The Hall effect is enabled without Ohmic resistivity "
+                       "or an Ohmic floor (diffusion/hall_ohmic_floor_code). The Hall term "
+                       "may be numerically unstable on the cell-centered grid."
+                    << std::endl;
+        }
+      } else if (hall_coeff_str == "ionization") {
+        // Self-consistent (signed) Hall diffusivity from the conductivity tensor of the
+        // reduced CR+thermal+grain ionization model. An Ohmic floor is still recommended
+        // for stability on the cell-centered grid (Hall is dispersive).
+        hall_coeff = HallCoeff::ionization;
+        Real hall_ohmic_floor_code =
+            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_code", 0.0);
+        Ionization::IonizationModel ion = BuildIonizationModel(pin);
+        auto hall_diff = HallDiffusivity(hall, hall_coeff, 0.0, hall_ohmic_floor_code, 0.0,
+                                         0.0, 0.0, ion, -1, eta_hall_cap_code);
+        pkg->AddParam<>("hall_diff", hall_diff);
+        if (parthenon::Globals::my_rank == 0) {
+          std::cout << "## Hall effect: self-consistent ionization model "
+                       "(conductivity-tensor sigma_H, signed)"
+                    << std::endl;
+          if (eta_hall_cap_code < std::numeric_limits<Real>::max()) {
+            std::cout << "## Hall |eta_H| cap: " << eta_hall_cap_code << " (code units)"
+                      << std::endl;
+          }
+          if ((resistivity == Resistivity::none) && (hall_ohmic_floor_code <= 0.0)) {
+            std::cout << "### WARNING: Hall enabled without Ohmic resistivity or an Ohmic "
+                         "floor (diffusion/hall_ohmic_floor_code); may be unstable."
+                      << std::endl;
+          }
+        }
+      } else if (hall_coeff_str == "ionization_chem") {
+        // Signed Hall diffusivity from the conductivity tensor built on the TIME-DEPENDENT
+        // electron abundance evolved by the chemistry package. x_e is prim component
+        // nhydro + xe_scalar_index. An Ohmic floor is still recommended for stability.
+        hall_coeff = HallCoeff::ionization_chem;
+        Real hall_ohmic_floor_code =
+            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_code", 0.0);
+        Ionization::IonizationModel ion = BuildIonizationModel(pin);
+        const int xe_scalar = pin->GetOrAddInteger("diffusion", "xe_scalar_index", 4);
+        const int i_xe_prim = nhydro + xe_scalar;
+        auto hall_diff = HallDiffusivity(hall, hall_coeff, 0.0, hall_ohmic_floor_code, 0.0,
+                                         0.0, 0.0, ion, i_xe_prim, eta_hall_cap_code);
+        pkg->AddParam<>("hall_diff", hall_diff);
+        if (parthenon::Globals::my_rank == 0) {
+          std::cout << "## Hall effect: chemistry-coupled x_e (conductivity-tensor sigma_H, "
+                       "signed, x_e from prim scalar index "
+                    << i_xe_prim << ")" << std::endl;
+          if (eta_hall_cap_code < std::numeric_limits<Real>::max()) {
+            std::cout << "## Hall |eta_H| cap: " << eta_hall_cap_code << " (code units)"
+                      << std::endl;
+          }
+          if ((resistivity == Resistivity::none) && (hall_ohmic_floor_code <= 0.0)) {
+            std::cout << "### WARNING: Hall enabled without Ohmic resistivity or an Ohmic "
+                         "floor (diffusion/hall_ohmic_floor_code); may be unstable."
+                      << std::endl;
+          }
+        }
+      } else {
+        PARTHENON_FAIL("The Hall effect is enabled but no valid coefficient is set. Set "
+                       "diffusion/hall_coeff to 'fixed' (+hall_coeff_code), 'ionization', "
+                       "or 'ionization_chem'.");
+      }
+    }
+    pkg->AddParam<>("hall", hall);
+
+    // Fused non-ideal diffusive-timestep path. The per-cell Wardle conductivity tensor
+    // (Ionization::Diffusivities) is the dominant GPU cost, and the three per-term dt
+    // reductions each recompute the full tensor but keep only one eta. When EVERY active
+    // non-ideal term uses an ionization-family coefficient ("ionization" or the
+    // chem-coupled "ionization_chem"), the reductions can share the minimal set of
+    // tensor evaluations per cell (FusedNonidealEval: one equilibrium solve, plus a
+    // chem-x_e solve only where Ohm/Hall are chem-coupled; the tier-4 production mix of
+    // equilibrium Ohm/Hall + chem-capped AD needs just ONE solve where the per-term path
+    // ran three). Fixed-coeff (cheap) terms keep their exact per-term estimators.
+    {
+      bool any_nonideal = false;
+      bool all_ionization = true;
+      if (resistivity != Resistivity::none) {
+        any_nonideal = true;
+        const auto ct = pkg->Param<OhmicDiffusivity>("ohm_diff").GetCoeffType();
+        if (ct != ResistivityCoeff::ionization && ct != ResistivityCoeff::ionization_chem)
+          all_ionization = false;
+      }
+      if (ambipolar != Ambipolar::none) {
+        any_nonideal = true;
+        const auto ct = pkg->Param<AmbipolarDiffusivity>("ad_diff").GetCoeffType();
+        if (ct != AmbipolarCoeff::ionization && ct != AmbipolarCoeff::ionization_chem)
+          all_ionization = false;
+      }
+      if (hall != Hall::none) {
+        any_nonideal = true;
+        const auto ct = pkg->Param<HallDiffusivity>("hall_diff").GetCoeffType();
+        if (ct != HallCoeff::ionization && ct != HallCoeff::ionization_chem)
+          all_ionization = false;
+      }
+      // In the mixed rkl2+Hall mode the whistler limit must stay separate from the
+      // parabolic aggregate; the two-reducer FusedMixed estimator handles that (one
+      // tensor evaluation per cell, two minima), so fusion is available there too.
+      // NOTE (profiled 2026-07-11, job 2321477): the per-term estimators were ~15% of
+      // all GPU kernel time in the mixed production run (2x843ms + 2x421ms per cycle).
+      const bool fusable = any_nonideal && all_ionization;
+      // Optional override (default = auto-on when fusable). Setting
+      // diffusion/fused_nonideal_dt=false forces the exact per-term estimators (used for
+      // A/B validation and as an escape hatch); it can never enable fusion where the
+      // coefficients are not all ionization-family.
+      const bool fused = pin->GetOrAddBoolean("diffusion", "fused_nonideal_dt", fusable);
+      pkg->AddParam<>("nonideal_dt_fused", fused && fusable);
+    }
+
+    // Cell-centered non-ideal diffusivity cache. When enabled, CalcDiffFluxes first
+    // fills a 3-component derived field (eta_O, eta_H, eta_A) once per stage
+    // (PrecomputeNonidealEta) and the Ohmic/ambipolar/Hall flux kernels face-average
+    // the cached per-cell values instead of re-running the (expensive) ionization
+    // solve per face -- cutting up to 9 tensor evaluations per cell per stage to 1.
+    // This is the Athena++ pattern (cell-centered CalcDiffusivity, then face/edge
+    // averaging). Face eta becomes the arithmetic mean of the two adjacent cell
+    // values rather than eta(face-averaged state): same order of accuracy, but not
+    // bit-identical -- diffusion/eta_cache=false restores the per-face evaluation
+    // for A/B validation. Default: on when any active term uses an ionization-type
+    // coefficient (where it pays), off for purely fixed coefficients (where the
+    // per-face evaluation is trivially cheap and bit-identical history matters).
+    {
+      const bool any_nonideal = (resistivity != Resistivity::none) ||
+                                (ambipolar != Ambipolar::none) || (hall != Hall::none);
+      bool any_ionization = false;
+      if (resistivity != Resistivity::none) {
+        const auto ct = pkg->Param<OhmicDiffusivity>("ohm_diff").GetCoeffType();
+        any_ionization |= (ct == ResistivityCoeff::ionization ||
+                           ct == ResistivityCoeff::ionization_chem);
+      }
+      if (ambipolar != Ambipolar::none) {
+        const auto ct = pkg->Param<AmbipolarDiffusivity>("ad_diff").GetCoeffType();
+        any_ionization |= (ct == AmbipolarCoeff::ionization ||
+                           ct == AmbipolarCoeff::ionization_chem);
+      }
+      if (hall != Hall::none) {
+        const auto ct = pkg->Param<HallDiffusivity>("hall_diff").GetCoeffType();
+        any_ionization |=
+            (ct == HallCoeff::ionization || ct == HallCoeff::ionization_chem);
+      }
+      const bool eta_cache =
+          pin->GetOrAddBoolean("diffusion", "eta_cache", any_ionization) && any_nonideal;
+      // Under eos=hydrogen the correct code temperature for the ionization model comes from
+      // the EOS table; that plumbing exists on the cached path (PrecomputeNonidealEta + the
+      // fused dt estimator) but not the per-face cache-off flux kernels, so require the
+      // cache there (it is the default when any term uses an ionization coefficient).
+      PARTHENON_REQUIRE(!(use_h2diss && any_ionization) || eta_cache,
+                        "eos=hydrogen with ionization-coefficient non-ideal MHD requires "
+                        "diffusion/eta_cache=true (the default).");
+      pkg->AddParam<>("nonideal_eta_cache", eta_cache);
+      if (eta_cache) {
+        Metadata m_eta({Metadata::Cell, Metadata::Derived, Metadata::OneCopy},
+                       std::vector<int>({3}),
+                       std::vector<std::string>{"eta_ohmic", "eta_hall", "eta_ambipolar"});
+        pkg->AddField("nonideal_eta", m_eta);
+        if (parthenon::Globals::my_rank == 0) {
+          std::cout << "## Non-ideal eta cache: cell-centered (eta_O, eta_H, eta_A) "
+                       "precomputed once per stage; flux kernels use face-averaged "
+                       "cached values (diffusion/eta_cache=false to disable)."
+                    << std::endl;
+        }
+      }
+      // Freeze the cached eta across the RKL2 stages of each Strang half: the stage
+      // tasks skip the PrecomputeNonidealEta refresh, so eta stays at its value from
+      // the half's first stage (refreshed 2x per cycle instead of once per stage).
+      // RKL2's stability polynomial (Meyer+2012) is derived for an operator held fixed
+      // across the super-step, and the coefficient lag is O(dt/2) on eta(rho,T,B),
+      // which evolves on the collapse timescale >> dt. Requires the eta cache; only
+      // meaningful with integrator=rkl2. Default off (bit-identical history matters
+      // for A/B validation).
+      const bool freeze_eta =
+          pin->GetOrAddBoolean("diffusion", "rkl2_freeze_eta", false);
+      PARTHENON_REQUIRE(!freeze_eta || (eta_cache && diffint == DiffInt::rkl2),
+                        "diffusion/rkl2_freeze_eta=true requires diffusion/eta_cache=true "
+                        "and diffusion/integrator=rkl2.");
+      pkg->AddParam<>("rkl2_freeze_eta", freeze_eta && eta_cache);
+      if (freeze_eta && parthenon::Globals::my_rank == 0) {
+        std::cout << "## RKL2 eta freeze: non-ideal eta cache refreshed at the first "
+                     "stage of each Strang half only (diffusion/rkl2_freeze_eta)."
+                  << std::endl;
+      }
+    }
+
     if (fluid == Fluid::euler) {
+      PARTHENON_REQUIRE(!use_h2diss,
+                        "H2-dissociation EOS (eos=hydrogen) is wired for fluid=glmmhd only.");
       AdiabaticHydroEOS eos(pfloor, dfloor, efloor, vceil, eceil, gamma);
       pkg->AddParam<>("eos", eos);
       pkg->FillDerivedMesh = ConsToPrim<AdiabaticHydroEOS>;
       pkg->EstimateTimestepMesh = EstimateTimestep<Fluid::euler>;
     } else if (fluid == Fluid::glmmhd) {
-      AdiabaticGLMMHDEOS eos(pfloor, dfloor, efloor, vceil, eceil, gamma);
+      AdiabaticGLMMHDEOS eos(pfloor, dfloor, efloor, vceil, eceil, gamma, use_h2diss,
+                             eos_tab);
       pkg->AddParam<>("eos", eos);
       pkg->FillDerivedMesh = ConsToPrim<AdiabaticGLMMHDEOS>;
       pkg->EstimateTimestepMesh = EstimateTimestep<Fluid::glmmhd>;
@@ -944,22 +1439,66 @@ Real EstimateTimestep(MeshData<Real> *md) {
 
   auto dt_diff = std::numeric_limits<Real>::max();
   if (hydro_pkg->Param<DiffInt>("diffint") != DiffInt::none) {
+    const auto diffint = hydro_pkg->Param<DiffInt>("diffint");
+    // Strict dt constraint of the unsplit-in-rkl2 Hall part (mixed mode): the dispersive
+    // whistler limit plus, if diffusion/hall_floor_integrator=unsplit, the floor's
+    // parabolic limit. Kept OUT of dt_diff, which under rkl2 only sets the STS stage
+    // count (and the optional ratio cap).
+    auto dt_strict_hall = std::numeric_limits<Real>::max();
     if (hydro_pkg->Param<Conduction>("conduction") != Conduction::none) {
       dt_diff = std::min(dt_diff, EstimateConductionTimestep(md));
     }
     if (hydro_pkg->Param<Viscosity>("viscosity") != Viscosity::none) {
       dt_diff = std::min(dt_diff, EstimateViscosityTimestep(md));
     }
-    if (hydro_pkg->Param<Resistivity>("resistivity") != Resistivity::none) {
-      dt_diff = std::min(dt_diff, EstimateResistivityTimestep(md));
+    // When every active non-ideal term uses the "ionization" coefficient, evaluate the
+    // (expensive) Wardle conductivity tensor ONCE per cell and reduce the Ohmic/ambipolar/
+    // Hall diffusive dt together. In the mixed rkl2+Hall mode the two-reducer FusedMixed
+    // variant keeps the whistler limit separate from the parabolic aggregate (replacing
+    // up to four full tensor sweeps per cycle with one); otherwise the single-reducer
+    // fused estimator applies. Fall back to the exact per-term estimators when fusion is
+    // off (diffusion/fused_nonideal_dt=false) or coefficients are not all "ionization".
+    const bool mixed_hall_dt = (diffint == DiffInt::rkl2) &&
+                               (hydro_pkg->Param<Hall>("hall") != Hall::none);
+    if (hydro_pkg->Param<bool>("nonideal_dt_fused") && mixed_hall_dt) {
+      const bool floor_rkl2 = hydro_pkg->Param<bool>("hall_floor_int_rkl2");
+      Real dt_par, dt_strict;
+      EstimateNonidealTimestepIonizationFusedMixed(md, !floor_rkl2, dt_par, dt_strict);
+      dt_diff = std::min(dt_diff, dt_par);
+      dt_strict_hall = std::min(dt_strict_hall, dt_strict);
+    } else if (hydro_pkg->Param<bool>("nonideal_dt_fused")) {
+      dt_diff = std::min(dt_diff, EstimateNonidealTimestepIonizationFused(md));
+    } else {
+      if (hydro_pkg->Param<Resistivity>("resistivity") != Resistivity::none) {
+        dt_diff = std::min(dt_diff, EstimateResistivityTimestep(md));
+      }
+      if (hydro_pkg->Param<Ambipolar>("ambipolar") != Ambipolar::none) {
+        dt_diff = std::min(dt_diff, EstimateAmbipolarTimestep(md));
+      }
+      if (hydro_pkg->Param<Hall>("hall") != Hall::none) {
+        if (diffint == DiffInt::unsplit) {
+          // whistler + floor both strict via the unsplit branch below
+          dt_diff = std::min(dt_diff, EstimateHallTimestep(md, true, true));
+        } else {
+          // Mixed mode: whistler (+ floor if unsplit) strict; floor joins the parabolic
+          // aggregate instead when it is RKL2-integrated.
+          const bool floor_rkl2 = hydro_pkg->Param<bool>("hall_floor_int_rkl2");
+          dt_strict_hall =
+              std::min(dt_strict_hall, EstimateHallTimestep(md, true, !floor_rkl2));
+          if (floor_rkl2) {
+            dt_diff = std::min(dt_diff, EstimateHallTimestep(md, false, true));
+          }
+        }
+      }
     }
 
     // For unsplit ingegration use strict limit
-    if (hydro_pkg->Param<DiffInt>("diffint") == DiffInt::unsplit) {
+    if (diffint == DiffInt::unsplit) {
       min_dt = std::min(min_dt, dt_diff);
       // and for RKL2 integration use limit taking into account the maxium ratio
       // or not constrain limit further (which is why RKL2 is there in first place)
-    } else if (hydro_pkg->Param<DiffInt>("diffint") == DiffInt::rkl2) {
+    } else if (diffint == DiffInt::rkl2) {
+      min_dt = std::min(min_dt, dt_strict_hall); // no-op unless mixed rkl2+Hall mode
       const auto max_dt_ratio = hydro_pkg->Param<Real>("rkl2_max_dt_ratio");
       if (max_dt_ratio > 0.0 && dt_hyp / dt_diff > max_dt_ratio) {
         min_dt = std::min(min_dt, max_dt_ratio * dt_diff);
@@ -1211,7 +1750,12 @@ TaskStatus CalculateFluxes(std::shared_ptr<MeshData<Real>> &md) {
 
   const auto &diffint = pkg->Param<DiffInt>("diffint");
   if (diffint == DiffInt::unsplit) {
-    CalcDiffFluxes(pkg.get(), md.get());
+    CalcDiffFluxes(pkg.get(), md.get(), DiffTermSet::all);
+  } else if (diffint == DiffInt::rkl2 && pkg->Param<Hall>("hall") != Hall::none) {
+    // Mixed mode: the dispersive Hall EMF (plus the Ohmic floor unless
+    // hall_floor_integrator=rkl2) rides on the hyperbolic fluxes every stage under the
+    // strict whistler dt; the parabolic terms are applied by the RKL2 tasks.
+    CalcDiffFluxes(pkg.get(), md.get(), DiffTermSet::dispersive);
   }
 
   return TaskStatus::complete;

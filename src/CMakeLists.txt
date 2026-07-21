@@ -6,11 +6,15 @@ add_executable(
         main.cpp
         eos/adiabatic_glmmhd.cpp
         units.hpp
+        units/physical_units.hpp
+        units/ionization_environment.hpp
         bvals/boundary_conditions_apk.hpp
         eos/adiabatic_hydro.cpp
+        hydro/diffusion/ambipolar.cpp
         hydro/diffusion/conduction.cpp
         hydro/diffusion/diffusion.cpp
         hydro/diffusion/diffusion.hpp
+        hydro/diffusion/hall.cpp
         hydro/diffusion/resistivity.cpp
         hydro/diffusion/viscosity.cpp
         hydro/hydro_driver.cpp
@@ -25,10 +29,21 @@ add_executable(
         refinement/jeans.cpp
         tracers/tracers.cpp
         tracers/tracers.hpp
+        sinks/sinks.cpp
+        sinks/sinks.hpp
         utils/few_modes_ft.cpp
         utils/few_modes_ft.hpp
 	self_gravity/self_gravity.cpp
 	self_gravity/self_gravity_driver.cpp
+	radiation/radiation.cpp
+	radiation/radiation_moments.cpp
+	chemistry/chemistry.cpp
+	chemistry/chemistry.hpp
+	dust/dust.cpp
+	dust/dust.hpp
+	dust/dust_pkg.hpp
+	chemistry/network_h2.hpp
+	chemistry/network_gow17_reduced.hpp
 )
 
 add_subdirectory(pgen)

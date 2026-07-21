@@ -19,16 +19,9 @@
 
 using namespace parthenon::package::prelude;
 
-KOKKOS_INLINE_FUNCTION
-Real OhmicDiffusivity::Get(const Real pres, const Real rho) const {
-  if (resistivity_coeff_type_ == ResistivityCoeff::fixed) {
-    return coeff_;
-  } else if (resistivity_coeff_type_ == ResistivityCoeff::spitzer) {
-    PARTHENON_FAIL("needs impl");
-  } else {
-    PARTHENON_FAIL("Unknown Resistivity coeff");
-  }
-}
+// NOTE: OhmicDiffusivity::Get bodies moved to diffusion.hpp -- they are
+// KOKKOS_INLINE_FUNCTION and are called from multiple translation units
+// (flux kernels, dt estimators, PrecomputeNonidealEta).
 
 Real EstimateResistivityTimestep(MeshData<Real> *md) {
   // get to package via first block in Meshdata (which exists by construction)
@@ -51,35 +44,32 @@ Real EstimateResistivityTimestep(MeshData<Real> *md) {
 
   const auto &ohm_diff = hydro_pkg->Param<OhmicDiffusivity>("ohm_diff");
 
-  if (ohm_diff.GetType() == Resistivity::ohmic &&
-      ohm_diff.GetCoeffType() == ResistivityCoeff::fixed) {
-    // TODO(pgrete): once mindx is properly calculated before this loop, we can get rid of
-    // it entirely.
-    // Using 0.0 as parameters rho and p as they're not used anyway for a fixed coeff.
-    const auto ohm_diff_coeff = ohm_diff.Get(0.0, 0.0);
-    Kokkos::parallel_reduce(
-        "EstimateResistivityTimestep (ohmic fixed)",
-        Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
-            DevExecSpace(), {0, kb.s, jb.s, ib.s},
-            {prim_pack.GetDim(5), kb.e + 1, jb.e + 1, ib.e + 1},
-            {1, 1, 1, ib.e + 1 - ib.s}),
-        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &min_dt) {
-          const auto &coords = prim_pack.GetCoords(b);
-          min_dt =
-              fmin(min_dt, SQR(coords.Dxc<1>(k, j, i)) / (ohm_diff_coeff + TINY_NUMBER));
-          if (ndim >= 2) {
-            min_dt = fmin(min_dt,
-                          SQR(coords.Dxc<2>(k, j, i)) / (ohm_diff_coeff + TINY_NUMBER));
-          }
-          if (ndim >= 3) {
-            min_dt = fmin(min_dt,
-                          SQR(coords.Dxc<3>(k, j, i)) / (ohm_diff_coeff + TINY_NUMBER));
-          }
-        },
-        Kokkos::Min<Real>(min_dt_resist));
-  } else {
-    PARTHENON_THROW("Needs impl.");
-  }
+  // Per-cell estimate so it works for both fixed and (spatially varying) ionization
+  // coefficients. eta_O is B-independent, but Get() takes bmag/temp for the unified API.
+  Kokkos::parallel_reduce(
+      "EstimateResistivityTimestep",
+      Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+          DevExecSpace(), {0, kb.s, jb.s, ib.s},
+          {prim_pack.GetDim(5), kb.e + 1, jb.e + 1, ib.e + 1},
+          {1, 1, 1, ib.e + 1 - ib.s}),
+      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &min_dt) {
+        const auto &coords = prim_pack.GetCoords(b);
+        const auto &prim = prim_pack(b);
+        const auto bmag = std::sqrt(SQR(prim(IB1, k, j, i)) + SQR(prim(IB2, k, j, i)) +
+                                    SQR(prim(IB3, k, j, i)));
+        const auto temp = prim(IPR, k, j, i) / prim(IDN, k, j, i); // code T (p = rho*T)
+        const int i_xe = ohm_diff.XeIndex();
+        const Real xe = (i_xe >= 0) ? prim(i_xe, k, j, i) : -1.0;
+        const auto eta = ohm_diff.Get(bmag, prim(IDN, k, j, i), temp, xe);
+        min_dt = fmin(min_dt, SQR(coords.Dxc<1>(k, j, i)) / (eta + TINY_NUMBER));
+        if (ndim >= 2) {
+          min_dt = fmin(min_dt, SQR(coords.Dxc<2>(k, j, i)) / (eta + TINY_NUMBER));
+        }
+        if (ndim >= 3) {
+          min_dt = fmin(min_dt, SQR(coords.Dxc<3>(k, j, i)) / (eta + TINY_NUMBER));
+        }
+      },
+      Kokkos::Min<Real>(min_dt_resist));
 
   const auto &cfl_diff = hydro_pkg->Param<Real>("cfl_diff");
   return cfl_diff * fac * min_dt_resist;
@@ -94,8 +84,12 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
   IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
   IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
 
-  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
-  auto cons_pack = md->PackVariablesAndFluxes(flags_ind);
+  // Pack "cons" by NAME: the {Independent} flag also matches rad.Er/Fr and grav.phi, so
+  // the fixed IB*/IEN flux indices below would silently target the wrong component if a
+  // non-cons Independent field ever sorted ahead of cons (same trap class as the v6 STS
+  // bug). The named pack pins the component indices to cons exactly; bit-identical today.
+  const std::vector<std::string> cons_names{"cons"};
+  auto cons_pack = md->PackVariablesAndFluxes(cons_names, cons_names);
   auto hydro_pkg = pmb->packages.Get("Hydro");
 
   auto const &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
@@ -103,9 +97,16 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
   const int ndim = pmb->pmy_mesh->ndim;
 
   const auto &ohm_diff = hydro_pkg->Param<OhmicDiffusivity>("ohm_diff");
-  // Using fixed and uniform coefficient so it's safe to get it outside the kernel.
-  // Using 0.0 as parameters rho and p as they're not used anyway for a fixed coeff.
-  const auto eta = ohm_diff.Get(0.0, 0.0);
+  // eta is computed per-face inside the kernels: for ResistivityCoeff::fixed it is the
+  // (uniform) coefficient, for ResistivityCoeff::ionization it varies with the local
+  // density/temperature via the self-consistent ionization model.
+
+  // Cell-centered eta cache (PrecomputeNonidealEta): face eta = arithmetic average of
+  // the two adjacent cached values. When the cache is off, "prim" is packed as a dummy
+  // to keep the lambda capture valid; it is never indexed on that branch.
+  const bool use_cache = hydro_pkg->Param<bool>("nonideal_eta_cache");
+  const auto eta_pack = md->PackVariables(
+      std::vector<std::string>{use_cache ? "nonideal_eta" : "prim"});
 
   parthenon::par_for(
       DEFAULT_LOOP_PATTERN, "Resist. X1 fluxes (ohmic)", DevExecSpace(), 0,
@@ -139,6 +140,26 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
                      : 0.0;
 
         const auto j3 = d1B2 - d2B1;
+
+        // Diffusivity at the i-1/2 face: cached cell-centered average, or evaluated
+        // from the face-averaged state.
+        Real eta;
+        if (use_cache) {
+          eta = 0.5 * (eta_pack(b, NonidealEtaIdx::O, k, j, i - 1) +
+                       eta_pack(b, NonidealEtaIdx::O, k, j, i));
+        } else {
+          const Real bm =
+              std::sqrt(SQR(0.5 * (prim(IB1, k, j, i - 1) + prim(IB1, k, j, i))) +
+                        SQR(0.5 * (prim(IB2, k, j, i - 1) + prim(IB2, k, j, i))) +
+                        SQR(0.5 * (prim(IB3, k, j, i - 1) + prim(IB3, k, j, i))));
+          const Real rho = 0.5 * (prim(IDN, k, j, i - 1) + prim(IDN, k, j, i));
+          const Real prs = 0.5 * (prim(IPR, k, j, i - 1) + prim(IPR, k, j, i));
+          const int i_xe = ohm_diff.XeIndex();
+          const Real xe = (i_xe >= 0)
+                              ? 0.5 * (prim(i_xe, k, j, i - 1) + prim(i_xe, k, j, i))
+                              : -1.0;
+          eta = ohm_diff.Get(bm, rho, prs / rho, xe);
+        }
 
         cons.flux(X1DIR, IB2, k, j, i) += -eta * j3;
         cons.flux(X1DIR, IB3, k, j, i) += eta * j2;
@@ -183,6 +204,26 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
 
         const auto j1 = d2B3 - d3B2;
 
+        // Diffusivity at the j-1/2 face: cached cell-centered average, or evaluated
+        // from the face-averaged state.
+        Real eta;
+        if (use_cache) {
+          eta = 0.5 * (eta_pack(b, NonidealEtaIdx::O, k, j - 1, i) +
+                       eta_pack(b, NonidealEtaIdx::O, k, j, i));
+        } else {
+          const Real bm =
+              std::sqrt(SQR(0.5 * (prim(IB1, k, j - 1, i) + prim(IB1, k, j, i))) +
+                        SQR(0.5 * (prim(IB2, k, j - 1, i) + prim(IB2, k, j, i))) +
+                        SQR(0.5 * (prim(IB3, k, j - 1, i) + prim(IB3, k, j, i))));
+          const Real rho = 0.5 * (prim(IDN, k, j - 1, i) + prim(IDN, k, j, i));
+          const Real prs = 0.5 * (prim(IPR, k, j - 1, i) + prim(IPR, k, j, i));
+          const int i_xe = ohm_diff.XeIndex();
+          const Real xe = (i_xe >= 0)
+                              ? 0.5 * (prim(i_xe, k, j - 1, i) + prim(i_xe, k, j, i))
+                              : -1.0;
+          eta = ohm_diff.Get(bm, rho, prs / rho, xe);
+        }
+
         cons.flux(X2DIR, IB1, k, j, i) += eta * j3;
         cons.flux(X2DIR, IB3, k, j, i) += -eta * j1;
         cons.flux(X2DIR, IEN, k, j, i) +=
@@ -223,6 +264,26 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
                           (coords.Xf<1, 3>(k, j, i + 1) - coords.Xf<1, 3>(k, j, i - 1));
 
         const auto j2 = d3B1 - d1B3;
+
+        // Diffusivity at the k-1/2 face: cached cell-centered average, or evaluated
+        // from the face-averaged state.
+        Real eta;
+        if (use_cache) {
+          eta = 0.5 * (eta_pack(b, NonidealEtaIdx::O, k - 1, j, i) +
+                       eta_pack(b, NonidealEtaIdx::O, k, j, i));
+        } else {
+          const Real bm =
+              std::sqrt(SQR(0.5 * (prim(IB1, k - 1, j, i) + prim(IB1, k, j, i))) +
+                        SQR(0.5 * (prim(IB2, k - 1, j, i) + prim(IB2, k, j, i))) +
+                        SQR(0.5 * (prim(IB3, k - 1, j, i) + prim(IB3, k, j, i))));
+          const Real rho = 0.5 * (prim(IDN, k - 1, j, i) + prim(IDN, k, j, i));
+          const Real prs = 0.5 * (prim(IPR, k - 1, j, i) + prim(IPR, k, j, i));
+          const int i_xe = ohm_diff.XeIndex();
+          const Real xe = (i_xe >= 0)
+                              ? 0.5 * (prim(i_xe, k - 1, j, i) + prim(i_xe, k, j, i))
+                              : -1.0;
+          eta = ohm_diff.Get(bm, rho, prs / rho, xe);
+        }
 
         cons.flux(X3DIR, IB1, k, j, i) += -eta * j2;
         cons.flux(X3DIR, IB2, k, j, i) += eta * j1;

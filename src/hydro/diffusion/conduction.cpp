@@ -192,8 +192,10 @@ void ThermalFluxIsoFixed(MeshData<Real> *md) {
   IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
   IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
 
-  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
-  auto cons_pack = md->PackVariablesAndFluxes(flags_ind);
+  // Pack "cons" by NAME (not {Independent}): pins the fixed IEN flux index to cons
+  // regardless of registration order (v6-STS-bug trap class). Bit-identical today.
+  const std::vector<std::string> cons_names{"cons"};
+  auto cons_pack = md->PackVariablesAndFluxes(cons_names, cons_names);
   auto hydro_pkg = pmb->packages.Get("Hydro");
 
   auto const &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
@@ -268,8 +270,10 @@ void ThermalFluxGeneral(MeshData<Real> *md) {
   IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
   IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
 
-  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
-  auto cons_pack = md->PackVariablesAndFluxes(flags_ind);
+  // Pack "cons" by NAME (not {Independent}): pins the fixed IEN flux index to cons
+  // regardless of registration order (v6-STS-bug trap class). Bit-identical today.
+  const std::vector<std::string> cons_names{"cons"};
+  auto cons_pack = md->PackVariablesAndFluxes(cons_names, cons_names);
   auto hydro_pkg = pmb->packages.Get("Hydro");
 
   auto const &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});

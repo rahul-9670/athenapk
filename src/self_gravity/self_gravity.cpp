@@ -4,6 +4,7 @@
 // Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,6 +20,7 @@
 #include "../main.hpp"          // for IDN
 #include "self_gravity.hpp"
 #include "poisson_equation.hpp"
+#include "multipole.hpp"
 #include <solvers/internal_prolongation.hpp>
 
 namespace SelfGravity {
@@ -100,7 +102,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
 
   // --- phi boundary condition enrollment -------------------------------------
   auto valid_bc = [](const std::string &s) {
-    return s == "default" || s == "zero" || s == "neumann";
+    return s == "default" || s == "zero" || s == "neumann" || s == "multipole";
   };
   const std::string b_ix1 = pin->GetOrAddString(block_name, "ix1_bc", "default");
   const std::string b_ox1 = pin->GetOrAddString(block_name, "ox1_bc", "default");
@@ -130,6 +132,55 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   if (b_ox2 == "neumann") pkg->UserBoundaryFunctions[BF::outer_x2].push_back(NeuZ<parthenon::X2DIR, RR>());
   if (b_ix3 == "neumann") pkg->UserBoundaryFunctions[BF::inner_x3].push_back(NeuZ<parthenon::X3DIR, LL>());
   if (b_ox3 == "neumann") pkg->UserBoundaryFunctions[BF::outer_x3].push_back(NeuZ<parthenon::X3DIR, RR>());
+  // Multipole (WS-5a): exterior Cartesian expansion of interior mass through the quadrupole.
+  // Enrolled as the per-block post-solve BC; the packed solver-internal path is in
+  // PoissonEquation::SetBoundary (both keyed on face type 3).
+  if (b_ix1 == "multipole") pkg->UserBoundaryFunctions[BF::inner_x1].push_back(MultipoleBC<parthenon::X1DIR, LL>);
+  if (b_ox1 == "multipole") pkg->UserBoundaryFunctions[BF::outer_x1].push_back(MultipoleBC<parthenon::X1DIR, RR>);
+  if (b_ix2 == "multipole") pkg->UserBoundaryFunctions[BF::inner_x2].push_back(MultipoleBC<parthenon::X2DIR, LL>);
+  if (b_ox2 == "multipole") pkg->UserBoundaryFunctions[BF::outer_x2].push_back(MultipoleBC<parthenon::X2DIR, RR>);
+  if (b_ix3 == "multipole") pkg->UserBoundaryFunctions[BF::inner_x3].push_back(MultipoleBC<parthenon::X3DIR, LL>);
+  if (b_ox3 == "multipole") pkg->UserBoundaryFunctions[BF::outer_x3].push_back(MultipoleBC<parthenon::X3DIR, RR>);
+
+  // Cache the per-face BC type (0=default/other, 1=zero/Dirichlet, 2=neumann/outflow,
+  // 3=multipole) so the packed PoissonEquation::SetBoundary can apply them without the
+  // per-block BC dispatch. Order matches parthenon::BoundaryFace:
+  // inner_x1,outer_x1,inner_x2,outer_x2,inner_x3,outer_x3.
+  auto bc_code = [](const std::string &s) {
+    return s == "zero" ? 1 : (s == "neumann" ? 2 : (s == "multipole" ? 3 : 0));
+  };
+  std::array<int, 6> grav_bc_face_type = {bc_code(b_ix1), bc_code(b_ox1), bc_code(b_ix2),
+                                          bc_code(b_ox2), bc_code(b_ix3), bc_code(b_ox3)};
+  pkg->AddParam("grav_bc_face_type", grav_bc_face_type);
+  // Runtime escape hatch / A-B switch: self_gravity/packed_bc=false forces the original
+  // per-block ApplyBoundaryConditionsOnCoarseOrFineMD path inside SetBoundary.
+  const bool packed_bc = pin->GetOrAddBoolean(block_name, "packed_bc", true);
+  pkg->AddParam("grav_packed_bc", packed_bc);
+
+  // Multipole moments (WS-5a): mutable POD recomputed each step in FillPoissonRHS and
+  // captured by value into the (device) boundary kernels. Registered unconditionally so
+  // both BC paths can Param<>() it; four_pi_G is fixed, the rest start at zero.
+  const bool has_multipole = (b_ix1 == "multipole") || (b_ox1 == "multipole") ||
+                             (b_ix2 == "multipole") || (b_ox2 == "multipole") ||
+                             (b_ix3 == "multipole") || (b_ox3 == "multipole");
+  // Multipole BCs rely on the packed SetBoundary applying HOMOGENEOUS Dirichlet inside the
+  // solve (with the inhomogeneous data lifted into the RHS). packed_bc=false would route
+  // the operator through the enrolled inhomogeneous per-block MultipoleBC, making the
+  // operator affine and diverging the preconditioned solve -- so forbid that combination.
+  PARTHENON_REQUIRE(!has_multipole || packed_bc,
+                    "self_gravity: multipole gravity BCs require packed_bc=true.");
+  // NEW-1 (audit 2026-07-19): the multipole moments are assembled from the FULL density
+  // while the swindle subtracts rho_mean from the RHS -- combining them would solve an
+  // equation whose boundary data and source are mutually inconsistent. The multipole BC
+  // is for isolated (non-periodic) boxes where the swindle is off anyway.
+  PARTHENON_REQUIRE(!has_multipole || !use_swindle,
+                    "self_gravity: multipole gravity BCs are incompatible with "
+                    "use_swindle=true (moments use full rho, swindle RHS uses rho - "
+                    "rho_mean). Disable the swindle for isolated-box multipole BCs.");
+  MultipoleMoments mm0{};
+  mm0.four_pi_G = four_pi_G;
+  pkg->AddParam("grav_multipole_moments", mm0, /*is_mutable=*/true);
+  pkg->AddParam("grav_has_multipole", has_multipole);
 
   // --- Fields ----------------------------------------------------------------
   // phi: solution variable. Needs ghost fill, fluxes, GMG prolong/restrict for AMR MG.
@@ -164,14 +215,35 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   using prolongator_t = parthenon::solvers::ProlongationBlockInteriorZeroDirichlet;
   using preconditioner_t = parthenon::solvers::MGSolver<PoissEq, prolongator_t>;
   const std::string solver_params_block = block_name + "/solver_params";
-  auto psolver =
-      std::make_shared<parthenon::solvers::BiCGSTABSolver<PoissEq, preconditioner_t>>(
-          /*container_base=*/"base",
-          /*container_u=*/"phi",
-          /*container_rhs=*/"rhs",
-          pin, solver_params_block, PoissEq(pin, block_name));
-  pkg->AddParam("solver_pointer",
-                std::static_pointer_cast<parthenon::solvers::SolverBase>(psolver));
+  // Runtime-selectable solver. Default "BiCGSTAB" reproduces production behaviour
+  // bit-for-bit. "MG" / "Multigrid" uses the *pure* geometric multigrid solver,
+  // which has no global inner-products (BiCGSTAB needs ~2 all-reduces/iteration),
+  // attacking the latency-bound bottleneck of the GPU self-gravity solve.
+  // NOTE: solver=MG (pure multigrid) needs an adequate smoother on AMR. SRJ1 (one
+  // weighted-Jacobi sweep) is enough on a UNIFORM grid but NOT across AMR fine-coarse
+  // boundaries, where the coarse-grid correction injects high-frequency error each
+  // V-cycle (the standalone V-cycle then has spectral radius > 1 and diverges). Use
+  // SRJ2/SRJ3 for MG on AMR; SRJ2 is the parthenon MGParams default and converges in
+  // ~6 V-cycles. BiCGSTAB tolerates SRJ1 because its Krylov outer loop stabilises a
+  // non-contractive preconditioner.
+  const std::string solver_type =
+      pin->GetOrAddString(solver_params_block, "solver", "BiCGSTAB");
+  std::shared_ptr<parthenon::solvers::SolverBase> psolver;
+  if (solver_type == "MG" || solver_type == "Multigrid") {
+    psolver = std::make_shared<parthenon::solvers::MGSolver<PoissEq, prolongator_t>>(
+        /*container_base=*/"base",
+        /*container_u=*/"phi",
+        /*container_rhs=*/"rhs",
+        pin, solver_params_block, PoissEq(pin, block_name));
+  } else {
+    psolver =
+        std::make_shared<parthenon::solvers::BiCGSTABSolver<PoissEq, preconditioner_t>>(
+            /*container_base=*/"base",
+            /*container_u=*/"phi",
+            /*container_rhs=*/"rhs",
+            pin, solver_params_block, PoissEq(pin, block_name));
+  }
+  pkg->AddParam("solver_pointer", psolver);
 
   return pkg;
 }
@@ -183,6 +255,7 @@ void FillPoissonRHS(MeshData<Real> *md) {
   auto &grav_pkg = pm->packages.Get("self_gravity");
   const bool use_swindle = grav_pkg->Param<bool>("use_swindle");
   const Real four_pi_G = grav_pkg->Param<Real>("four_pi_G");
+  const bool has_multipole = grav_pkg->Param<bool>("grav_has_multipole");
 
   const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
   auto &resolved = pm->resolved_packages;
@@ -223,6 +296,71 @@ void FillPoissonRHS(MeshData<Real> *md) {
     grav_mean_rho = total_mass / total_volume;
   }
 
+  // --- Multipole moments (for multipole exterior BC) -------------------------
+  // Ten raw moments about the coordinate origin (mass, mass-weighted x_i, and
+  // mass-weighted x_i x_j) summed over interior cells, then a global MPI_Allreduce.
+  // From these derive the center of mass and the traceless quadrupole about it.
+  // Uses the FULL density (not rho - rho_mean): the multipole BC is only used on
+  // isolated (non-periodic) boxes where the swindle is off, so RHS = 4piG*rho and
+  // the exterior expansion is of that same rho -- consistent by construction.
+  if (has_multipole) {
+    Kokkos::View<Real *> mom("SG::moments", 10);
+    Kokkos::deep_copy(mom, 0.0);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "SG::Moments", parthenon::DevExecSpace(), 0, nblocks - 1,
+        kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &coords = prim_pack.GetCoords(b);
+          const Real vv = coords.CellVolume(k, j, i);
+          const Real dm = prim_pack(b, IDN, k, j, i) * vv;
+          const Real x = coords.Xc<parthenon::X1DIR>(k, j, i);
+          const Real y = coords.Xc<parthenon::X2DIR>(k, j, i);
+          const Real z = coords.Xc<parthenon::X3DIR>(k, j, i);
+          Kokkos::atomic_add(&mom(0), dm);
+          Kokkos::atomic_add(&mom(1), dm * x);
+          Kokkos::atomic_add(&mom(2), dm * y);
+          Kokkos::atomic_add(&mom(3), dm * z);
+          Kokkos::atomic_add(&mom(4), dm * x * x);
+          Kokkos::atomic_add(&mom(5), dm * y * y);
+          Kokkos::atomic_add(&mom(6), dm * z * z);
+          Kokkos::atomic_add(&mom(7), dm * x * y);
+          Kokkos::atomic_add(&mom(8), dm * x * z);
+          Kokkos::atomic_add(&mom(9), dm * y * z);
+        });
+    Kokkos::fence();
+    auto mom_h = Kokkos::create_mirror_view(mom);
+    Kokkos::deep_copy(mom_h, mom);
+    Real h[10];
+    for (int t = 0; t < 10; ++t) h[t] = mom_h(t);
+#ifdef MPI_PARALLEL
+    PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, h, 10, MPI_PARTHENON_REAL, MPI_SUM,
+                                      MPI_COMM_WORLD));
+#endif
+    MultipoleMoments mm;
+    mm.four_pi_G = four_pi_G;
+    mm.M = h[0];
+    const Real invM = (h[0] != 0.0) ? 1.0 / h[0] : 0.0;
+    mm.cx = h[1] * invM;
+    mm.cy = h[2] * invM;
+    mm.cz = h[3] * invM;
+    // Second moments of mass about the COM: mu_ij = <x_i x_j> - M c_i c_j.
+    const Real muxx = h[4] - mm.M * mm.cx * mm.cx;
+    const Real muyy = h[5] - mm.M * mm.cy * mm.cy;
+    const Real muzz = h[6] - mm.M * mm.cz * mm.cz;
+    const Real muxy = h[7] - mm.M * mm.cx * mm.cy;
+    const Real muxz = h[8] - mm.M * mm.cx * mm.cz;
+    const Real muyz = h[9] - mm.M * mm.cy * mm.cz;
+    // Traceless Cartesian quadrupole Q_ij = 3 mu_ij - delta_ij tr(mu).
+    const Real tr = muxx + muyy + muzz;
+    mm.Qxx = 3.0 * muxx - tr;
+    mm.Qyy = 3.0 * muyy - tr;
+    mm.Qzz = 3.0 * muzz - tr;
+    mm.Qxy = 3.0 * muxy;
+    mm.Qxz = 3.0 * muxz;
+    mm.Qyz = 3.0 * muyz;
+    grav_pkg->UpdateParam("grav_multipole_moments", mm);
+  }
+
   // --- Fill rhs over entire domain (incl. ghosts) ----------------------------
   parthenon::par_for(
       DEFAULT_LOOP_PATTERN, "SG::SetRHS", parthenon::DevExecSpace(), 0, nblocks - 1,
@@ -231,6 +369,60 @@ void FillPoissonRHS(MeshData<Real> *md) {
         const Real rho = prim_pack(b, IDN, k, j, i);
         rhs_pack(b, te, grav::rhs(), k, j, i) = four_pi_G * (rho - grav_mean_rho);
       });
+
+  // --- Multipole boundary lift ----------------------------------------------
+  // The Poisson solver runs a LINEAR operator with HOMOGENEOUS Dirichlet ghosts on the
+  // multipole faces (see PoissonEquation::SetBoundary). The inhomogeneous exterior-
+  // expansion face value Phi_mp is folded into the RHS here: for an interior cell adjacent
+  // to a boundary face, the true ghost 2*Phi_mp - phi_int vs the homogeneous ghost -phi_int
+  // differ by 2*Phi_mp, which the discrete Laplacian adds as +2*Phi_mp/dx_n^2. Moving it to
+  // the RHS:  b -= 2*Phi_mp(face) / dx_n^2  at each boundary-adjacent interior cell (edges/
+  // corners get one term per touching face). Post-solve, the enrolled per-block MultipoleBC
+  // restores the physical ghost values for ApplyGravitySource.
+  if (has_multipole) {
+    const MultipoleMoments mm =
+        grav_pkg->Param<MultipoleMoments>("grav_multipole_moments");
+    const auto &bctype = grav_pkg->Param<std::array<int, 6>>("grav_bc_face_type");
+    for (int b = 0; b < nblocks; ++b) {
+      auto *pmb = md->GetBlockData(b)->GetBlockPointer();
+      for (int f = 0; f < 6; ++f) {
+        if (bctype[f] != 3) continue;
+        if (pmb->boundary_flag[f] != parthenon::BoundaryFlag::user) continue;
+        const int dd = f / 2;         // 0->x1, 1->x2, 2->x3
+        const bool inner = (f % 2 == 0);
+        const int foff = inner ? 0 : 1; // Xf face-index offset for this side
+        // Interior cell slab adjacent to this face (one cell thick along dd).
+        const int i0 = (dd == 0) ? (inner ? ib.s : ib.e) : ib.s;
+        const int i1 = (dd == 0) ? (inner ? ib.s : ib.e) : ib.e;
+        const int j0 = (dd == 1) ? (inner ? jb.s : jb.e) : jb.s;
+        const int j1 = (dd == 1) ? (inner ? jb.s : jb.e) : jb.e;
+        const int k0 = (dd == 2) ? (inner ? kb.s : kb.e) : kb.s;
+        const int k1 = (dd == 2) ? (inner ? kb.s : kb.e) : kb.e;
+        parthenon::par_for(
+            DEFAULT_LOOP_PATTERN, "SG::MultipoleRHSLift", parthenon::DevExecSpace(),
+            b, b, k0, k1, j0, j1, i0, i1,
+            KOKKOS_LAMBDA(const int bb, const int k, const int j, const int i) {
+              const auto &coords = prim_pack.GetCoords(bb);
+              Real px = coords.Xc<parthenon::X1DIR>(k, j, i);
+              Real py = coords.Xc<parthenon::X2DIR>(k, j, i);
+              Real pz = coords.Xc<parthenon::X3DIR>(k, j, i);
+              Real dxn;
+              if (dd == 0) {
+                px = coords.Xf<parthenon::X1DIR>(k, j, i + foff);
+                dxn = coords.Dxc<parthenon::X1DIR>(k, j, i);
+              } else if (dd == 1) {
+                py = coords.Xf<parthenon::X2DIR>(k, j + foff, i);
+                dxn = coords.Dxc<parthenon::X2DIR>(k, j, i);
+              } else {
+                pz = coords.Xf<parthenon::X3DIR>(k + foff, j, i);
+                dxn = coords.Dxc<parthenon::X3DIR>(k, j, i);
+              }
+              const Real val = MultipolePhi(mm, px, py, pz);
+              rhs_pack(bb, te, grav::rhs(), k, j, i) -= 2.0 * val / (dxn * dxn);
+            });
+      }
+    }
+  }
 }
 
 // ApplyGravitySource: momentum += rho * g * dt, energy += flux-weighted work.
@@ -247,9 +439,13 @@ TaskStatus ApplyGravitySource(MeshData<Real> *md, const parthenon::SimTime &tm,
   auto desc_phi = parthenon::MakePackDescriptor<grav::phi>(resolved.get());
   auto phi_pack = desc_phi.GetPack(md);
 
-  // Mass flux: "cons" pack with fluxes (density flux = component IDN).
-  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
-  auto cons_flx_pack = md->PackVariablesAndFluxes(flags_ind);
+  // Mass flux: pack the "cons" variable AND its fluxes BY NAME (density flux =
+  // component IDN). Packing by name rather than the {Independent} metadata flag
+  // is required here: grav::phi is also Independent + WithFluxes, so selecting by
+  // flag would pull phi into the pack and make the flat IDN index point at phi's
+  // flux instead of the gas mass flux whenever phi sorts ahead of cons.
+  auto cons_flx_pack = md->PackVariablesAndFluxes(std::vector<std::string>{"cons"},
+                                                  std::vector<std::string>{"cons"});
 
   IndexRange ib = md->GetBoundsI(IndexDomain::interior);
   IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
