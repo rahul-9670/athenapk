@@ -32,8 +32,22 @@
   3D E1/E2/E3 kernels validated on a 3D field loop (iprob=2, cylinder along x with diagonal flow
   so all three edge EMFs are active, 2 blocks): absolute div B = 1.6e-18 (round-off), EXIT 0 —
   confirms the cyclic curl signs and edge indexing. `field_loop` CT face-init extended to iprob=1/2/3.
-- **Increment 4 (non-ideal edge-EMF re-routing + STS-curl) — NEXT.** Deposit the Ohm/AD/Hall EMFs
-  on the shared edges instead of the cell-face induction flux; advance Bf under RKL2 via the curl.
+- **Increment 5 (restart/output) — DONE (2026-07-22).** `Bf` is `Metadata::Independent`, so Parthenon
+  includes it in the restart set automatically (restart dump shows `Var: Bf:3`). Round-trip (run to
+  cycle 70 → restart → cycle 140) gives round-off absolute div B and a final magnetic energy
+  **bit-identical** to the uninterrupted run — the self-resuming production submit pattern works on CT.
+  phdf science output keeps cell-centered (projected) B, so analysis notebooks are unaffected.
+- **Increment 6 (GPU validation) — DONE (2026-07-22).** The CT sources compile cleanly with the Kokkos
+  `nvcc_wrapper` for `Kokkos_ARCH_HOPPER90` (build job 2379356, `build_gpu/bin/athenaPK` md5 caff223b).
+  On-device smoke on one H100 (job 2379359): 3D field loop (iprob=2, all E1/E2/E3, 2 blocks)
+  absolute div B = **1.4e-18**; static-AMR field loop (20 blocks, C-F reflux) = **2.6e-18** — both
+  EXIT 0, round-off, matching the CPU values. GPU SUM-reduction non-determinism does not affect the
+  MIN/MAX divergence reduction.
+- **Increment 4 (non-ideal edge-EMF re-routing + STS-curl) — NEXT (hard).** Deposit the Ohm/AD/Hall
+  EMFs on the shared edges instead of the cell-face induction flux; advance Bf under RKL2 via the curl.
+  Touches validated production diffusion physics — warrants its own focused, separately-validated pass.
+- **Increment 7 (CT-vs-GLM collapse flux-retention gate) — the Phase-2 science gate.** Needs GPU
+  collapse runs (`divergence_control=glm` vs `=ct`, matched otherwise) at reduced resolution first.
 
 **Status:** design / scoping note (read-only investigation, no code changed).
 **Scope:** replace GLM/Dedner hyperbolic divergence cleaning with staggered/face-centered
