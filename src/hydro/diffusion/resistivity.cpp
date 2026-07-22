@@ -92,6 +92,14 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
   auto cons_pack = md->PackVariablesAndFluxes(cons_names, cons_names);
   auto hydro_pkg = pmb->packages.Get("Hydro");
 
+  // Under Constrained Transport (divergence_control=ct) the magnetic *induction* is
+  // advanced from an edge-centered curl of eta*J assembled in CT_AddOhmicEMF (ct.cpp),
+  // so we must NOT also deposit the resistive contribution into the cell-centered
+  // cons.flux(IB*) here -- GS05 reads those and would double-count it. The resistive
+  // *energy* (Poynting/heating) term in cons.flux(IEN) is unaffected and stays on the
+  // finite-volume energy flux. GLM path (use_ct=false): deposits unchanged, bit-identical.
+  const bool ct_induction = hydro_pkg->Param<bool>("use_ct");
+
   auto const &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
 
   const int ndim = pmb->pmy_mesh->ndim;
@@ -161,8 +169,10 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
           eta = ohm_diff.Get(bm, rho, prs / rho, xe);
         }
 
-        cons.flux(X1DIR, IB2, k, j, i) += -eta * j3;
-        cons.flux(X1DIR, IB3, k, j, i) += eta * j2;
+        if (!ct_induction) {
+          cons.flux(X1DIR, IB2, k, j, i) += -eta * j3;
+          cons.flux(X1DIR, IB3, k, j, i) += eta * j2;
+        }
         cons.flux(X1DIR, IEN, k, j, i) +=
             0.5 * eta *
             ((prim(IB3, k, j, i - 1) + prim(IB3, k, j, i)) * j2 -
@@ -224,8 +234,10 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
           eta = ohm_diff.Get(bm, rho, prs / rho, xe);
         }
 
-        cons.flux(X2DIR, IB1, k, j, i) += eta * j3;
-        cons.flux(X2DIR, IB3, k, j, i) += -eta * j1;
+        if (!ct_induction) {
+          cons.flux(X2DIR, IB1, k, j, i) += eta * j3;
+          cons.flux(X2DIR, IB3, k, j, i) += -eta * j1;
+        }
         cons.flux(X2DIR, IEN, k, j, i) +=
             0.5 * eta *
             ((prim(IB1, k, j - 1, i) + prim(IB1, k, j, i)) * j3 -
@@ -285,8 +297,10 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
           eta = ohm_diff.Get(bm, rho, prs / rho, xe);
         }
 
-        cons.flux(X3DIR, IB1, k, j, i) += -eta * j2;
-        cons.flux(X3DIR, IB2, k, j, i) += eta * j1;
+        if (!ct_induction) {
+          cons.flux(X3DIR, IB1, k, j, i) += -eta * j2;
+          cons.flux(X3DIR, IB2, k, j, i) += eta * j1;
+        }
         cons.flux(X3DIR, IEN, k, j, i) +=
             0.5 * eta *
             ((prim(IB2, k - 1, j, i) + prim(IB2, k, j, i)) * j1 -

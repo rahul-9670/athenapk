@@ -572,6 +572,12 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
       } else {
         emf = tl.AddTask(calc_flux, Hydro::CT::CT_AssembleEMF, mu0.get());
       }
+      // CT increment 4 (non-ideal): add the Ohmic edge EMF (eta*curl(Bf), edge-centered)
+      // onto the ideal edge EMF, BEFORE the flux-correction round so the coarse-fine
+      // reflux restricts it too. No-op unless resistivity is active. The matching cons
+      // induction deposit in OhmicDiffFluxIsoFixed is gated off under CT (no double
+      // count); its resistive-energy term stays on the FV flux. Unsplit only.
+      emf = tl.AddTask(emf, Hydro::CT::CT_AddOhmicEMF, mu0.get());
     }
     auto send_flx = tl.AddTask(first_order_flux_correct | emf,
                                parthenon::LoadAndSendFluxCorrections, mu0);

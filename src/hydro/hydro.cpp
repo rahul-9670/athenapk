@@ -1114,6 +1114,26 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     }
     pkg->AddParam<>("hall", hall);
 
+    // Constrained Transport (divergence_control=ct) support for non-ideal MHD is limited
+    // to Ohmic resistivity in the unsplit integrator (increment 4). The Ohmic induction
+    // is re-routed to an edge-centered CT EMF (CT_AddOhmicEMF); its cons-flux induction
+    // deposit is gated off. AD/Hall are NOT yet CT-routed (their cons-flux induction would
+    // be folded through the GS05 face-flux read un-validated), and RKL2 super-time-stepping
+    // updates the cell-centered B via a separate super-step that the CT projection would
+    // clobber. Fail loudly rather than run silently-wrong physics.
+    if (pkg->Param<bool>("use_ct")) {
+      PARTHENON_REQUIRE_THROWS(
+          !((resistivity != Resistivity::none) && (diffint == DiffInt::rkl2)),
+          "Ohmic resistivity under Constrained Transport (divergence_control=ct) requires "
+          "the unsplit diffusion integrator (diffusion/integrator=unsplit); RKL2 STS + CT "
+          "is not supported.");
+      PARTHENON_REQUIRE_THROWS(
+          (ambipolar == Ambipolar::none) && (hall == Hall::none),
+          "Ambipolar diffusion and the Hall effect are not yet supported under Constrained "
+          "Transport (divergence_control=ct); only ideal MHD and Ohmic resistivity are "
+          "CT-routed so far.");
+    }
+
     // Fused non-ideal diffusive-timestep path. The per-cell Wardle conductivity tensor
     // (Ionization::Diffusivities) is the dominant GPU cost, and the three per-term dt
     // reductions each recompute the full tensor but keep only one eta. When EVERY active

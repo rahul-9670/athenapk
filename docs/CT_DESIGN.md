@@ -43,9 +43,23 @@
   absolute div B = **1.4e-18**; static-AMR field loop (20 blocks, C-F reflux) = **2.6e-18** — both
   EXIT 0, round-off, matching the CPU values. GPU SUM-reduction non-determinism does not affect the
   MIN/MAX divergence reduction.
-- **Increment 4 (non-ideal edge-EMF re-routing + STS-curl) — NEXT (hard).** Deposit the Ohm/AD/Hall
-  EMFs on the shared edges instead of the cell-face induction flux; advance Bf under RKL2 via the curl.
-  Touches validated production diffusion physics — warrants its own focused, separately-validated pass.
+- **Increment 4 (non-ideal edge-EMF re-routing) — Ohmic DONE (2026-07-22); AD/Hall + STS-curl PENDING.**
+  `CT_AddOhmicEMF` (ct.cpp) computes the resistive EMF `E += eta*J` with `J = curl(Bf)` evaluated
+  *edge-centered* directly from the staggered face field, accumulated onto the ideal edge EMF in
+  `Bf.flux(E1/E2/E3)` BEFORE the flux-correction round (so the C-F reflux restricts it too). Because
+  `CT_UpdateBf` does `dB/dt = -curl(E)`, this reproduces `dB/dt = eta grad^2 B`. The double-count trap
+  is closed by gating the `cons.flux(IBn)` induction deposit in `OhmicDiffFluxIsoFixed` behind
+  `!use_ct` (its `cons.flux(IEN)` resistive-Poynting/heating term stays on the FV energy flux); GLM path
+  (`use_ct=false`) is bit-identical by construction (the guard branch always evaluates true). Unsplit
+  only — an init-time `PARTHENON_REQUIRE` forbids `rkl2`+CT with resistivity, and AD/Hall+CT (not yet
+  routed) fail loudly. **Validation (CPU):** (i) 1D Ohmic Gaussian decay (diffusion pgen iprob=40) —
+  CT By peak matches analytic to **0.008%** and equals the GLM control to 7 sig figs; (ii) 2D resistive
+  static field loop — `ct_maxAbsDivB` = **4.5e-18** (round-off) across the whole run while ME decays to
+  2.42%, with CT-vs-GLM ME decay agreeing to **0.12%**; (iii) ideal-CT regression unchanged
+  (`ct_maxAbsDivB` = 3.38e-18). Decks: `runs/ct_tests/diffusion_ohmic_{glm,ct}.in`,
+  `field_loop_resistive_{ct,glm}.in`. **PENDING:** AD (perp-current `eta_A(J-(J.b)b)`) and Hall
+  (`eta_H (JxB)/|B|`) need B interpolated to edges + cross products; RKL2 STS-curl for CT (STS advances
+  cell-centered B via flux-divergence, which the projection clobbers) remains unsupported.
 - **Increment 7 (CT-vs-GLM collapse flux-retention gate) — the Phase-2 science gate. IN PROGRESS.**
   Groundwork done: `collapse_be` now initializes `Bf` (uniform B0z on F3 faces) on the CT path, so a
   CT collapse shares the GLM IC. Finding (2026-07-22): a *lean* gate config (`eos=adiabatic` +

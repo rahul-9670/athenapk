@@ -79,6 +79,23 @@ struct Bf : public parthenon::variable_names::base_t<false> {
 TaskStatus CT_AssembleEMF(MeshData<Real> *md);
 TaskStatus CT_AssembleEMF_GS05(MeshData<Real> *md, const Real dt);
 
+// Non-ideal (resistive) edge EMF for CT (Phase 2, increment 4). Adds the Ohmic EMF
+// E_ohm = eta * J, with J = curl(Bf) evaluated *edge-centered* directly from the face
+// field, onto the ideal edge EMF already stored in Bf.flux(E1,E2,E3). Because
+// CT_UpdateBf advances dB/dt = -curl(E), accumulating E += eta*J reproduces the
+// resistive induction dB/dt = -curl(eta curl B) = eta grad^2 B (const eta) while
+// keeping div B at round-off (curl of a single-valued edge EMF telescopes).
+//
+// This is the CT counterpart of the *induction* half of OhmicDiffFluxIsoFixed
+// (resistivity.cpp): under divergence_control=ct that kernel's cons.flux(IBn)
+// induction deposits are gated OFF (so GS05 does not double-count them), while its
+// cons.flux(IEN) resistive-Poynting/heating term stays on the finite-volume energy
+// flux. Must run AFTER CT_AssembleEMF[_GS05] (ideal EMF present) and BEFORE the
+// flux-correction round (so the C-F reflux restricts the non-ideal edge EMF too).
+// eta at the edge: fixed coeff -> uniform; ionization/cache -> average of the four
+// (E3) / (E1,E2) cells bounding the edge. Unsplit only (STS+CT is incompatible).
+TaskStatus CT_AddOhmicEMF(MeshData<Real> *md);
+
 // VL2 low-storage face update: Bf_base = gam0*Bf_base + gam1*Bf_u1
 //                                       + beta_dt * curl(edge EMF stored in Bf.flux).
 TaskStatus CT_UpdateBf(MeshData<Real> *md_base, MeshData<Real> *md_u1, const Real gam0,

@@ -17,6 +17,7 @@
 #include <parthenon/package.hpp>
 
 #include "../../main.hpp"
+#include "../diffusion/diffusion.hpp"
 #include "ct.hpp"
 
 using namespace parthenon::package::prelude;
@@ -460,6 +461,134 @@ Real CT_MaxAbsFaceDivB(MeshData<Real> *md) {
       },
       Kokkos::Max<Real>(maxdiv));
   return maxdiv;
+}
+
+//----------------------------------------------------------------------------------------
+//! Cell-centered Ohmic diffusivity eta_O, from the cache if on, else evaluated from the
+//! local primitive state (for ResistivityCoeff::fixed this ignores the state and returns
+//! the uniform coefficient). Used to average eta to the edge in CT_AddOhmicEMF.
+template <class Pack>
+KOKKOS_INLINE_FUNCTION Real CellEtaO(const bool use_cache, const OhmicDiffusivity &ohm,
+                                     const Pack &eta_pack, const Pack &prim, const int b,
+                                     const int k, const int j, const int i) {
+  if (use_cache) {
+    return eta_pack(b, NonidealEtaIdx::O, k, j, i);
+  }
+  const Real bm = std::sqrt(SQR(prim(b, IB1, k, j, i)) + SQR(prim(b, IB2, k, j, i)) +
+                            SQR(prim(b, IB3, k, j, i)));
+  const Real rho = prim(b, IDN, k, j, i);
+  const Real prs = prim(b, IPR, k, j, i);
+  const int i_xe = ohm.XeIndex();
+  const Real xe = (i_xe >= 0) ? prim(b, i_xe, k, j, i) : -1.0;
+  return ohm.Get(bm, rho, prs / rho, xe);
+}
+
+//----------------------------------------------------------------------------------------
+//! Non-ideal (Ohmic) edge EMF for CT: E += eta * J with J = curl(Bf) evaluated directly
+//! from the staggered face field, so J is naturally edge-centered on the same E1/E2/E3
+//! edges that carry the ideal EMF. See ct.hpp. Sign: CT_UpdateBf does dB/dt=-curl(E),
+//! so E_ohm = eta*J = eta*curl(B) gives dB/dt = -curl(eta curl B) = eta grad^2 B.
+TaskStatus CT_AddOhmicEMF(MeshData<Real> *md) {
+  auto pmb = md->GetBlockData(0)->GetBlockPointer();
+  auto hydro_pkg = pmb->packages.Get("Hydro");
+  // No-op unless Ohmic resistivity is active (CT diffusion is unsplit-only).
+  if (hydro_pkg->Param<Resistivity>("resistivity") == Resistivity::none) {
+    return TaskStatus::complete;
+  }
+  const int ndim = md->GetMeshPointer()->ndim;
+  const bool three_d = ndim > 2;
+  const auto &ohm_diff = hydro_pkg->Param<OhmicDiffusivity>("ohm_diff");
+  const bool use_cache = hydro_pkg->Param<bool>("nonideal_eta_cache");
+
+  auto prim = md->PackVariables(std::vector<std::string>{"prim"});
+  // When the cache is off, "prim" is packed as a dummy to keep the capture valid; it is
+  // never indexed on that branch (mirrors OhmicDiffFluxIsoFixed).
+  const auto eta_pack =
+      md->PackVariables(std::vector<std::string>{use_cache ? "nonideal_eta" : "prim"});
+  static auto desc =
+      parthenon::MakePackDescriptor<Bf>(md, {}, {parthenon::PDOpt::WithFluxes});
+  auto pack = desc.GetPack(md);
+  const int nb = pack.GetNBlocks();
+
+  // ---- E3 edge (x-y corner, i-1/2,j-1/2,k). J3 = dBy/dx - dBx/dy. Needed 2D & 3D. ----
+  {
+    IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E3);
+    IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E3);
+    IndexRange kb = md->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::E3);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "CT_OhmicEMF_E3", parthenon::DevExecSpace(), 0, nb - 1,
+        kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &c = pack.GetCoordinates(b);
+          const Real dBy_dx =
+              (pack(b, TE::F2, Bf(), k, j, i) - pack(b, TE::F2, Bf(), k, j, i - 1)) /
+              c.Dxc<X1DIR>(k, j, i);
+          const Real dBx_dy =
+              (pack(b, TE::F1, Bf(), k, j, i) - pack(b, TE::F1, Bf(), k, j - 1, i)) /
+              c.Dxc<X2DIR>(k, j, i);
+          const Real j3 = dBy_dx - dBx_dy;
+          const Real eta =
+              0.25 * (CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j, i) +
+                      CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j, i - 1) +
+                      CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j - 1, i) +
+                      CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j - 1, i - 1));
+          pack.flux(b, TE::E3, Bf(), k, j, i) += eta * j3;
+        });
+  }
+
+  if (three_d) {
+    // ---- E1 edge (y-z corner, i,j-1/2,k-1/2). J1 = dBz/dy - dBy/dz. ----
+    {
+      IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E1);
+      IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E1);
+      IndexRange kb = md->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::E1);
+      parthenon::par_for(
+          DEFAULT_LOOP_PATTERN, "CT_OhmicEMF_E1", parthenon::DevExecSpace(), 0, nb - 1,
+          kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+          KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+            const auto &c = pack.GetCoordinates(b);
+            const Real dBz_dy =
+                (pack(b, TE::F3, Bf(), k, j, i) - pack(b, TE::F3, Bf(), k, j - 1, i)) /
+                c.Dxc<X2DIR>(k, j, i);
+            const Real dBy_dz =
+                (pack(b, TE::F2, Bf(), k, j, i) - pack(b, TE::F2, Bf(), k - 1, j, i)) /
+                c.Dxc<X3DIR>(k, j, i);
+            const Real j1 = dBz_dy - dBy_dz;
+            const Real eta =
+                0.25 * (CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j, i) +
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j - 1, i) +
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k - 1, j, i) +
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k - 1, j - 1, i));
+            pack.flux(b, TE::E1, Bf(), k, j, i) += eta * j1;
+          });
+    }
+    // ---- E2 edge (z-x corner, i-1/2,j,k-1/2). J2 = dBx/dz - dBz/dx. ----
+    {
+      IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E2);
+      IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E2);
+      IndexRange kb = md->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::E2);
+      parthenon::par_for(
+          DEFAULT_LOOP_PATTERN, "CT_OhmicEMF_E2", parthenon::DevExecSpace(), 0, nb - 1,
+          kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+          KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+            const auto &c = pack.GetCoordinates(b);
+            const Real dBx_dz =
+                (pack(b, TE::F1, Bf(), k, j, i) - pack(b, TE::F1, Bf(), k - 1, j, i)) /
+                c.Dxc<X3DIR>(k, j, i);
+            const Real dBz_dx =
+                (pack(b, TE::F3, Bf(), k, j, i) - pack(b, TE::F3, Bf(), k, j, i - 1)) /
+                c.Dxc<X1DIR>(k, j, i);
+            const Real j2 = dBx_dz - dBz_dx;
+            const Real eta =
+                0.25 * (CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j, i) +
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j, i - 1) +
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k - 1, j, i) +
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k - 1, j, i - 1));
+            pack.flux(b, TE::E2, Bf(), k, j, i) += eta * j2;
+          });
+    }
+  }
+  return TaskStatus::complete;
 }
 
 } // namespace CT
