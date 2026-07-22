@@ -434,6 +434,20 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     PARTHENON_FAIL("AthenaPK hydro: Unknown divergence_control (use 'glm' or 'ct').");
   }
   pkg->AddParam<>("use_ct", use_ct);
+  // CT edge-EMF averaging scheme (increment 3). "gs05" = Gardiner & Stone (2005) upwind
+  // CT (default; matches Athena++, adds Riemann dissipation via the transverse-B face
+  // fluxes); "arithmetic" = Balsara & Spicer (1999) plain average (increment-1 fallback).
+  // Both are divergence-free by construction; this only sets the EMF *value*.
+  const auto ct_emf_str = pin->GetOrAddString("hydro", "ct_emf", "gs05");
+  bool use_ct_gs05 = true;
+  if (ct_emf_str == "gs05") {
+    use_ct_gs05 = true;
+  } else if (ct_emf_str == "arithmetic") {
+    use_ct_gs05 = false;
+  } else {
+    PARTHENON_FAIL("AthenaPK hydro: Unknown ct_emf (use 'gs05' or 'arithmetic').");
+  }
+  pkg->AddParam<>("use_ct_gs05", use_ct_gs05);
   // Following params should (currently) be present independent of solver because
   // they're all used in the main loop.
   // TODO(pgrete) think about which approach (selective versus always is preferable)
@@ -1321,6 +1335,8 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     auto hst_vars = pkg->Param<parthenon::HstVar_list>(parthenon::hist_param_key);
     hst_vars.emplace_back(parthenon::HistoryOutputVar(
         parthenon::UserHistoryOperation::max, Hydro::CT::CT_MaxRelFaceDivB, "ct_maxRelDivB"));
+    hst_vars.emplace_back(parthenon::HistoryOutputVar(
+        parthenon::UserHistoryOperation::max, Hydro::CT::CT_MaxAbsFaceDivB, "ct_maxAbsDivB"));
     pkg->UpdateParam(parthenon::hist_param_key, hst_vars);
   }
 

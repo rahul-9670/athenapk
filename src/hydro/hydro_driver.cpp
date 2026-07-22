@@ -564,7 +564,14 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     // which is correct single-level but skips the C-F correction. GLM path: emf = none.
     TaskID emf = none;
     if (use_ct) {
-      emf = tl.AddTask(calc_flux, Hydro::CT::CT_AssembleEMF, mu0.get());
+      if (hydro_pkg->Param<bool>("use_ct_gs05")) {
+        // GS05 upwind EMF needs the transverse-B + mass face fluxes -> depends on
+        // calc_flux; dt sets the contact-upwind switch sharpness (GetWeightForCT).
+        emf = tl.AddTask(calc_flux, Hydro::CT::CT_AssembleEMF_GS05, mu0.get(),
+                         integrator->beta[stage - 1] * integrator->dt);
+      } else {
+        emf = tl.AddTask(calc_flux, Hydro::CT::CT_AssembleEMF, mu0.get());
+      }
     }
     auto send_flx = tl.AddTask(first_order_flux_correct | emf,
                                parthenon::LoadAndSendFluxCorrections, mu0);

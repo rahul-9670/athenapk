@@ -14,8 +14,23 @@
   Falsification: the increment-1 ordering (EMF assembled *after* correction, no reflux) spikes to
   **5.5** on the identical mesh. Test = `inputs/field_loop_ct_amr.in`, suite = `runs/ct_tests/run_ct_tests.sh`.
   The Tóth–Roe div-free prolongation ops were already registered on `Bf` in increment 1.
-- **Increment 3 (GS05 upwind EMF) — NEXT.** Replace the arithmetic edge-EMF average with the
-  Gardiner & Stone (2005) upwinded reconstruction (field-loop dissipation gate; matches Athena++).
+- **Increment 3 (GS05 upwind EMF) — DONE (2026-07-22).** Added `<hydro> ct_emf = gs05|arithmetic`
+  (default `gs05`). GS05 builds the edge EMF from the HLLD transverse-B *face* fluxes (carrying the
+  Riemann dissipation) plus a contact-mode-upwinded gradient correction toward the cell-centered
+  reference EMF, exactly mirroring Athena++'s `ComputeCornerE` (incl. `GetWeightForCT`); this ties
+  the cross-code comparison to a common scheme. Feasible with no extra plumbing because AthenaPK's
+  flux kernel already computes transverse fluxes one layer into the ghost zone (X1 flux over
+  `j in [js-1,je+1]`, X2 over `i in [is-1,ie+1]`, X3 over `i,j in [.s-1,.e+1]`), which also makes the
+  wider stencil consistent across same-level block boundaries. Added an absolute-divergence history
+  diagnostic `ct_maxAbsDivB` (= max|div B|_face*dx, the true CT invariant) alongside `ct_maxRelDivB`;
+  the relative metric divides by |B_cc| and blows up in a near-zero-field ambient, so the field loop
+  reads ~1e-9 relative from pure round-off there. Validation: **absolute** div B is round-off for GS05
+  everywhere — single level 3.4e-18, static-AMR across C-F 6.0e-18 (increments 2+3 compose), OT
+  1.9e-15. Accuracy/stability gate (field loop): GS05 retains 92.5% of magnetic energy (physical
+  monotonic decay) while the plain arithmetic average *grows* ME to 101.6% — the known Balsara-Spicer
+  under-dissipation GS05 cures. GLM path bit-identical; the arithmetic EMF remains selectable.
+- **Increment 4 (non-ideal edge-EMF re-routing + STS-curl) — NEXT.** Deposit the Ohm/AD/Hall EMFs
+  on the shared edges instead of the cell-face induction flux; advance Bf under RKL2 via the curl.
 
 **Status:** design / scoping note (read-only investigation, no code changed).
 **Scope:** replace GLM/Dedner hyperbolic divergence cleaning with staggered/face-centered
