@@ -1,5 +1,22 @@
 # Phase 2 — Constrained Transport (CT) Design & Scoping
 
+**Progress (implementation):**
+- **Increment 1 (ideal, single level) — DONE.** `divergence_control = glm|ct` switch, face field
+  `Bf`, Balsara–Spicer edge EMF, Stokes curl, face→CC projection, `ct_maxRelDivB` history
+  diagnostic. GLM path bit-identical. Field-loop / OT / div-pulse div-free to round-off
+  (~1e-13). Commit `1d62eff`.
+- **Increment 2 (AMR reflux-curl) — DONE (2026-07-22).** The edge EMF is now assembled *before*
+  the flux-correction round in `hydro_driver.cpp`, so the existing Load/Receive/Set flux-correction
+  trio (which handles a Face variable's edge fluxes via `GetFluxCorrectionElements`) restricts the
+  fine-block edge EMFs onto the coarse neighbour's shared edge — both sides curl the identical EMF,
+  keeping ∇·B at round-off across coarse–fine boundaries. Validated on a static-AMR field loop whose
+  C–F boundary (x1=0, 20 blocks) bisects the loop: `ct_maxRelDivB` max = **7.6e-13** (round-off).
+  Falsification: the increment-1 ordering (EMF assembled *after* correction, no reflux) spikes to
+  **5.5** on the identical mesh. Test = `inputs/field_loop_ct_amr.in`, suite = `runs/ct_tests/run_ct_tests.sh`.
+  The Tóth–Roe div-free prolongation ops were already registered on `Bf` in increment 1.
+- **Increment 3 (GS05 upwind EMF) — NEXT.** Replace the arithmetic edge-EMF average with the
+  Gardiner & Stone (2005) upwinded reconstruction (field-loop dissipation gate; matches Athena++).
+
 **Status:** design / scoping note (read-only investigation, no code changed).
 **Scope:** replace GLM/Dedner hyperbolic divergence cleaning with staggered/face-centered
 Constrained Transport so discrete ∇·B = 0 to round-off, keeping GLM as a selectable

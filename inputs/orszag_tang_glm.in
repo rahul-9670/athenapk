@@ -39,7 +39,7 @@ riemann = hlld
 reconstruction = ppm
 gamma = 1.666666666666667
 first_order_flux_correct = true
-divergence_control = ct
+divergence_control = glm
 
 <parthenon/output1>
 file_type = hst

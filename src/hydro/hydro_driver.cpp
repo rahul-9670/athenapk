@@ -554,8 +554,20 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
                      integrator->beta[stage - 1] * integrator->dt);
     }
 
-    auto send_flx =
-        tl.AddTask(first_order_flux_correct, parthenon::LoadAndSendFluxCorrections, mu0);
+    // CT increment 2 (AMR): assemble the edge EMF from the primitive state BEFORE the
+    // flux-correction round. The flux-correction buffers of a Face variable carry its
+    // edge fluxes (GetFluxCorrectionElements), so the same Load/Receive/Set trio that
+    // corrects the cons cell-fluxes also restricts the fine-block edge EMFs onto the
+    // coarse neighbour's *shared* edge -- both sides then curl the identical EMF, keeping
+    // div B at round-off across coarse-fine boundaries (reflux-curl). Must precede
+    // LoadAndSendFluxCorrections; in increment 1 the EMF was assembled after set_flx,
+    // which is correct single-level but skips the C-F correction. GLM path: emf = none.
+    TaskID emf = none;
+    if (use_ct) {
+      emf = tl.AddTask(calc_flux, Hydro::CT::CT_AssembleEMF, mu0.get());
+    }
+    auto send_flx = tl.AddTask(first_order_flux_correct | emf,
+                               parthenon::LoadAndSendFluxCorrections, mu0);
     auto recv_flx = tl.AddTask(start_flxcor_recv, parthenon::ReceiveFluxCorrections, mu0);
     auto set_flx = tl.AddTask(recv_flx | first_order_flux_correct,
                               parthenon::SetFluxCorrections, mu0);
@@ -592,9 +604,10 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
       const Real gam0 = integrator->gam0[stage - 1];
       const Real gam1 = integrator->gam1[stage - 1];
       const Real bdt = integrator->beta[stage - 1] * integrator->dt;
-      auto emf = tl.AddTask(set_flx, Hydro::CT::CT_AssembleEMF, mu0.get());
+      // Bf.flux now holds the coarse-fine-corrected edge EMF (via set_flx above). Curl
+      // it onto the faces (VL2 combine), then project Bf -> cell-centered IB1..IB3.
       auto ct_update =
-          tl.AddTask(emf | update, Hydro::CT::CT_UpdateBf, mu0.get(), mu1.get(), gam0,
+          tl.AddTask(set_flx | update, Hydro::CT::CT_UpdateBf, mu0.get(), mu1.get(), gam0,
                      gam1, bdt);
       after_ct = tl.AddTask(ct_update | after_cooling, Hydro::CT::CT_ProjectBfToCC,
                             mu0.get());
