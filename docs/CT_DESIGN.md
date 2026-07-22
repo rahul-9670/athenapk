@@ -46,8 +46,14 @@
 - **Increment 4 (non-ideal edge-EMF re-routing + STS-curl) — NEXT (hard).** Deposit the Ohm/AD/Hall
   EMFs on the shared edges instead of the cell-face induction flux; advance Bf under RKL2 via the curl.
   Touches validated production diffusion physics — warrants its own focused, separately-validated pass.
-- **Increment 7 (CT-vs-GLM collapse flux-retention gate) — the Phase-2 science gate.** Needs GPU
-  collapse runs (`divergence_control=glm` vs `=ct`, matched otherwise) at reduced resolution first.
+- **Increment 7 (CT-vs-GLM collapse flux-retention gate) — the Phase-2 science gate. IN PROGRESS.**
+  Groundwork done: `collapse_be` now initializes `Bf` (uniform B0z on F3 faces) on the CT path, so a
+  CT collapse shares the GLM IC. Finding (2026-07-22): a *lean* gate config (`eos=adiabatic` +
+  self-gravity + barotropic cooling + uniform B, reduced res) is numerically unstable at cycle 1 for
+  **both** `glm` and `ct` identically (dt-doubling limiter → huge CFL dt → MHD NaN) — a config issue,
+  not CT. The gate therefore needs the production-quality `eos=hydrogen` setup (known stable), non-ideal
+  turned off for the ideal-first comparison, at reduced resolution. Depends on a GPU rebuild that
+  includes the collapse `Bf` init; the full ideal-vs-AD comparison additionally needs increment 4.
 
 **Status:** design / scoping note (read-only investigation, no code changed).
 **Scope:** replace GLM/Dedner hyperbolic divergence cleaning with staggered/face-centered
