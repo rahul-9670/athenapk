@@ -22,6 +22,7 @@
 #include <parthenon/package.hpp>
 
 #include "../main.hpp"
+#include "../hydro/ct/ct.hpp" // Constrained Transport face field (Phase 2)
 #include "../units.hpp" // canonical Heaviside-Lorentz magnetic-unit definition (audit #3)
 #include "pgen.hpp"
 
@@ -517,6 +518,42 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
     data->Get("rad.Fr1").data.DeepCopy(Fx);
     data->Get("rad.Fr2").data.DeepCopy(Fy);
     data->Get("rad.Fr3").data.DeepCopy(Fz);
+  }
+
+  // ---- Constrained Transport: initialize the face field Bf ----
+  // The FHC IC is a uniform vertical field B0z e_z, so Bf.F3 = B0z on every z-face and
+  // Bf.F1 = Bf.F2 = 0 -- trivially divergence-free. The projection then reproduces the
+  // cell-centered u(IB3)=B0z set above, so the CT and GLM runs share an identical IC.
+  if (mhd && hydro_pkg->Param<bool>("use_ct")) {
+    using TE = parthenon::TopologicalElement;
+    const Real B0z_l = B0z;
+    auto desc = parthenon::MakePackDescriptor<Hydro::CT::Bf>(data.get());
+    auto pack = desc.GetPack(data.get());
+    const int bidx = 0;
+    IndexRange fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F1);
+    IndexRange fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F1);
+    IndexRange fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F1);
+    pmb->par_for(
+        "collapse_be CT Bf F1", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
+        KOKKOS_LAMBDA(const int k, const int j, const int i) {
+          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) = 0.0;
+        });
+    fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F2);
+    fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F2);
+    fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F2);
+    pmb->par_for(
+        "collapse_be CT Bf F2", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
+        KOKKOS_LAMBDA(const int k, const int j, const int i) {
+          pack(bidx, TE::F2, Hydro::CT::Bf(), k, j, i) = 0.0;
+        });
+    fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F3);
+    fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F3);
+    fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F3);
+    pmb->par_for(
+        "collapse_be CT Bf F3", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
+        KOKKOS_LAMBDA(const int k, const int j, const int i) {
+          pack(bidx, TE::F3, Hydro::CT::Bf(), k, j, i) = B0z_l;
+        });
   }
 }
 
