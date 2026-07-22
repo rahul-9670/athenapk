@@ -96,6 +96,21 @@ TaskStatus CT_AssembleEMF_GS05(MeshData<Real> *md, const Real dt);
 // (E3) / (E1,E2) cells bounding the edge. Unsplit only (STS+CT is incompatible).
 TaskStatus CT_AddOhmicEMF(MeshData<Real> *md);
 
+// Non-ideal (ambipolar) edge EMF for CT (Phase 2, increment 4). Adds the perpendicular-
+// current EMF E_A = eta_A (J - (J.bhat) bhat) onto the ideal edge EMF in Bf.flux(E*).
+// Unlike the Ohmic term (whose EMF is eta*J, a single curl component that lives naturally
+// on the edge), the AD EMF needs the *full* current and field vectors, so it is built the
+// way Athena++'s FieldDiffusion::AddEMF does: the perp-current EMF is evaluated at cell
+// FACES with the exact same stencils as the GLM path (AmbipolarDiffFluxIsoFixed) and the
+// relevant component is arithmetic-averaged from the four faces bounding each edge (the
+// same four-face pattern GS05 uses for the ideal base EMF). div B stays at round-off (the
+// edge value is single-valued, so its curl telescopes) and the operator is identical to
+// the validated GLM AD operator by construction. As with Ohmic, the matching cons.flux(IBn)
+// induction deposits in AmbipolarDiffFluxIsoFixed are gated OFF under CT while its
+// cons.flux(IEN) ambipolar-Poynting term stays on the finite-volume energy flux. Must run
+// after CT_AssembleEMF[_GS05] and before the flux-correction round. Unsplit only.
+TaskStatus CT_AddAmbipolarEMF(MeshData<Real> *md);
+
 // VL2 low-storage face update: Bf_base = gam0*Bf_base + gam1*Bf_u1
 //                                       + beta_dt * curl(edge EMF stored in Bf.flux).
 TaskStatus CT_UpdateBf(MeshData<Real> *md_base, MeshData<Real> *md_u1, const Real gam0,

@@ -578,6 +578,11 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
       // induction deposit in OhmicDiffFluxIsoFixed is gated off under CT (no double
       // count); its resistive-energy term stays on the FV flux. Unsplit only.
       emf = tl.AddTask(emf, Hydro::CT::CT_AddOhmicEMF, mu0.get());
+      // CT increment 4 (non-ideal): ambipolar perp-current edge EMF, face-evaluated and
+      // averaged to edges (same four-face pattern as GS05). No-op unless AD is active.
+      // Its cons induction deposit in AmbipolarDiffFluxIsoFixed is gated off under CT; its
+      // AD-Poynting energy term stays on the FV flux. Unsplit only.
+      emf = tl.AddTask(emf, Hydro::CT::CT_AddAmbipolarEMF, mu0.get());
     }
     auto send_flx = tl.AddTask(first_order_flux_correct | emf,
                                parthenon::LoadAndSendFluxCorrections, mu0);

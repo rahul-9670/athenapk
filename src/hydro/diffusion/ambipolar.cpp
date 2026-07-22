@@ -106,6 +106,14 @@ void AmbipolarDiffFluxIsoFixed(MeshData<Real> *md) {
   auto cons_pack = md->PackVariablesAndFluxes(cons_names, cons_names);
   auto hydro_pkg = pmb->packages.Get("Hydro");
 
+  // Under Constrained Transport (divergence_control=ct) the magnetic *induction* is
+  // advanced from an edge-centered curl of the ambipolar perp-current EMF assembled in
+  // CT_AddAmbipolarEMF (ct.cpp), so we must NOT also deposit the AD contribution into the
+  // cell-centered cons.flux(IB*) here (GS05 reads those and would double-count it). The
+  // ambipolar *energy* (Poynting) term in cons.flux(IEN) stays on the finite-volume energy
+  // flux. GLM path (use_ct=false): deposits unchanged, bit-identical. Mirrors resistivity.cpp.
+  const bool ct_induction = hydro_pkg->Param<bool>("use_ct");
+
   auto const &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
 
   const int ndim = pmb->pmy_mesh->ndim;
@@ -180,8 +188,10 @@ void AmbipolarDiffFluxIsoFixed(MeshData<Real> *md) {
         Real e1, e2, e3;
         PerpCurrentEMF(eta, j1, j2, j3, b1, b2, b3, e1, e2, e3);
 
-        cons.flux(X1DIR, IB2, k, j, i) += -e3;
-        cons.flux(X1DIR, IB3, k, j, i) += e2;
+        if (!ct_induction) {
+          cons.flux(X1DIR, IB2, k, j, i) += -e3;
+          cons.flux(X1DIR, IB3, k, j, i) += e2;
+        }
         cons.flux(X1DIR, IEN, k, j, i) += e2 * b3 - e3 * b2;
       });
 
@@ -246,8 +256,10 @@ void AmbipolarDiffFluxIsoFixed(MeshData<Real> *md) {
         Real e1, e2, e3;
         PerpCurrentEMF(eta, j1, j2, j3, b1, b2, b3, e1, e2, e3);
 
-        cons.flux(X2DIR, IB1, k, j, i) += e3;
-        cons.flux(X2DIR, IB3, k, j, i) += -e1;
+        if (!ct_induction) {
+          cons.flux(X2DIR, IB1, k, j, i) += e3;
+          cons.flux(X2DIR, IB3, k, j, i) += -e1;
+        }
         cons.flux(X2DIR, IEN, k, j, i) += e3 * b1 - e1 * b3;
       });
 
@@ -308,8 +320,10 @@ void AmbipolarDiffFluxIsoFixed(MeshData<Real> *md) {
         Real e1, e2, e3;
         PerpCurrentEMF(eta, j1, j2, j3, b1, b2, b3, e1, e2, e3);
 
-        cons.flux(X3DIR, IB1, k, j, i) += -e2;
-        cons.flux(X3DIR, IB2, k, j, i) += e1;
+        if (!ct_induction) {
+          cons.flux(X3DIR, IB1, k, j, i) += -e2;
+          cons.flux(X3DIR, IB2, k, j, i) += e1;
+        }
         cons.flux(X3DIR, IEN, k, j, i) += e1 * b2 - e2 * b1;
       });
 }

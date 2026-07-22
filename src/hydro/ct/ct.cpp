@@ -591,5 +591,293 @@ TaskStatus CT_AddOhmicEMF(MeshData<Real> *md) {
   return TaskStatus::complete;
 }
 
+//----------------------------------------------------------------------------------------
+//! Perpendicular-current EMF for ambipolar diffusion: E = eta (J - (J.bhat) bhat).
+//! Local copy of PerpCurrentEMF (ambipolar.cpp) -- identical math; kept here so the CT
+//! edge routine does not reach into that translation unit. Keep the two in sync.
+KOKKOS_INLINE_FUNCTION
+void ADPerpEMF(const Real eta, const Real j1, const Real j2, const Real j3, const Real b1,
+               const Real b2, const Real b3, Real &e1, Real &e2, Real &e3) {
+  const Real bsq = SQR(b1) + SQR(b2) + SQR(b3) + TINY_NUMBER;
+  const Real jdotb = j1 * b1 + j2 * b2 + j3 * b3;
+  e1 = eta * (j1 - jdotb * b1 / bsq);
+  e2 = eta * (j2 - jdotb * b2 / bsq);
+  e3 = eta * (j3 - jdotb * b3 / bsq);
+}
+
+//----------------------------------------------------------------------------------------
+//! Ambipolar perpendicular-current EMF (e1,e2,e3) at the X1 face (i-1/2). Mirrors the
+//! X1 loop of AmbipolarDiffFluxIsoFixed (ambipolar.cpp) EXACTLY -- the current-density
+//! stencils, the face-averaged B, and the cached/uncached eta_A. Kept in sync so the CT
+//! AD operator equals the validated GLM AD operator by construction.
+template <class Prim, class Coords, class Eta>
+KOKKOS_INLINE_FUNCTION void
+AmbiFaceEMF_X1(const Prim &prim, const Coords &coords, const AmbipolarDiffusivity &ad_diff,
+               const Eta &eta_pack, const bool use_cache, const int ndim, const int b,
+               const int k, const int j, const int i, Real &e1, Real &e2, Real &e3) {
+  const auto d3B1 =
+      ndim > 2 ? (0.5 * (prim(b, IB1, k + 1, j, i - 1) + prim(b, IB1, k + 1, j, i)) -
+                  0.5 * (prim(b, IB1, k - 1, j, i - 1) + prim(b, IB1, k - 1, j, i))) /
+                     (coords.template Xf<3, 1>(k + 1, j, i) -
+                      coords.template Xf<3, 1>(k - 1, j, i))
+               : 0.0;
+  const auto d1B3 =
+      (prim(b, IB3, k, j, i) - prim(b, IB3, k, j, i - 1)) / coords.template Dxc<1>(k, j, i);
+  const auto j2 = d3B1 - d1B3;
+  const auto d1B2 =
+      (prim(b, IB2, k, j, i) - prim(b, IB2, k, j, i - 1)) / coords.template Dxc<1>(k, j, i);
+  const auto d2B1 =
+      ndim > 1 ? (0.5 * (prim(b, IB1, k, j + 1, i - 1) + prim(b, IB1, k, j + 1, i)) -
+                  0.5 * (prim(b, IB1, k, j - 1, i - 1) + prim(b, IB1, k, j - 1, i))) /
+                     (coords.template Xf<2, 1>(k, j + 1, i) -
+                      coords.template Xf<2, 1>(k, j - 1, i))
+               : 0.0;
+  const auto j3 = d1B2 - d2B1;
+  const auto d2B3 =
+      ndim > 1 ? (0.5 * (prim(b, IB3, k, j + 1, i - 1) + prim(b, IB3, k, j + 1, i)) -
+                  0.5 * (prim(b, IB3, k, j - 1, i - 1) + prim(b, IB3, k, j - 1, i))) /
+                     (coords.template Xf<2, 1>(k, j + 1, i) -
+                      coords.template Xf<2, 1>(k, j - 1, i))
+               : 0.0;
+  const auto d3B2 =
+      ndim > 2 ? (0.5 * (prim(b, IB2, k + 1, j, i - 1) + prim(b, IB2, k + 1, j, i)) -
+                  0.5 * (prim(b, IB2, k - 1, j, i - 1) + prim(b, IB2, k - 1, j, i))) /
+                     (coords.template Xf<3, 1>(k + 1, j, i) -
+                      coords.template Xf<3, 1>(k - 1, j, i))
+               : 0.0;
+  const auto j1 = d2B3 - d3B2;
+  const Real b1 = 0.5 * (prim(b, IB1, k, j, i - 1) + prim(b, IB1, k, j, i));
+  const Real b2 = 0.5 * (prim(b, IB2, k, j, i - 1) + prim(b, IB2, k, j, i));
+  const Real b3 = 0.5 * (prim(b, IB3, k, j, i - 1) + prim(b, IB3, k, j, i));
+  Real eta;
+  if (use_cache) {
+    eta = 0.5 * (eta_pack(b, NonidealEtaIdx::A, k, j, i - 1) +
+                 eta_pack(b, NonidealEtaIdx::A, k, j, i));
+  } else {
+    const Real rho = 0.5 * (prim(b, IDN, k, j, i - 1) + prim(b, IDN, k, j, i));
+    const Real prs = 0.5 * (prim(b, IPR, k, j, i - 1) + prim(b, IPR, k, j, i));
+    const Real bmag = std::sqrt(SQR(b1) + SQR(b2) + SQR(b3));
+    const int i_xe = ad_diff.XeIndex();
+    const Real xe =
+        (i_xe >= 0) ? 0.5 * (prim(b, i_xe, k, j, i - 1) + prim(b, i_xe, k, j, i)) : -1.0;
+    eta = ad_diff.Get(bmag, rho, prs / rho, xe);
+  }
+  ADPerpEMF(eta, j1, j2, j3, b1, b2, b3, e1, e2, e3);
+}
+
+//----------------------------------------------------------------------------------------
+//! Ambipolar perp-current EMF at the X2 face (j-1/2). Mirrors the ambipolar.cpp X2 loop.
+template <class Prim, class Coords, class Eta>
+KOKKOS_INLINE_FUNCTION void
+AmbiFaceEMF_X2(const Prim &prim, const Coords &coords, const AmbipolarDiffusivity &ad_diff,
+               const Eta &eta_pack, const bool use_cache, const int ndim, const int b,
+               const int k, const int j, const int i, Real &e1, Real &e2, Real &e3) {
+  const auto d1B2 = (0.5 * (prim(b, IB2, k, j - 1, i + 1) + prim(b, IB2, k, j, i + 1)) -
+                     0.5 * (prim(b, IB2, k, j - 1, i - 1) + prim(b, IB2, k, j, i - 1))) /
+                    (coords.template Xf<1, 2>(k, j, i + 1) -
+                     coords.template Xf<1, 2>(k, j, i - 1));
+  const auto d2B1 =
+      (prim(b, IB1, k, j, i) - prim(b, IB1, k, j - 1, i)) / coords.template Dxc<2>(k, j, i);
+  const auto j3 = d1B2 - d2B1;
+  const auto d2B3 =
+      (prim(b, IB3, k, j, i) - prim(b, IB3, k, j - 1, i)) / coords.template Dxc<2>(k, j, i);
+  const auto d3B2 =
+      ndim > 2 ? (0.5 * (prim(b, IB2, k + 1, j - 1, i) + prim(b, IB2, k + 1, j, i)) -
+                  0.5 * (prim(b, IB2, k - 1, j - 1, i) + prim(b, IB2, k - 1, j, i))) /
+                     (coords.template Xf<3, 2>(k + 1, j, i) -
+                      coords.template Xf<3, 2>(k - 1, j, i))
+               : 0.0;
+  const auto j1 = d2B3 - d3B2;
+  const auto d3B1 =
+      ndim > 2 ? (0.5 * (prim(b, IB1, k + 1, j - 1, i) + prim(b, IB1, k + 1, j, i)) -
+                  0.5 * (prim(b, IB1, k - 1, j - 1, i) + prim(b, IB1, k - 1, j, i))) /
+                     (coords.template Xf<3, 2>(k + 1, j, i) -
+                      coords.template Xf<3, 2>(k - 1, j, i))
+               : 0.0;
+  const auto d1B3 = (0.5 * (prim(b, IB3, k, j - 1, i + 1) + prim(b, IB3, k, j, i + 1)) -
+                     0.5 * (prim(b, IB3, k, j - 1, i - 1) + prim(b, IB3, k, j, i - 1))) /
+                    (coords.template Xf<1, 2>(k, j, i + 1) -
+                     coords.template Xf<1, 2>(k, j, i - 1));
+  const auto j2 = d3B1 - d1B3;
+  const Real b1 = 0.5 * (prim(b, IB1, k, j - 1, i) + prim(b, IB1, k, j, i));
+  const Real b2 = 0.5 * (prim(b, IB2, k, j - 1, i) + prim(b, IB2, k, j, i));
+  const Real b3 = 0.5 * (prim(b, IB3, k, j - 1, i) + prim(b, IB3, k, j, i));
+  Real eta;
+  if (use_cache) {
+    eta = 0.5 * (eta_pack(b, NonidealEtaIdx::A, k, j - 1, i) +
+                 eta_pack(b, NonidealEtaIdx::A, k, j, i));
+  } else {
+    const Real rho = 0.5 * (prim(b, IDN, k, j - 1, i) + prim(b, IDN, k, j, i));
+    const Real prs = 0.5 * (prim(b, IPR, k, j - 1, i) + prim(b, IPR, k, j, i));
+    const Real bmag = std::sqrt(SQR(b1) + SQR(b2) + SQR(b3));
+    const int i_xe = ad_diff.XeIndex();
+    const Real xe =
+        (i_xe >= 0) ? 0.5 * (prim(b, i_xe, k, j - 1, i) + prim(b, i_xe, k, j, i)) : -1.0;
+    eta = ad_diff.Get(bmag, rho, prs / rho, xe);
+  }
+  ADPerpEMF(eta, j1, j2, j3, b1, b2, b3, e1, e2, e3);
+}
+
+//----------------------------------------------------------------------------------------
+//! Ambipolar perp-current EMF at the X3 face (k-1/2). Mirrors the ambipolar.cpp X3 loop.
+template <class Prim, class Coords, class Eta>
+KOKKOS_INLINE_FUNCTION void
+AmbiFaceEMF_X3(const Prim &prim, const Coords &coords, const AmbipolarDiffusivity &ad_diff,
+               const Eta &eta_pack, const bool use_cache, const int ndim, const int b,
+               const int k, const int j, const int i, Real &e1, Real &e2, Real &e3) {
+  const auto d2B3 = (0.5 * (prim(b, IB3, k - 1, j + 1, i) + prim(b, IB3, k, j + 1, i)) -
+                     0.5 * (prim(b, IB3, k - 1, j - 1, i) + prim(b, IB3, k, j - 1, i))) /
+                    (coords.template Xf<2, 3>(k, j + 1, i) -
+                     coords.template Xf<2, 3>(k, j - 1, i));
+  const auto d3B2 =
+      (prim(b, IB2, k, j, i) - prim(b, IB2, k - 1, j, i)) / coords.template Dxc<3>(k, j, i);
+  const auto j1 = d2B3 - d3B2;
+  const auto d3B1 =
+      (prim(b, IB1, k, j, i) - prim(b, IB1, k - 1, j, i)) / coords.template Dxc<3>(k, j, i);
+  const auto d1B3 = (0.5 * (prim(b, IB3, k - 1, j, i + 1) + prim(b, IB3, k, j, i + 1)) -
+                     0.5 * (prim(b, IB3, k - 1, j, i - 1) + prim(b, IB3, k, j, i - 1))) /
+                    (coords.template Xf<1, 3>(k, j, i + 1) -
+                     coords.template Xf<1, 3>(k, j, i - 1));
+  const auto j2 = d3B1 - d1B3;
+  const auto d1B2 = (0.5 * (prim(b, IB2, k - 1, j, i + 1) + prim(b, IB2, k, j, i + 1)) -
+                     0.5 * (prim(b, IB2, k - 1, j, i - 1) + prim(b, IB2, k, j, i - 1))) /
+                    (coords.template Xf<1, 3>(k, j, i + 1) -
+                     coords.template Xf<1, 3>(k, j, i - 1));
+  const auto d2B1 = (0.5 * (prim(b, IB1, k - 1, j + 1, i) + prim(b, IB1, k, j + 1, i)) -
+                     0.5 * (prim(b, IB1, k - 1, j - 1, i) + prim(b, IB1, k, j - 1, i))) /
+                    (coords.template Xf<2, 3>(k, j + 1, i) -
+                     coords.template Xf<2, 3>(k, j - 1, i));
+  const auto j3 = d1B2 - d2B1;
+  const Real b1 = 0.5 * (prim(b, IB1, k - 1, j, i) + prim(b, IB1, k, j, i));
+  const Real b2 = 0.5 * (prim(b, IB2, k - 1, j, i) + prim(b, IB2, k, j, i));
+  const Real b3 = 0.5 * (prim(b, IB3, k - 1, j, i) + prim(b, IB3, k, j, i));
+  Real eta;
+  if (use_cache) {
+    eta = 0.5 * (eta_pack(b, NonidealEtaIdx::A, k - 1, j, i) +
+                 eta_pack(b, NonidealEtaIdx::A, k, j, i));
+  } else {
+    const Real rho = 0.5 * (prim(b, IDN, k - 1, j, i) + prim(b, IDN, k, j, i));
+    const Real prs = 0.5 * (prim(b, IPR, k - 1, j, i) + prim(b, IPR, k, j, i));
+    const Real bmag = std::sqrt(SQR(b1) + SQR(b2) + SQR(b3));
+    const int i_xe = ad_diff.XeIndex();
+    const Real xe =
+        (i_xe >= 0) ? 0.5 * (prim(b, i_xe, k - 1, j, i) + prim(b, i_xe, k, j, i)) : -1.0;
+    eta = ad_diff.Get(bmag, rho, prs / rho, xe);
+  }
+  ADPerpEMF(eta, j1, j2, j3, b1, b2, b3, e1, e2, e3);
+}
+
+//----------------------------------------------------------------------------------------
+//! Non-ideal (ambipolar) edge EMF for CT. See ct.hpp. The perp-current EMF is evaluated at
+//! cell faces (AmbiFaceEMF_X{1,2,3}, same stencils as the GLM path) and the relevant
+//! component is arithmetic-averaged from the four faces bounding each edge -- the exact
+//! four-face index pattern GS05 uses for the ideal base EMF, so div B stays at round-off.
+TaskStatus CT_AddAmbipolarEMF(MeshData<Real> *md) {
+  auto pmb = md->GetBlockData(0)->GetBlockPointer();
+  auto hydro_pkg = pmb->packages.Get("Hydro");
+  // No-op unless ambipolar diffusion is active (CT diffusion is unsplit-only).
+  if (hydro_pkg->Param<Ambipolar>("ambipolar") == Ambipolar::none) {
+    return TaskStatus::complete;
+  }
+  const int ndim = md->GetMeshPointer()->ndim;
+  const bool three_d = ndim > 2;
+  const auto &ad_diff = hydro_pkg->Param<AmbipolarDiffusivity>("ad_diff");
+  const bool use_cache = hydro_pkg->Param<bool>("nonideal_eta_cache");
+
+  auto prim = md->PackVariables(std::vector<std::string>{"prim"});
+  const auto eta_pack =
+      md->PackVariables(std::vector<std::string>{use_cache ? "nonideal_eta" : "prim"});
+  static auto desc =
+      parthenon::MakePackDescriptor<Bf>(md, {}, {parthenon::PDOpt::WithFluxes});
+  auto pack = desc.GetPack(md);
+  const int nb = pack.GetNBlocks();
+
+  // ---- E3 edge (x-y corner, i-1/2,j-1/2,k): e3 from x-faces (rows j,j-1) + y-faces
+  //      (cols i,i-1). Needed in 2D & 3D. ----
+  {
+    IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E3);
+    IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E3);
+    IndexRange kb = md->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::E3);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "CT_AmbiEMF_E3", parthenon::DevExecSpace(), 0, nb - 1, kb.s,
+        kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &c = pack.GetCoordinates(b);
+          Real e1, e2, e3, acc = 0.0;
+          AmbiFaceEMF_X1(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j, i, e1, e2,
+                         e3);
+          acc += e3;
+          AmbiFaceEMF_X1(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j - 1, i, e1,
+                         e2, e3);
+          acc += e3;
+          AmbiFaceEMF_X2(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j, i, e1, e2,
+                         e3);
+          acc += e3;
+          AmbiFaceEMF_X2(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j, i - 1, e1,
+                         e2, e3);
+          acc += e3;
+          pack.flux(b, TE::E3, Bf(), k, j, i) += 0.25 * acc;
+        });
+  }
+
+  if (three_d) {
+    // ---- E1 edge (y-z corner, i,j-1/2,k-1/2): e1 from y-faces (rows k,k-1) + z-faces
+    //      (cols j,j-1). ----
+    {
+      IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E1);
+      IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E1);
+      IndexRange kb = md->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::E1);
+      parthenon::par_for(
+          DEFAULT_LOOP_PATTERN, "CT_AmbiEMF_E1", parthenon::DevExecSpace(), 0, nb - 1,
+          kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+          KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+            const auto &c = pack.GetCoordinates(b);
+            Real e1, e2, e3, acc = 0.0;
+            AmbiFaceEMF_X2(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j, i, e1, e2,
+                           e3);
+            acc += e1;
+            AmbiFaceEMF_X2(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k - 1, j, i, e1,
+                           e2, e3);
+            acc += e1;
+            AmbiFaceEMF_X3(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j, i, e1, e2,
+                           e3);
+            acc += e1;
+            AmbiFaceEMF_X3(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j - 1, i, e1,
+                           e2, e3);
+            acc += e1;
+            pack.flux(b, TE::E1, Bf(), k, j, i) += 0.25 * acc;
+          });
+    }
+    // ---- E2 edge (z-x corner, i-1/2,j,k-1/2): e2 from z-faces (cols i,i-1) + x-faces
+    //      (rows k,k-1). ----
+    {
+      IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E2);
+      IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E2);
+      IndexRange kb = md->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::E2);
+      parthenon::par_for(
+          DEFAULT_LOOP_PATTERN, "CT_AmbiEMF_E2", parthenon::DevExecSpace(), 0, nb - 1,
+          kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+          KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+            const auto &c = pack.GetCoordinates(b);
+            Real e1, e2, e3, acc = 0.0;
+            AmbiFaceEMF_X3(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j, i, e1, e2,
+                           e3);
+            acc += e2;
+            AmbiFaceEMF_X3(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j, i - 1, e1,
+                           e2, e3);
+            acc += e2;
+            AmbiFaceEMF_X1(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k, j, i, e1, e2,
+                           e3);
+            acc += e2;
+            AmbiFaceEMF_X1(prim, c, ad_diff, eta_pack, use_cache, ndim, b, k - 1, j, i, e1,
+                           e2, e3);
+            acc += e2;
+            pack.flux(b, TE::E2, Bf(), k, j, i) += 0.25 * acc;
+          });
+    }
+  }
+  return TaskStatus::complete;
+}
+
 } // namespace CT
 } // namespace Hydro

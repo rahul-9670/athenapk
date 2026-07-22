@@ -214,30 +214,36 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
       });
 
   // ---- Constrained Transport: initialize the face-centered field Bf ----
-  // Only the Ohmic Gaussian decay test (iprob=40) is CT-wired: B_y = G(x) with B_x=B_z=0,
-  // so setting the y-face field F2(i,j-1/2)=G(x_i) (constant along y) and F1=F3=0 is div-B
-  // free by construction and the CT projection reproduces the cell-centered u(IB2) above.
+  // Two diffusion tests are CT-wired, both with a field that varies only in x so the face
+  // init is div-B-free by construction and the projection reproduces the cell-centered u:
+  //   iprob=40 (Ohmic Gaussian):     B_y = G(x), B_x=B_z=0  -> F2(i,j-1/2)=G(x_i), F1=F3=0.
+  //   iprob=50 (ambipolar eigenmode): B_x=B0 (uniform guide), B_y=amp*sin(k x), B_z=0
+  //                                   -> F1(i-1/2)=B0, F2(i,j-1/2)=amp*sin(k x_i), F3=0.
   if (hydro_pkg->Param<bool>("use_ct")) {
     PARTHENON_REQUIRE_THROWS(
-        iprob == 40,
+        (iprob == 40) || (iprob == 50),
         "Constrained Transport (divergence_control=ct) in the diffusion pgen is currently "
-        "only wired for iprob=40 (Ohmic Gaussian decay).");
-    const Real gnorm = amp / std::sqrt(4. * M_PI * diff_coeff * t0);
-    const Real inv4dt = 1.0 / (4. * diff_coeff * t0);
+        "only wired for iprob=40 (Ohmic Gaussian) and iprob=50 (ambipolar eigenmode).");
+    const bool is_ad = (iprob == 50);
+    const Real gnorm = is_ad ? 0.0 : amp / std::sqrt(4. * M_PI * diff_coeff * t0);
+    const Real inv4dt = is_ad ? 0.0 : 1.0 / (4. * diff_coeff * t0);
+    const Real B0 = Bx;   // guide field (iprob=50); 0 for iprob=40 by input
+    const Real kx = kpar; // wavenumber (iprob=50); 0 for iprob=40
+    const Real amp_l = amp;
     auto desc = parthenon::MakePackDescriptor<Hydro::CT::Bf>(mbd.get());
     auto pack = desc.GetPack(mbd.get());
     const int bidx = 0;
     using TE = parthenon::TopologicalElement;
-    // F1 (x-face, B_x) = 0
+    // F1 (x-face, B_x): guide field B0 for iprob=50, else 0.
     IndexRange fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F1);
     IndexRange fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F1);
     IndexRange fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F1);
     pmb->par_for(
         "diffusion CT F1", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
         KOKKOS_LAMBDA(const int k, const int j, const int i) {
-          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) = 0.0;
+          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) = is_ad ? B0 : 0.0;
         });
-    // F2 (y-face, B_y) = Gaussian(x)
+    // F2 (y-face, B_y): Gaussian(x) (iprob=40) or amp*sin(k x) (iprob=50).
     fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F2);
     fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F2);
     fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F2);
@@ -247,7 +253,7 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
           const auto &c = pack.GetCoordinates(bidx);
           const Real x = c.X<X1DIR, TE::F2>(k, j, i);
           pack(bidx, TE::F2, Hydro::CT::Bf(), k, j, i) =
-              gnorm * std::exp(-x * x * inv4dt);
+              is_ad ? amp_l * std::sin(kx * x) : gnorm * std::exp(-x * x * inv4dt);
         });
     // F3 (z-face, B_z) = 0
     fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F3);

@@ -1,0 +1,73 @@
+<comment>
+problem = Ambipolar diffusion damped-Alfven eigenmode -- CT (increment-4 AD) gate. By = amp*sin(k x) on a uniform guide field Bx=B0 decays as a damped
+# AD) gate. By = amp*sin(k x) on a uniform guide field Bx=B0 decays as a damped Alfven mode;
+# the measured amplitude is checked against the analytic 2-mode envelope. 2D box (nx2=8) so
+# the matched CT run has a real transverse dimension. Differs from diffusion_ad_ct.in ONLY
+# in divergence_control.
+
+<job>
+problem_id = diffusion
+
+<problem/diffusion>
+iprob = 50
+Bx    = 1.0
+By    = 0.0
+amp   = 1.0e-6
+nwave = 1.0
+
+<parthenon/mesh>
+refinement = none
+nghost = 2
+nx1 = 128
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 8
+x2min = -0.03125
+x2max = 0.03125
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 64
+nx2 = 8
+nx3 = 1
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 0.3
+nlim = 10000000
+ncycle_out = 500
+
+<hydro>
+fluid = glmmhd
+riemann = hlld
+eos = adiabatic
+reconstruction = plm
+gamma = 2.0
+divergence_control = ct
+ct_emf = gs05
+
+<diffusion>
+integrator = unsplit
+cfl = 0.3
+ambipolar = ambipolar
+ambipolar_coeff = fixed
+ambipolar_coeff_code = 0.5
+
+<parthenon/output0>
+file_type = hdf5
+dt = 0.3
+variables = prim
+id = prim
+
+<parthenon/output1>
+file_type = hst
+dt = 0.01
