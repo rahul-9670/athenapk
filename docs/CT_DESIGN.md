@@ -29,6 +29,9 @@
   1.9e-15. Accuracy/stability gate (field loop): GS05 retains 92.5% of magnetic energy (physical
   monotonic decay) while the plain arithmetic average *grows* ME to 101.6% — the known Balsara-Spicer
   under-dissipation GS05 cures. GLM path bit-identical; the arithmetic EMF remains selectable.
+  3D E1/E2/E3 kernels validated on a 3D field loop (iprob=2, cylinder along x with diagonal flow
+  so all three edge EMFs are active, 2 blocks): absolute div B = 1.6e-18 (round-off), EXIT 0 —
+  confirms the cyclic curl signs and edge indexing. `field_loop` CT face-init extended to iprob=1/2/3.
 - **Increment 4 (non-ideal edge-EMF re-routing + STS-curl) — NEXT.** Deposit the Ohm/AD/Hall EMFs
   on the shared edges instead of the cell-face induction flux; advance Bf under RKL2 via the curl.
 

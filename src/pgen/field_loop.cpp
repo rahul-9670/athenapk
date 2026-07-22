@@ -331,23 +331,32 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
   // cell edges, so div(B)_face = 0 to round-off by construction.
   auto hydro_pkg = pmb->packages.Get("Hydro");
   if (hydro_pkg->Param<bool>("use_ct")) {
-    PARTHENON_REQUIRE(iprob == 1,
-                      "field_loop CT face-init currently supports iprob=1 only.");
+    // Face field Bf = discrete curl of the single-component analytic vector potential
+    // A_axis(u,v) = amp*(rad - r_perp), so div(B)_face = 0 to round-off by construction.
+    // Three loop orientations, cyclic in (axis; in-plane u,v):
+    //   iprob=1: A = A_z(x,y) e_z  -> B in x-y plane, cylinder along z (Bf.F3=0)
+    //   iprob=2: A = A_x(y,z) e_x  -> B in y-z plane, cylinder along x (Bf.F1=0) [3D E1/E2/E3]
+    //   iprob=3: A = A_y(z,x) e_y  -> B in z-x plane, cylinder along y (Bf.F2=0)
+    // (iprob 4/5 rotated loops are not wired for CT.)
+    PARTHENON_REQUIRE(iprob == 1 || iprob == 2 || iprob == 3,
+                      "field_loop CT face-init supports iprob = 1, 2, or 3.");
     using TE = parthenon::TopologicalElement;
     const Real amp_l = amp;
     const Real rad_l = rad;
+    const int iprob_l = iprob;
     auto desc = parthenon::MakePackDescriptor<Hydro::CT::Bf>(mbd.get());
     auto pack = desc.GetPack(mbd.get());
     const int bidx = 0;
-    // A_z(x,y) = amp*(rad - r) inside the loop, 0 outside.
-    auto Az = KOKKOS_LAMBDA(const Real x, const Real y)->Real {
-      const Real r = std::sqrt(x * x + y * y);
+    // A_axis as a function of its two in-plane coordinates (u,v).
+    auto Apot = KOKKOS_LAMBDA(const Real u, const Real v)->Real {
+      const Real r = std::sqrt(u * u + v * v);
       return (r < rad_l) ? amp_l * (rad_l - r) : 0.0;
     };
-    // Bf.F1 = dA_z/dy  (x-face)
     IndexRange fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F1);
     IndexRange fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F1);
     IndexRange fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F1);
+    // ---- Bf.F1 (x-face, B_x) ----
+    //   iprob=1: +dA_z/dy ;  iprob=2: 0 ;  iprob=3: -dA_y/dz
     pmb->par_for(
         "field_loop CT F1", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
         KOKKOS_LAMBDA(const int k, const int j, const int i) {
@@ -355,10 +364,18 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
           const Real x = c.X<X1DIR, TE::F1>(k, j, i);
           const Real ylo = c.X<X2DIR, TE::F2>(k, j, i);
           const Real yhi = c.X<X2DIR, TE::F2>(k, j + 1, i);
-          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) =
-              (Az(x, yhi) - Az(x, ylo)) / (yhi - ylo);
+          const Real zlo = c.X<X3DIR, TE::F3>(k, j, i);
+          const Real zhi = c.X<X3DIR, TE::F3>(k + 1, j, i);
+          Real bx = 0.0;
+          if (iprob_l == 1) { // +dA_z/dy ; A_z(x,y)
+            bx = (Apot(x, yhi) - Apot(x, ylo)) / (yhi - ylo);
+          } else if (iprob_l == 3) { // -dA_y/dz ; A_y(z,x)
+            bx = -(Apot(zhi, x) - Apot(zlo, x)) / (zhi - zlo);
+          }
+          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) = bx;
         });
-    // Bf.F2 = -dA_z/dx  (y-face)
+    // ---- Bf.F2 (y-face, B_y) ----
+    //   iprob=1: -dA_z/dx ;  iprob=2: +dA_x/dz ;  iprob=3: 0
     fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F2);
     fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F2);
     fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F2);
@@ -369,17 +386,37 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
           const Real y = c.X<X2DIR, TE::F2>(k, j, i);
           const Real xlo = c.X<X1DIR, TE::F1>(k, j, i);
           const Real xhi = c.X<X1DIR, TE::F1>(k, j, i + 1);
-          pack(bidx, TE::F2, Hydro::CT::Bf(), k, j, i) =
-              -(Az(xhi, y) - Az(xlo, y)) / (xhi - xlo);
+          const Real zlo = c.X<X3DIR, TE::F3>(k, j, i);
+          const Real zhi = c.X<X3DIR, TE::F3>(k + 1, j, i);
+          Real by = 0.0;
+          if (iprob_l == 1) { // -dA_z/dx ; A_z(x,y)
+            by = -(Apot(xhi, y) - Apot(xlo, y)) / (xhi - xlo);
+          } else if (iprob_l == 2) { // +dA_x/dz ; A_x(y,z)
+            by = (Apot(y, zhi) - Apot(y, zlo)) / (zhi - zlo);
+          }
+          pack(bidx, TE::F2, Hydro::CT::Bf(), k, j, i) = by;
         });
-    // Bf.F3 = B_z = 0 in the plane.
+    // ---- Bf.F3 (z-face, B_z) ----
+    //   iprob=1: 0 ;  iprob=2: -dA_x/dy ;  iprob=3: +dA_y/dx
     fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F3);
     fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F3);
     fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F3);
     pmb->par_for(
         "field_loop CT F3", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
         KOKKOS_LAMBDA(const int k, const int j, const int i) {
-          pack(bidx, TE::F3, Hydro::CT::Bf(), k, j, i) = 0.0;
+          const auto &c = pack.GetCoordinates(bidx);
+          const Real z = c.X<X3DIR, TE::F3>(k, j, i);
+          const Real xlo = c.X<X1DIR, TE::F1>(k, j, i);
+          const Real xhi = c.X<X1DIR, TE::F1>(k, j, i + 1);
+          const Real ylo = c.X<X2DIR, TE::F2>(k, j, i);
+          const Real yhi = c.X<X2DIR, TE::F2>(k, j + 1, i);
+          Real bz = 0.0;
+          if (iprob_l == 2) { // -dA_x/dy ; A_x(y,z)
+            bz = -(Apot(yhi, z) - Apot(ylo, z)) / (yhi - ylo);
+          } else if (iprob_l == 3) { // +dA_y/dx ; A_y(z,x)
+            bz = (Apot(z, xhi) - Apot(z, xlo)) / (xhi - xlo);
+          }
+          pack(bidx, TE::F3, Hydro::CT::Bf(), k, j, i) = bz;
         });
   }
 }
