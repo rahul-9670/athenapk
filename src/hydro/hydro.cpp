@@ -1114,24 +1114,26 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     }
     pkg->AddParam<>("hall", hall);
 
-    // Constrained Transport (divergence_control=ct) support for non-ideal MHD covers Ohmic
-    // resistivity (CT_AddOhmicEMF) and ambipolar diffusion (CT_AddAmbipolarEMF) in BOTH the
-    // unsplit integrator (edge EMF added to the ideal EMF each stage) and the RKL2 super-
+    // Constrained Transport (divergence_control=ct) support for non-ideal MHD. Ohmic
+    // resistivity (CT_AddOhmicEMF) and ambipolar diffusion (CT_AddAmbipolarEMF) run in BOTH
+    // the unsplit integrator (edge EMF added to the ideal EMF each stage) and the RKL2 super-
     // time-stepping integrator (the divergence-free induction is super-time-stepped on the
-    // face field Bf with M(Bf)=-curl(E_diff); see AddSTSTasks). Their inductions are routed
-    // to edge-centered CT EMFs and their cons-flux induction deposits are gated off (no GS05
-    // / no cons-IB double count). The Hall effect (CT_AddHallEMF) IS implemented by the same
-    // four-face-average construction and preserves div B, but that averaging (a box filter)
-    // badly degrades the DISPERSIVE whistler (CT runs ~25% slow at Q_H=0.05, ~90% at Q_H=0.5
-    // vs GLM ~6% and the analytic dispersion), so until a COMPACT edge-current Hall EMF is
-    // written, Hall+CT is forbidden here (the code path stays for that future work).
-    if (pkg->Param<bool>("use_ct")) {
-      PARTHENON_REQUIRE_THROWS(
-          hall == Hall::none,
-          "The Hall effect under Constrained Transport (divergence_control=ct) is "
-          "implemented (CT_AddHallEMF) but its face-averaged edge EMF corrupts the whistler "
-          "dispersion (~25-90% too slow); it is disabled pending a compact edge-current "
-          "formulation. Use divergence_control=glm for Hall runs.");
+    // face field Bf with M(Bf)=-curl(E_diff); see AddSTSTasks) -- both validated to analytic.
+    // The Hall effect (CT_AddHallEMF) uses the COMPACT edge-current formulation (tight edge
+    // curls; transverse J interpolated only in transverse directions), applied unsplit in the
+    // main step. It is div-free, stable (with the usual Ohmic floor), reproduces the CT ideal-
+    // Alfven base exactly, and gives the correct-DIRECTION whistler -- but the whistler
+    // *dispersion* is still under-captured (~12% slow at Q_H=0.05, growing with Hall strength;
+    // the dispersive Hall term is hard to make spectrally accurate on a staggered mesh).
+    // Warn (do not block): Hall+CT is usable but not spectral-accurate for fast whistlers.
+    if (pkg->Param<bool>("use_ct") && hall != Hall::none &&
+        parthenon::Globals::my_rank == 0) {
+      std::cout << "## WARNING: Hall + Constrained Transport (divergence_control=ct) uses the "
+                   "compact edge-current CT_AddHallEMF: div-free and correct-direction, but "
+                   "the whistler dispersion is under-captured (~12% slow at Q_H=0.05, more at "
+                   "stronger Hall). Use divergence_control=glm if fast-wave dispersion "
+                   "accuracy matters. (Ohmic/ambipolar under CT are fully validated.)"
+                << std::endl;
     }
 
     // Fused non-ideal diffusive-timestep path. The per-cell Wardle conductivity tensor

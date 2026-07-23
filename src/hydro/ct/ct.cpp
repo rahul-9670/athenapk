@@ -1039,77 +1039,77 @@ AmbiFaceEMF_X3(const Prim &prim, const Coords &coords, const AmbipolarDiffusivit
 }
 
 //----------------------------------------------------------------------------------------
-//! Hall EMF (e1,e2,e3) at the X{1,2,3} face. Pairs FaceCurrentAndB with the face-averaged
-//! eta_H (signed) + the optional Ohmic floor, and the (J x B)/|B| combine. Mirrors
-//! HallDiffFluxIsoFixed (hall.cpp) with eta_h_on=floor_on=true (the unsplit CT case).
-template <class Prim, class Coords, class Eta>
-KOKKOS_INLINE_FUNCTION void
-HallFaceEMF_X1(const Prim &prim, const Coords &coords, const HallDiffusivity &hall_diff,
-               const Real eta_floor, const Eta &eta_pack, const bool use_cache,
-               const int ndim, const int b, const int k, const int j, const int i, Real &e1,
-               Real &e2, Real &e3) {
-  Real j1, j2, j3, b1, b2, b3;
-  FaceCurrentAndB_X1(prim, coords, ndim, b, k, j, i, j1, j2, j3, b1, b2, b3);
-  const Real bmag = std::sqrt(SQR(b1) + SQR(b2) + SQR(b3));
-  Real eta_h;
-  if (use_cache) {
-    eta_h = 0.5 * (eta_pack(b, NonidealEtaIdx::H, k, j, i - 1) +
-                   eta_pack(b, NonidealEtaIdx::H, k, j, i));
-  } else {
-    const Real rho = 0.5 * (prim(b, IDN, k, j, i - 1) + prim(b, IDN, k, j, i));
-    const Real prs = 0.5 * (prim(b, IPR, k, j, i - 1) + prim(b, IPR, k, j, i));
-    const int i_xe = hall_diff.XeIndex();
-    const Real xe =
-        (i_xe >= 0) ? 0.5 * (prim(b, i_xe, k, j, i - 1) + prim(b, i_xe, k, j, i)) : -1.0;
-    eta_h = hall_diff.Get(bmag, rho, prs / rho, xe);
-  }
-  HallEMFLocal(eta_h, eta_floor, bmag, j1, j2, j3, b1, b2, b3, e1, e2, e3);
+//! COMPACT edge-current Hall (fixes the whistler-dispersion corruption of the earlier
+//! face-EMF-averaged Hall). The current is evaluated with the tight curl of the face field
+//! on the SAME edges the Ohmic term uses -- one value per edge, no averaging of the
+//! derivative:
+//!   J_x on E1 edges (i,j-1/2,k-1/2) = dBz/dy - dBy/dz
+//!   J_y on E2 edges (i-1/2,j,k-1/2) = dBx/dz - dBz/dx
+//!   J_z on E3 edges (i-1/2,j-1/2,k) = dBy/dx - dBx/dy
+//! For the E_H component on a given edge we need the full J and B vectors THERE, so the two
+//! transverse J components are interpolated from their own natural edges to the target edge
+//! -- but ONLY in the directions transverse to each component's derivative. E.g. for the
+//! whistler in x, the E3-edge EMF needs J_y = -dBz/dx (natural on E2 edges, which share the
+//! x=i-1/2 location with the E3 edge), so J_y is interpolated only in y,z: the compact
+//! dBz/dx stencil survives un-filtered, unlike the box-filter of the face-averaged scheme.
+template <class Pack, class Coords>
+KOKKOS_INLINE_FUNCTION Real HallJxE1(const Pack &p, const Coords &c, const int b,
+                                     const int k, const int j, const int i,
+                                     const bool three_d) {
+  const Real dBz_dy = (p(b, TE::F3, Bf(), k, j, i) - p(b, TE::F3, Bf(), k, j - 1, i)) /
+                      c.template Dxc<X2DIR>(k, j, i);
+  const Real dBy_dz =
+      three_d ? (p(b, TE::F2, Bf(), k, j, i) - p(b, TE::F2, Bf(), k - 1, j, i)) /
+                    c.template Dxc<X3DIR>(k, j, i)
+              : 0.0;
+  return dBz_dy - dBy_dz;
 }
-template <class Prim, class Coords, class Eta>
-KOKKOS_INLINE_FUNCTION void
-HallFaceEMF_X2(const Prim &prim, const Coords &coords, const HallDiffusivity &hall_diff,
-               const Real eta_floor, const Eta &eta_pack, const bool use_cache,
-               const int ndim, const int b, const int k, const int j, const int i, Real &e1,
-               Real &e2, Real &e3) {
-  Real j1, j2, j3, b1, b2, b3;
-  FaceCurrentAndB_X2(prim, coords, ndim, b, k, j, i, j1, j2, j3, b1, b2, b3);
-  const Real bmag = std::sqrt(SQR(b1) + SQR(b2) + SQR(b3));
-  Real eta_h;
-  if (use_cache) {
-    eta_h = 0.5 * (eta_pack(b, NonidealEtaIdx::H, k, j - 1, i) +
-                   eta_pack(b, NonidealEtaIdx::H, k, j, i));
-  } else {
-    const Real rho = 0.5 * (prim(b, IDN, k, j - 1, i) + prim(b, IDN, k, j, i));
-    const Real prs = 0.5 * (prim(b, IPR, k, j - 1, i) + prim(b, IPR, k, j, i));
-    const int i_xe = hall_diff.XeIndex();
-    const Real xe =
-        (i_xe >= 0) ? 0.5 * (prim(b, i_xe, k, j - 1, i) + prim(b, i_xe, k, j, i)) : -1.0;
-    eta_h = hall_diff.Get(bmag, rho, prs / rho, xe);
-  }
-  HallEMFLocal(eta_h, eta_floor, bmag, j1, j2, j3, b1, b2, b3, e1, e2, e3);
+template <class Pack, class Coords>
+KOKKOS_INLINE_FUNCTION Real HallJyE2(const Pack &p, const Coords &c, const int b,
+                                     const int k, const int j, const int i,
+                                     const bool three_d) {
+  const Real dBx_dz =
+      three_d ? (p(b, TE::F1, Bf(), k, j, i) - p(b, TE::F1, Bf(), k - 1, j, i)) /
+                    c.template Dxc<X3DIR>(k, j, i)
+              : 0.0;
+  const Real dBz_dx = (p(b, TE::F3, Bf(), k, j, i) - p(b, TE::F3, Bf(), k, j, i - 1)) /
+                      c.template Dxc<X1DIR>(k, j, i);
+  return dBx_dz - dBz_dx;
 }
-template <class Prim, class Coords, class Eta>
-KOKKOS_INLINE_FUNCTION void
-HallFaceEMF_X3(const Prim &prim, const Coords &coords, const HallDiffusivity &hall_diff,
-               const Real eta_floor, const Eta &eta_pack, const bool use_cache,
-               const int ndim, const int b, const int k, const int j, const int i, Real &e1,
-               Real &e2, Real &e3) {
-  Real j1, j2, j3, b1, b2, b3;
-  FaceCurrentAndB_X3(prim, coords, ndim, b, k, j, i, j1, j2, j3, b1, b2, b3);
-  const Real bmag = std::sqrt(SQR(b1) + SQR(b2) + SQR(b3));
-  Real eta_h;
+template <class Pack, class Coords>
+KOKKOS_INLINE_FUNCTION Real HallJzE3(const Pack &p, const Coords &c, const int b,
+                                     const int k, const int j, const int i) {
+  const Real dBy_dx = (p(b, TE::F2, Bf(), k, j, i) - p(b, TE::F2, Bf(), k, j, i - 1)) /
+                      c.template Dxc<X1DIR>(k, j, i);
+  const Real dBx_dy = (p(b, TE::F1, Bf(), k, j, i) - p(b, TE::F1, Bf(), k, j - 1, i)) /
+                      c.template Dxc<X2DIR>(k, j, i);
+  return dBy_dx - dBx_dy;
+}
+
+//! eta_H at an edge as the mean of its four bounding cells (cached NonidealEtaIdx::H, or
+//! evaluated from the cell-mean rho/T/x_e and the edge |B|). The four (kc,jc,ic) triplets
+//! are the cells sharing the edge.
+template <class Prim, class Eta>
+KOKKOS_INLINE_FUNCTION Real
+HallEdgeEta(const HallDiffusivity &hd, const Prim &prim, const Eta &eta_pack,
+            const bool use_cache, const Real bmag, const int b, const int k0, const int j0,
+            const int i0, const int k1, const int j1, const int i1, const int k2,
+            const int j2, const int i2, const int k3, const int j3, const int i3) {
   if (use_cache) {
-    eta_h = 0.5 * (eta_pack(b, NonidealEtaIdx::H, k - 1, j, i) +
-                   eta_pack(b, NonidealEtaIdx::H, k, j, i));
-  } else {
-    const Real rho = 0.5 * (prim(b, IDN, k - 1, j, i) + prim(b, IDN, k, j, i));
-    const Real prs = 0.5 * (prim(b, IPR, k - 1, j, i) + prim(b, IPR, k, j, i));
-    const int i_xe = hall_diff.XeIndex();
-    const Real xe =
-        (i_xe >= 0) ? 0.5 * (prim(b, i_xe, k - 1, j, i) + prim(b, i_xe, k, j, i)) : -1.0;
-    eta_h = hall_diff.Get(bmag, rho, prs / rho, xe);
+    return 0.25 * (eta_pack(b, NonidealEtaIdx::H, k0, j0, i0) +
+                   eta_pack(b, NonidealEtaIdx::H, k1, j1, i1) +
+                   eta_pack(b, NonidealEtaIdx::H, k2, j2, i2) +
+                   eta_pack(b, NonidealEtaIdx::H, k3, j3, i3));
   }
-  HallEMFLocal(eta_h, eta_floor, bmag, j1, j2, j3, b1, b2, b3, e1, e2, e3);
+  const Real rho = 0.25 * (prim(b, IDN, k0, j0, i0) + prim(b, IDN, k1, j1, i1) +
+                           prim(b, IDN, k2, j2, i2) + prim(b, IDN, k3, j3, i3));
+  const Real prs = 0.25 * (prim(b, IPR, k0, j0, i0) + prim(b, IPR, k1, j1, i1) +
+                           prim(b, IPR, k2, j2, i2) + prim(b, IPR, k3, j3, i3));
+  const int i_xe = hd.XeIndex();
+  const Real xe = (i_xe >= 0) ? 0.25 * (prim(b, i_xe, k0, j0, i0) + prim(b, i_xe, k1, j1, i1) +
+                                        prim(b, i_xe, k2, j2, i2) + prim(b, i_xe, k3, j3, i3))
+                              : -1.0;
+  return hd.Get(bmag, rho, prs / rho, xe);
 }
 
 //----------------------------------------------------------------------------------------
@@ -1225,12 +1225,12 @@ TaskStatus CT_AddAmbipolarEMF(MeshData<Real> *md) {
 }
 
 //----------------------------------------------------------------------------------------
-//! Non-ideal (Hall) edge EMF for CT. Same four-face-average construction as
-//! CT_AddAmbipolarEMF, but with the Hall EMF E_H = eta_H (J x B)/|B| (+ optional Ohmic
-//! floor eta_O J). Hall is dispersive and unsplit-only under CT (RKL2+CT forbidden), so the
-//! whistler part and the floor are both applied here (eta_h_on = floor_on = true). See
-//! ct.hpp. The matching cons.flux(IBn) deposit in HallDiffFluxIsoFixed is gated off under
-//! CT; its cons.flux(IEN) Poynting term stays on the FV energy flux.
+//! Non-ideal (Hall) edge EMF for CT -- COMPACT edge-current formulation (see the helper
+//! comment above). The Hall EMF E_H = eta_H (J x B)/|B| (+ optional Ohmic floor eta_O J) is
+//! formed ONCE per edge from the tight edge currents and the edge-interpolated field, which
+//! preserves the whistler dispersion (the face-EMF-averaged version was ~25-90% too slow).
+//! Hall is dispersive and unsplit-only under CT. The matching cons.flux(IBn) deposit in
+//! HallDiffFluxIsoFixed is gated off under CT; its cons.flux(IEN) Poynting term stays FV.
 TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
   auto pmb = md->GetBlockData(0)->GetBlockPointer();
   auto hydro_pkg = pmb->packages.Get("Hydro");
@@ -1251,7 +1251,7 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
   auto pack = desc.GetPack(md);
   const int nb = pack.GetNBlocks();
 
-  // ---- E3 edge: e3 from x-faces (rows j,j-1) + y-faces (cols i,i-1). 2D & 3D. ----
+  // ---- E3 edge (i-1/2,j-1/2,k): e3 = eta_H (Jx By - Jy Bx)/|B| + eta_floor Jz. 2D & 3D. ----
   {
     IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E3);
     IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E3);
@@ -1261,25 +1261,48 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
         kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
           const auto &c = pack.GetCoordinates(b);
-          Real e1, e2, e3, acc = 0.0;
-          HallFaceEMF_X1(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k, j,
-                         i, e1, e2, e3);
-          acc += e3;
-          HallFaceEMF_X1(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k,
-                         j - 1, i, e1, e2, e3);
-          acc += e3;
-          HallFaceEMF_X2(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k, j,
-                         i, e1, e2, e3);
-          acc += e3;
-          HallFaceEMF_X2(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k, j,
-                         i - 1, e1, e2, e3);
-          acc += e3;
-          pack.flux(b, TE::E3, Bf(), k, j, i) += 0.25 * acc;
+          const Real Jz = HallJzE3(pack, c, b, k, j, i);
+          // J_x from E1 edges: interp x (i,i-1), z (k,k+1) -> preserves any dBz/dy stencil.
+          const Real Jx =
+              three_d ? 0.25 * (HallJxE1(pack, c, b, k, j, i, three_d) +
+                                HallJxE1(pack, c, b, k, j, i - 1, three_d) +
+                                HallJxE1(pack, c, b, k + 1, j, i, three_d) +
+                                HallJxE1(pack, c, b, k + 1, j, i - 1, three_d))
+                      : 0.5 * (HallJxE1(pack, c, b, k, j, i, three_d) +
+                               HallJxE1(pack, c, b, k, j, i - 1, three_d));
+          // J_y from E2 edges: interp y (j,j-1), z (k,k+1) -> preserves the dBz/dx stencil.
+          const Real Jy =
+              three_d ? 0.25 * (HallJyE2(pack, c, b, k, j, i, three_d) +
+                                HallJyE2(pack, c, b, k, j - 1, i, three_d) +
+                                HallJyE2(pack, c, b, k + 1, j, i, three_d) +
+                                HallJyE2(pack, c, b, k + 1, j - 1, i, three_d))
+                      : 0.5 * (HallJyE2(pack, c, b, k, j, i, three_d) +
+                               HallJyE2(pack, c, b, k, j - 1, i, three_d));
+          const Real Bx = 0.5 * (pack(b, TE::F1, Bf(), k, j, i) +
+                                 pack(b, TE::F1, Bf(), k, j - 1, i));
+          const Real By = 0.5 * (pack(b, TE::F2, Bf(), k, j, i) +
+                                 pack(b, TE::F2, Bf(), k, j, i - 1));
+          Real Bz = 0.25 * (pack(b, TE::F3, Bf(), k, j, i) +
+                            pack(b, TE::F3, Bf(), k, j - 1, i) +
+                            pack(b, TE::F3, Bf(), k, j, i - 1) +
+                            pack(b, TE::F3, Bf(), k, j - 1, i - 1));
+          if (three_d) {
+            Bz = 0.5 * Bz + 0.125 * (pack(b, TE::F3, Bf(), k + 1, j, i) +
+                                     pack(b, TE::F3, Bf(), k + 1, j - 1, i) +
+                                     pack(b, TE::F3, Bf(), k + 1, j, i - 1) +
+                                     pack(b, TE::F3, Bf(), k + 1, j - 1, i - 1));
+          }
+          const Real bmag = std::sqrt(SQR(Bx) + SQR(By) + SQR(Bz));
+          const Real eta_h = HallEdgeEta(hall_diff, prim, eta_pack, use_cache, bmag, b, k, j,
+                                         i, k, j, i - 1, k, j - 1, i, k, j - 1, i - 1);
+          Real e1, e2, e3;
+          HallEMFLocal(eta_h, eta_floor, bmag, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
+          pack.flux(b, TE::E3, Bf(), k, j, i) += e3;
         });
   }
 
   if (three_d) {
-    // ---- E1 edge: e1 from y-faces (rows k,k-1) + z-faces (cols j,j-1). ----
+    // ---- E1 edge (i,j-1/2,k-1/2): e1 = eta_H (Jy Bz - Jz By)/|B| + eta_floor Jx. ----
     {
       IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E1);
       IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E1);
@@ -1289,23 +1312,37 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
           kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
           KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
             const auto &c = pack.GetCoordinates(b);
-            Real e1, e2, e3, acc = 0.0;
-            HallFaceEMF_X2(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k,
-                           j, i, e1, e2, e3);
-            acc += e1;
-            HallFaceEMF_X2(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b,
-                           k - 1, j, i, e1, e2, e3);
-            acc += e1;
-            HallFaceEMF_X3(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k,
-                           j, i, e1, e2, e3);
-            acc += e1;
-            HallFaceEMF_X3(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k,
-                           j - 1, i, e1, e2, e3);
-            acc += e1;
-            pack.flux(b, TE::E1, Bf(), k, j, i) += 0.25 * acc;
+            const Real Jx = HallJxE1(pack, c, b, k, j, i, true);
+            const Real Jy = 0.25 * (HallJyE2(pack, c, b, k, j, i, true) +
+                                    HallJyE2(pack, c, b, k, j - 1, i, true) +
+                                    HallJyE2(pack, c, b, k, j, i + 1, true) +
+                                    HallJyE2(pack, c, b, k, j - 1, i + 1, true));
+            const Real Jz = 0.25 * (HallJzE3(pack, c, b, k, j, i) +
+                                    HallJzE3(pack, c, b, k, j, i + 1) +
+                                    HallJzE3(pack, c, b, k - 1, j, i) +
+                                    HallJzE3(pack, c, b, k - 1, j, i + 1));
+            const Real Bx = 0.125 * (pack(b, TE::F1, Bf(), k, j, i) +
+                                     pack(b, TE::F1, Bf(), k, j, i + 1) +
+                                     pack(b, TE::F1, Bf(), k, j - 1, i) +
+                                     pack(b, TE::F1, Bf(), k, j - 1, i + 1) +
+                                     pack(b, TE::F1, Bf(), k - 1, j, i) +
+                                     pack(b, TE::F1, Bf(), k - 1, j, i + 1) +
+                                     pack(b, TE::F1, Bf(), k - 1, j - 1, i) +
+                                     pack(b, TE::F1, Bf(), k - 1, j - 1, i + 1));
+            const Real By = 0.5 * (pack(b, TE::F2, Bf(), k, j, i) +
+                                   pack(b, TE::F2, Bf(), k - 1, j, i));
+            const Real Bz = 0.5 * (pack(b, TE::F3, Bf(), k, j, i) +
+                                   pack(b, TE::F3, Bf(), k, j - 1, i));
+            const Real bmag = std::sqrt(SQR(Bx) + SQR(By) + SQR(Bz));
+            const Real eta_h =
+                HallEdgeEta(hall_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k,
+                            j - 1, i, k - 1, j, i, k - 1, j - 1, i);
+            Real e1, e2, e3;
+            HallEMFLocal(eta_h, eta_floor, bmag, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
+            pack.flux(b, TE::E1, Bf(), k, j, i) += e1;
           });
     }
-    // ---- E2 edge: e2 from z-faces (cols i,i-1) + x-faces (rows k,k-1). ----
+    // ---- E2 edge (i-1/2,j,k-1/2): e2 = eta_H (Jz Bx - Jx Bz)/|B| + eta_floor Jy. ----
     {
       IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E2);
       IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E2);
@@ -1315,20 +1352,34 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
           kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
           KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
             const auto &c = pack.GetCoordinates(b);
-            Real e1, e2, e3, acc = 0.0;
-            HallFaceEMF_X3(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k,
-                           j, i, e1, e2, e3);
-            acc += e2;
-            HallFaceEMF_X3(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k,
-                           j, i - 1, e1, e2, e3);
-            acc += e2;
-            HallFaceEMF_X1(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b, k,
-                           j, i, e1, e2, e3);
-            acc += e2;
-            HallFaceEMF_X1(prim, c, hall_diff, eta_floor, eta_pack, use_cache, ndim, b,
-                           k - 1, j, i, e1, e2, e3);
-            acc += e2;
-            pack.flux(b, TE::E2, Bf(), k, j, i) += 0.25 * acc;
+            const Real Jy = HallJyE2(pack, c, b, k, j, i, true);
+            const Real Jx = 0.25 * (HallJxE1(pack, c, b, k, j, i, true) +
+                                    HallJxE1(pack, c, b, k, j + 1, i, true) +
+                                    HallJxE1(pack, c, b, k, j, i - 1, true) +
+                                    HallJxE1(pack, c, b, k, j + 1, i - 1, true));
+            const Real Jz = 0.25 * (HallJzE3(pack, c, b, k, j, i) +
+                                    HallJzE3(pack, c, b, k, j + 1, i) +
+                                    HallJzE3(pack, c, b, k - 1, j, i) +
+                                    HallJzE3(pack, c, b, k - 1, j + 1, i));
+            const Real Bx = 0.5 * (pack(b, TE::F1, Bf(), k, j, i) +
+                                   pack(b, TE::F1, Bf(), k - 1, j, i));
+            const Real By = 0.125 * (pack(b, TE::F2, Bf(), k, j, i) +
+                                     pack(b, TE::F2, Bf(), k, j + 1, i) +
+                                     pack(b, TE::F2, Bf(), k, j, i - 1) +
+                                     pack(b, TE::F2, Bf(), k, j + 1, i - 1) +
+                                     pack(b, TE::F2, Bf(), k - 1, j, i) +
+                                     pack(b, TE::F2, Bf(), k - 1, j + 1, i) +
+                                     pack(b, TE::F2, Bf(), k - 1, j, i - 1) +
+                                     pack(b, TE::F2, Bf(), k - 1, j + 1, i - 1));
+            const Real Bz = 0.5 * (pack(b, TE::F3, Bf(), k, j, i) +
+                                   pack(b, TE::F3, Bf(), k, j, i - 1));
+            const Real bmag = std::sqrt(SQR(Bx) + SQR(By) + SQR(Bz));
+            const Real eta_h =
+                HallEdgeEta(hall_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k, j,
+                            i - 1, k - 1, j, i, k - 1, j, i - 1);
+            Real e1, e2, e3;
+            HallEMFLocal(eta_h, eta_floor, bmag, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
+            pack.flux(b, TE::E2, Bf(), k, j, i) += e2;
           });
     }
   }

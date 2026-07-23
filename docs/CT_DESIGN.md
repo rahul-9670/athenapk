@@ -76,15 +76,23 @@
   *1D* Gaussian/eigenmode tests read exactly 0 because their field varies only in x.)
   Decks: `runs/ct_tests/diffusion_ohmic_{glm,ct}.in`, `diffusion_ad_{glm,ct}.in`,
   `field_loop_resistive_{ct,glm}.in`, `field_loop_ad_{ct,glm}.in`.
-  *Hall — IMPLEMENTED but DISABLED (dispersion-incorrect).* `CT_AddHallEMF` routes
-  `E_H = eta_H (JxB)/|B| (+ Ohmic floor)` through the identical four-face-average construction (sharing
-  `FaceCurrentAndB_X{1,2,3}` with AD). It preserves div B and is bit-identical on GLM, BUT the
-  face-EMF-averaging (a box filter, only 2nd-order for parabolic terms) **corrupts the dispersive
-  whistler**: measured 3D whistler `omega` runs **~25% slow at Q_H=0.05 and ~90% slow at Q_H=0.5** vs
-  the analytic Hall dispersion (GLM ~6% on the same box; GLM itself goes unstable at Q_H=0.5 in 3D — the
-  cross-code Hall is moot anyway since Athena++'s Hall is a stub). An init-time `PARTHENON_REQUIRE`
-  therefore forbids Hall+CT. Fixing it needs a COMPACT edge-current Hall EMF (edge-direct `J x B` rather
-  than face-averaged), a genuine future increment. Decks: `runs/ct_tests/hall_whistler_{glm,ct}.in`.
+  *Hall — COMPACT edge-current formulation, ENABLED with a dispersion caveat (2026-07-23).* `CT_AddHallEMF`
+  now forms `E_H = eta_H (JxB)/|B| (+ Ohmic floor)` ONCE per edge from the tight edge curls of the face
+  field (`HallJxE1`/`HallJyE2`/`HallJzE3`, the same compact stencils Ohmic uses) with the transverse J and
+  the field interpolated to the edge ONLY in the directions transverse to each component's own derivative
+  -- so the propagation-direction derivative is never box-filtered. This replaces the earlier
+  face-EMF-averaged Hall (a double box filter). **Reliable re-measurement (per-snapshot phase increment,
+  which showed the earlier "25-90% slow" was largely a coarse-FFT artifact):** CT reproduces the ideal-
+  Alfven base EXACTLY (omega=6.288 vs k*vA=6.283), is div-free and stable (with the usual Ohmic floor, as
+  Hall always needs -- GLM is outright unstable floor-off), and gives the correct-DIRECTION whistler
+  (above Alfven). BUT the whistler *dispersion* is still under-captured: omega/analytic = 0.88 at Q_H=0.05,
+  0.62 at Q_H=0.2 (deficit grows with Hall strength, with mild spurious damping) -- the dispersive, non-
+  dissipative Hall term is genuinely hard to make spectrally accurate on a staggered mesh (needs a
+  whistler-preserving scheme a la Toth+2008 / sub-cycling; a real future increment). It is therefore
+  ENABLED with a one-time startup WARNING rather than blocked: usable and correct-direction, but use
+  `divergence_control=glm` when fast-wave dispersion accuracy matters. Hall is not in the production
+  collapse and Athena++'s Hall is a stub, so the cross-code comparison is unaffected. Decks:
+  `runs/ct_tests/hall_whistler_{glm,ct}.in`.
   *RKL2 STS-curl — DONE (2026-07-23).* Production AD collapses super-time-step the parabolic diffusion, so
   Ohmic/AD under CT now run with `diffusion/integrator=rkl2` as well as `unsplit`. The divergence-free
   induction is super-time-stepped on the face field `Bf` IN PARALLEL with the cons energy: `AddSTSTasks`
