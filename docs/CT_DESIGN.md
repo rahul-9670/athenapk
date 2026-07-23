@@ -43,7 +43,7 @@
   absolute div B = **1.4e-18**; static-AMR field loop (20 blocks, C-F reflux) = **2.6e-18** — both
   EXIT 0, round-off, matching the CPU values. GPU SUM-reduction non-determinism does not affect the
   MIN/MAX divergence reduction.
-- **Increment 4 (non-ideal edge-EMF re-routing) — Ohmic + Ambipolar DONE (2026-07-22/23); Hall + STS-curl PENDING.**
+- **Increment 4 (non-ideal edge-EMF re-routing) — Ohmic + Ambipolar DONE (unsplit + RKL2 STS, 2026-07-22/23); Hall implemented-but-disabled; compact-Hall the only gap.**
   *Ohmic:* `CT_AddOhmicEMF` (ct.cpp) computes `E += eta*J` with `J = curl(Bf)` evaluated *edge-centered*
   directly from the staggered face field, accumulated onto the ideal edge EMF in `Bf.flux(E1/E2/E3)`
   BEFORE the flux-correction round (so the C-F reflux restricts it too). Because `CT_UpdateBf` does
@@ -85,8 +85,18 @@
   cross-code Hall is moot anyway since Athena++'s Hall is a stub). An init-time `PARTHENON_REQUIRE`
   therefore forbids Hall+CT. Fixing it needs a COMPACT edge-current Hall EMF (edge-direct `J x B` rather
   than face-averaged), a genuine future increment. Decks: `runs/ct_tests/hall_whistler_{glm,ct}.in`.
-  **PENDING:** compact edge-current Hall for CT; RKL2 STS-curl for CT (STS advances cell-centered B via
-  flux-divergence, which the projection clobbers) remains unsupported.
+  *RKL2 STS-curl — DONE (2026-07-23).* Production AD collapses super-time-step the parabolic diffusion, so
+  Ohmic/AD under CT now run with `diffusion/integrator=rkl2` as well as `unsplit`. The divergence-free
+  induction is super-time-stepped on the face field `Bf` IN PARALLEL with the cons energy: `AddSTSTasks`
+  runs the RKL2 recurrence on `Bf` with `M(Bf) = -curl(E_diff)` (`CT_ZeroEMF`+`CT_AddOhmicEMF`+
+  `CT_AddAmbipolarEMF` build the diffusive edge EMF; `CT_CurlEMFToBf`/`CT_RKL2FirstBf`/`CT_RKL2OtherBf` are
+  the M-operator and the recurrence), projecting `Bf`->cons `IB` each sub-stage so AD's eta sees the updated
+  field. The unsplit main-step Ohmic/AD edge EMF is gated to `diffint!=rkl2` (no double-apply), and
+  `ResetFluxes` now packs `cons` by name (the `{Independent}` flag matched the face var `Bf`, segfaulting on
+  its edge fluxes). div B stays at round-off (linear combinations of `Bf` states + curls). **Validation:**
+  Ohmic Gaussian CT+rkl2 vs analytic 0.008% (= unsplit); AD damped-Alfven CT+rkl2 0.08%; AD field loop
+  STS-vs-unsplit converge (5e-5 at eta=0.05, 7e-6 at eta=0.005); div B 3e-13; GLM+rkl2 production STS intact.
+  **PENDING:** compact edge-current Hall for CT — the only remaining non-ideal gap.
 - **Increment 7 (CT-vs-GLM collapse flux-retention gate) — the Phase-2 science gate. CODE-READY, config+GPU-bound.**
   Groundwork done: `collapse_be` initializes `Bf` (uniform B0z on F3 faces) on the CT path, so a CT
   collapse shares the GLM IC — VERIFIED div-free at t=0 (div-B=0). Finding (updated 2026-07-23): the *lean*
