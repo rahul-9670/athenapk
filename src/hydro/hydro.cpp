@@ -1115,25 +1115,17 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     pkg->AddParam<>("hall", hall);
 
     // Constrained Transport (divergence_control=ct) support for non-ideal MHD covers Ohmic
-    // resistivity (CT_AddOhmicEMF) and ambipolar diffusion (CT_AddAmbipolarEMF) in the
-    // unsplit integrator (increment 4). Their inductions are re-routed to edge-centered CT
-    // EMFs and their cons-flux induction deposits are gated off (no GS05 double-count).
-    // The Hall effect (CT_AddHallEMF) IS implemented by the same four-face-average
-    // construction and preserves div B, but that averaging (a box filter) badly degrades
-    // the DISPERSIVE whistler: the CT whistler runs ~25% slow at Q_H=0.05 and ~90% slow at
-    // Q_H=0.5 (vs GLM ~6% and the analytic dispersion), because face-EMF-averaging is only
-    // second-order-accurate for parabolic terms and corrupts the dispersion relation. Until
-    // a COMPACT edge-current Hall EMF is written, Hall+CT is forbidden here (the code path
-    // stays for that future work). RKL2 super-time-stepping advances the cell-centered B via
-    // a separate super-step that the CT projection would clobber, so Ohmic/AD under CT also
-    // require the unsplit integrator. Fail loudly rather than run silently-wrong physics.
+    // resistivity (CT_AddOhmicEMF) and ambipolar diffusion (CT_AddAmbipolarEMF) in BOTH the
+    // unsplit integrator (edge EMF added to the ideal EMF each stage) and the RKL2 super-
+    // time-stepping integrator (the divergence-free induction is super-time-stepped on the
+    // face field Bf with M(Bf)=-curl(E_diff); see AddSTSTasks). Their inductions are routed
+    // to edge-centered CT EMFs and their cons-flux induction deposits are gated off (no GS05
+    // / no cons-IB double count). The Hall effect (CT_AddHallEMF) IS implemented by the same
+    // four-face-average construction and preserves div B, but that averaging (a box filter)
+    // badly degrades the DISPERSIVE whistler (CT runs ~25% slow at Q_H=0.05, ~90% at Q_H=0.5
+    // vs GLM ~6% and the analytic dispersion), so until a COMPACT edge-current Hall EMF is
+    // written, Hall+CT is forbidden here (the code path stays for that future work).
     if (pkg->Param<bool>("use_ct")) {
-      PARTHENON_REQUIRE_THROWS(
-          !(((resistivity != Resistivity::none) || (ambipolar != Ambipolar::none)) &&
-            (diffint == DiffInt::rkl2)),
-          "Ohmic resistivity / ambipolar diffusion under Constrained Transport "
-          "(divergence_control=ct) require the unsplit diffusion integrator "
-          "(diffusion/integrator=unsplit); RKL2 STS + CT is not supported.");
       PARTHENON_REQUIRE_THROWS(
           hall == Hall::none,
           "The Hall effect under Constrained Transport (divergence_control=ct) is "

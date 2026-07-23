@@ -365,6 +365,181 @@ TaskStatus CT_UpdateBf(MeshData<Real> *md_base, MeshData<Real> *md_u1, const Rea
 }
 
 //----------------------------------------------------------------------------------------
+//! Discrete curl of the edge EMF (stored in the Bf.flux slots of `emf`) for one face,
+//! i.e. the M-operator value (-curl E) used by the CT RKL2 super-time-stepping. Mirrors the
+//! per-face curl of CT_UpdateBf exactly. `comp` selects F1/F2/F3.
+template <int comp, class Pack, class Coords>
+KOKKOS_INLINE_FUNCTION Real CurlEMF(const Pack &emf, const Coords &coords, const int b,
+                                    const int k, const int j, const int i,
+                                    const bool three_d) {
+  if (comp == 1) { // F1 (B_x): -(dE3/dy) + (dE2/dz)
+    Real curl = -(emf.flux(b, TE::E3, Bf(), k, j + 1, i) -
+                  emf.flux(b, TE::E3, Bf(), k, j, i)) /
+                coords.template Dxc<X2DIR>(k, j, i);
+    if (three_d) {
+      curl += (emf.flux(b, TE::E2, Bf(), k + 1, j, i) -
+               emf.flux(b, TE::E2, Bf(), k, j, i)) /
+              coords.template Dxc<X3DIR>(k, j, i);
+    }
+    return curl;
+  } else if (comp == 2) { // F2 (B_y): (dE3/dx) - (dE1/dz)
+    Real curl = (emf.flux(b, TE::E3, Bf(), k, j, i + 1) -
+                 emf.flux(b, TE::E3, Bf(), k, j, i)) /
+                coords.template Dxc<X1DIR>(k, j, i);
+    if (three_d) {
+      curl -= (emf.flux(b, TE::E1, Bf(), k + 1, j, i) -
+               emf.flux(b, TE::E1, Bf(), k, j, i)) /
+              coords.template Dxc<X3DIR>(k, j, i);
+    }
+    return curl;
+  } else { // F3 (B_z): -(dE2/dx) + (dE1/dy)  [3D only]
+    return -(emf.flux(b, TE::E2, Bf(), k, j, i + 1) -
+             emf.flux(b, TE::E2, Bf(), k, j, i)) /
+               coords.template Dxc<X1DIR>(k, j, i) +
+           (emf.flux(b, TE::E1, Bf(), k, j + 1, i) -
+            emf.flux(b, TE::E1, Bf(), k, j, i)) /
+               coords.template Dxc<X2DIR>(k, j, i);
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! Zero the edge-EMF flux slots so the += accumulators build the diffusive-only EMF.
+TaskStatus CT_ZeroEMF(MeshData<Real> *md) {
+  const int ndim = md->GetMeshPointer()->ndim;
+  static auto desc =
+      parthenon::MakePackDescriptor<Bf>(md, {}, {parthenon::PDOpt::WithFluxes});
+  auto pack = desc.GetPack(md);
+  const int nb = pack.GetNBlocks();
+  auto zero = [&](TE te, const char *name) {
+    IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, te);
+    IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, te);
+    IndexRange kb = md->GetBoundsK(CellLevel::same, IndexDomain::interior, te);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, name, parthenon::DevExecSpace(), 0, nb - 1, kb.s, kb.e, jb.s,
+        jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          pack.flux(b, te, Bf(), k, j, i) = 0.0;
+        });
+  };
+  zero(TE::E3, "CT_ZeroEMF_E3");
+  if (ndim > 2) {
+    zero(TE::E1, "CT_ZeroEMF_E1");
+    zero(TE::E2, "CT_ZeroEMF_E2");
+  }
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! MY0 = M(Y0) = -curl(E_diff): write md_out's face field to the curl of the edge EMF in
+//! md_emf's Bf.flux. (Both containers carry the Bf variable; md_emf must have valid fluxes.)
+TaskStatus CT_CurlEMFToBf(MeshData<Real> *md_emf, MeshData<Real> *md_out) {
+  const int ndim = md_emf->GetMeshPointer()->ndim;
+  const bool three_d = ndim > 2;
+  static auto desc_e =
+      parthenon::MakePackDescriptor<Bf>(md_emf, {}, {parthenon::PDOpt::WithFluxes});
+  static auto desc_o = parthenon::MakePackDescriptor<Bf>(md_out);
+  auto emf = desc_e.GetPack(md_emf);
+  auto out = desc_o.GetPack(md_out);
+  const int nb = emf.GetNBlocks();
+  auto run = [&](auto comp_c, TE te, const char *name) {
+    constexpr int comp = decltype(comp_c)::value;
+    IndexRange ib = md_emf->GetBoundsI(CellLevel::same, IndexDomain::interior, te);
+    IndexRange jb = md_emf->GetBoundsJ(CellLevel::same, IndexDomain::interior, te);
+    IndexRange kb = md_emf->GetBoundsK(CellLevel::same, IndexDomain::interior, te);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, name, parthenon::DevExecSpace(), 0, nb - 1, kb.s, kb.e, jb.s,
+        jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &c = emf.GetCoordinates(b);
+          out(b, te, Bf(), k, j, i) = CurlEMF<comp>(emf, c, b, k, j, i, three_d);
+        });
+  };
+  run(std::integral_constant<int, 1>{}, TE::F1, "CT_CurlEMF_F1");
+  run(std::integral_constant<int, 2>{}, TE::F2, "CT_CurlEMF_F2");
+  if (three_d) run(std::integral_constant<int, 3>{}, TE::F3, "CT_CurlEMF_F3");
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! RKL2 first sub-step on the face field: base.Bf = Y0.Bf + mu_tilde_1*tau*MY0.Bf and
+//! Yjm2.Bf = Y0.Bf. Mirrors RKL2StepFirst but for Bf (F1/F2/F3).
+TaskStatus CT_RKL2FirstBf(MeshData<Real> *md_Y0, MeshData<Real> *md_base,
+                          MeshData<Real> *md_Yjm2, MeshData<Real> *md_MY0, const int s_rkl,
+                          const Real tau) {
+  const Real mu_tilde_1 = 4. / 3. /
+                          (static_cast<Real>(s_rkl) * static_cast<Real>(s_rkl) +
+                           static_cast<Real>(s_rkl) - 2.);
+  const int ndim = md_base->GetMeshPointer()->ndim;
+  static auto desc = parthenon::MakePackDescriptor<Bf>(md_base);
+  auto Y0 = desc.GetPack(md_Y0);
+  auto base = desc.GetPack(md_base);
+  auto Yjm2 = desc.GetPack(md_Yjm2);
+  auto MY0 = desc.GetPack(md_MY0);
+  const int nb = base.GetNBlocks();
+  auto run = [&](TE te, const char *name) {
+    IndexRange ib = md_base->GetBoundsI(CellLevel::same, IndexDomain::interior, te);
+    IndexRange jb = md_base->GetBoundsJ(CellLevel::same, IndexDomain::interior, te);
+    IndexRange kb = md_base->GetBoundsK(CellLevel::same, IndexDomain::interior, te);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, name, parthenon::DevExecSpace(), 0, nb - 1, kb.s, kb.e, jb.s,
+        jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const Real y0 = Y0(b, te, Bf(), k, j, i);
+          base(b, te, Bf(), k, j, i) = y0 + mu_tilde_1 * tau * MY0(b, te, Bf(), k, j, i);
+          Yjm2(b, te, Bf(), k, j, i) = y0;
+        });
+  };
+  run(TE::F1, "CT_RKL2First_F1");
+  run(TE::F2, "CT_RKL2First_F2");
+  if (ndim > 2) run(TE::F3, "CT_RKL2First_F3");
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! RKL2 sub-step j>=2 on the face field. MYjm1 = -curl(edge EMF in base.Bf.flux) is formed
+//! inline; then base.Bf is advanced by the RKL2 recurrence with the Yjm2 shuffle. Mirrors
+//! RKL2StepOther but for Bf, reading the edge EMF from base's own flux slots.
+TaskStatus CT_RKL2OtherBf(MeshData<Real> *md_Y0, MeshData<Real> *md_base,
+                          MeshData<Real> *md_Yjm2, MeshData<Real> *md_MY0, const Real mu_j,
+                          const Real nu_j, const Real mu_tilde_j, const Real gamma_tilde_j,
+                          const Real tau) {
+  const int ndim = md_base->GetMeshPointer()->ndim;
+  const bool three_d = ndim > 2;
+  static auto desc_f =
+      parthenon::MakePackDescriptor<Bf>(md_base, {}, {parthenon::PDOpt::WithFluxes});
+  static auto desc = parthenon::MakePackDescriptor<Bf>(md_base);
+  auto base = desc_f.GetPack(md_base); // has Bf + edge-EMF fluxes
+  auto Y0 = desc.GetPack(md_Y0);
+  auto Yjm2 = desc.GetPack(md_Yjm2);
+  auto MY0 = desc.GetPack(md_MY0);
+  const int nb = base.GetNBlocks();
+  auto run = [&](auto comp_c, TE te, const char *name) {
+    constexpr int comp = decltype(comp_c)::value;
+    IndexRange ib = md_base->GetBoundsI(CellLevel::same, IndexDomain::interior, te);
+    IndexRange jb = md_base->GetBoundsJ(CellLevel::same, IndexDomain::interior, te);
+    IndexRange kb = md_base->GetBoundsK(CellLevel::same, IndexDomain::interior, te);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, name, parthenon::DevExecSpace(), 0, nb - 1, kb.s, kb.e, jb.s,
+        jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &c = base.GetCoordinates(b);
+          const Real MYjm1 = CurlEMF<comp>(base, c, b, k, j, i, three_d);
+          const Real yjm1 = base(b, te, Bf(), k, j, i);
+          const Real yj = mu_j * yjm1 + nu_j * Yjm2(b, te, Bf(), k, j, i) +
+                          (1.0 - mu_j - nu_j) * Y0(b, te, Bf(), k, j, i) +
+                          mu_tilde_j * tau * MYjm1 +
+                          gamma_tilde_j * tau * MY0(b, te, Bf(), k, j, i);
+          Yjm2(b, te, Bf(), k, j, i) = yjm1;
+          base(b, te, Bf(), k, j, i) = yj;
+        });
+  };
+  run(std::integral_constant<int, 1>{}, TE::F1, "CT_RKL2Other_F1");
+  run(std::integral_constant<int, 2>{}, TE::F2, "CT_RKL2Other_F2");
+  if (three_d) run(std::integral_constant<int, 3>{}, TE::F3, "CT_RKL2Other_F3");
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
 //! Project the face field onto cell-centered IB1..IB3 in cons.
 TaskStatus CT_ProjectBfToCC(MeshData<Real> *md) {
   const int ndim = md->GetMeshPointer()->ndim;

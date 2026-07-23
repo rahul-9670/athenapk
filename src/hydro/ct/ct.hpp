@@ -126,6 +126,36 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md);
 TaskStatus CT_UpdateBf(MeshData<Real> *md_base, MeshData<Real> *md_u1, const Real gam0,
                        const Real gam1, const Real beta_dt);
 
+// ---- RKL2 super-time-stepping of the diffusive induction under CT (increment 4) --------
+// The GLM STS (AddSTSTasks) super-time-steps the parabolic diffusion on the cell-centered
+// cons via flux-divergence. Under CT the cons.flux(IBn) induction deposits are gated off,
+// so the cons recurrence advances only the gas energy (resistive/AD Poynting) and leaves B
+// inert; the divergence-free induction is super-time-stepped SEPARATELY on the face field
+// Bf here, with the RKL2 operator M(Bf) = -curl(E_diff) (E_diff = the Ohmic+AD edge EMF).
+// Because every sub-stage is a linear combination of Bf states plus curls of single-valued
+// edge EMFs, div B stays at round-off through the whole super-step.
+
+// Zero the edge-EMF flux slots Bf.flux(E1/E2/E3) so CT_AddOhmicEMF/CT_AddAmbipolarEMF (which
+// accumulate with +=) build the *diffusive-only* edge EMF for the STS operator.
+TaskStatus CT_ZeroEMF(MeshData<Real> *md);
+
+// M-operator: write md_out's face field to the discrete curl of the edge EMF currently in
+// md_emf's Bf.flux, i.e. Bf_out = -curl(E_diff). Used to precompute MY0 = M(Y0) once.
+TaskStatus CT_CurlEMFToBf(MeshData<Real> *md_emf, MeshData<Real> *md_out);
+
+// RKL2 first sub-step on Bf: base.Bf = Y0.Bf + mu_tilde_1*tau*MY0.Bf ; Yjm2.Bf = Y0.Bf.
+TaskStatus CT_RKL2FirstBf(MeshData<Real> *md_Y0, MeshData<Real> *md_base,
+                          MeshData<Real> *md_Yjm2, MeshData<Real> *md_MY0, const int s_rkl,
+                          const Real tau);
+
+// RKL2 sub-step j>=2 on Bf. MYjm1 = -curl(edge EMF in base.Bf.flux) is formed inline; then
+// base.Bf = mu*base.Bf + nu*Yjm2.Bf + (1-mu-nu)*Y0.Bf + mu_tilde*tau*MYjm1
+//           + gamma_tilde*tau*MY0.Bf, with Yjm2.Bf shuffled to the old base.Bf first.
+TaskStatus CT_RKL2OtherBf(MeshData<Real> *md_Y0, MeshData<Real> *md_base,
+                          MeshData<Real> *md_Yjm2, MeshData<Real> *md_MY0, const Real mu_j,
+                          const Real nu_j, const Real mu_tilde_j, const Real gamma_tilde_j,
+                          const Real tau);
+
 // Project the face field onto the cell-centered slots IB1..IB3 of "cons".
 TaskStatus CT_ProjectBfToCC(MeshData<Real> *md);
 

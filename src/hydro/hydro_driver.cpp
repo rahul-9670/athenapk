@@ -54,10 +54,13 @@ TaskStatus ResetFluxes(MeshData<Real> *md) {
   IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
   IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
 
-  // In principle, we'd only need to pack Metadata::WithFluxes here, but
-  // choosing to mirror other use in the code so that the packs are already cached.
-  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
-  auto cons_pack = md->PackVariablesAndFluxes(flags_ind);
+  // Pack "cons" by NAME rather than by the {Independent} flag: the STS resets the diffusive
+  // fluxes, which are deposited ONLY onto cons. Under Constrained Transport the {Independent}
+  // flag also matches the FACE field Bf (WithFluxes) whose EDGE fluxes (E1/E2/E3) have no
+  // X1/X2/X3 cell-flux slots -- indexing them here segfaults. Bf's edge EMF is zeroed
+  // separately by CT_ZeroEMF. cons-by-name is also the v6-STS-bug-hardened choice.
+  const std::vector<std::string> cons_name{"cons"};
+  auto cons_pack = md->PackVariablesAndFluxes(cons_name, cons_name);
 
   const int ndim = pmb->pmy_mesh->ndim;
   // Using separate loops for each dim as the launch overhead should be hidden
@@ -187,6 +190,12 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
   // With diffusion/rkl2_freeze_eta the stage-init below refreshes the non-ideal eta
   // cache from the half-start state and the stages jj=2..s reuse it (refill=false).
   const bool refill_eta_stages = !hydro_pkg->Param<bool>("rkl2_freeze_eta");
+  // Under Constrained Transport the cons.flux(IBn) diffusive deposits are gated off, so the
+  // cons recurrence super-time-steps only the gas energy (Ohmic/AD Poynting) and leaves B
+  // inert; the divergence-free induction is super-time-stepped in PARALLEL on the face field
+  // Bf with M(Bf) = -curl(E_diff). Each Bf sub-stage is projected onto cons IB1..IB3 so the
+  // AD eta / edge EMF of the next sub-stage sees the updated field. See ct.hpp / ct.cpp.
+  const bool use_ct = hydro_pkg->Param<bool>("use_ct");
 
   // get number of RKL steps
   // eq (21) using half hyperbolic timestep due to Strang split
@@ -214,12 +223,18 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
     auto &base = blocks[i]->meshblock_data.Get();
     tl.AddTask(
         none,
-        [](MeshBlockData<Real> *dst, MeshBlockData<Real> *src) {
+        [](MeshBlockData<Real> *dst, MeshBlockData<Real> *src, bool use_ct) {
           dst->Get("cons").data.DeepCopy(src->Get("cons").data);
           dst->Get("prim").data.DeepCopy(src->Get("prim").data);
+          // CT: the face field Bf is the primary magnetic variable, super-time-stepped on
+          // its own register here, so its Y0 snapshot must be copied too (the cons/prim-only
+          // copy leaves u1.Bf stale -> the Bf recurrence would read a wrong Y0).
+          if (use_ct) {
+            dst->Get("Bf").data.DeepCopy(src->Get("Bf").data);
+          }
           return TaskStatus::complete;
         },
-        Y0.get(), base.get());
+        Y0.get(), base.get(), use_ct);
   }
 
   TaskRegion &region_init = ptask_coll->AddRegion(blocks.size());
@@ -258,12 +273,20 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
     auto hydro_diff_fluxes = tl.AddTask(reset_fluxes, CalcDiffFluxes, hydro_pkg.get(),
                                         base.get(), DiffTermSet::parabolic, true);
 
-    auto send_flx =
-        tl.AddTask(hydro_diff_fluxes, parthenon::LoadAndSendFluxCorrections, base);
+    // CT: build the diffusive-only edge EMF (Ohmic + AD) into base.Bf.flux BEFORE the flux
+    // correction, so the coarse-fine reflux restricts it too (as in the unsplit step).
+    TaskID diff_ready = hydro_diff_fluxes;
+    if (use_ct) {
+      auto zero_emf = tl.AddTask(hydro_diff_fluxes, Hydro::CT::CT_ZeroEMF, base.get());
+      auto ohm_emf = tl.AddTask(zero_emf, Hydro::CT::CT_AddOhmicEMF, base.get());
+      diff_ready = tl.AddTask(ohm_emf, Hydro::CT::CT_AddAmbipolarEMF, base.get());
+    }
+
+    auto send_flx = tl.AddTask(diff_ready, parthenon::LoadAndSendFluxCorrections, base);
     auto recv_flx =
         tl.AddTask(start_flxcor_recv, parthenon::ReceiveFluxCorrections, base);
     auto set_flx =
-        tl.AddTask(recv_flx | hydro_diff_fluxes, parthenon::SetFluxCorrections, base);
+        tl.AddTask(recv_flx | diff_ready, parthenon::SetFluxCorrections, base);
 
     auto &Y0 = pmesh->mesh_data.GetOrAdd("u1", i);
     auto &MY0 = pmesh->mesh_data.GetOrAdd("MY0", i);
@@ -277,6 +300,18 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
     auto rkl2_step_first = tl.AddTask(init_MY0, RKL2StepFirst, Y0.get(), base.get(),
                                       Yjm2.get(), MY0.get(), s_rkl, tau);
 
+    // CT: MY0.Bf = -curl(E_diff of Y0), then the RKL2 first sub-step on Bf, then project
+    // the updated face field onto cons IB1..IB3 (overwriting the inert cons-IB recurrence).
+    TaskID after_step = rkl2_step_first;
+    if (use_ct) {
+      auto curl_my0 =
+          tl.AddTask(set_flx, Hydro::CT::CT_CurlEMFToBf, base.get(), MY0.get());
+      auto ct_first =
+          tl.AddTask(curl_my0 | rkl2_step_first, Hydro::CT::CT_RKL2FirstBf, Y0.get(),
+                     base.get(), Yjm2.get(), MY0.get(), s_rkl, tau);
+      after_step = tl.AddTask(ct_first, Hydro::CT::CT_ProjectBfToCC, base.get());
+    }
+
     // Update ghost cells of Y1 (as MY1 is calculated for each Y_j).
     // Y1 stored in "base", see rkl2_step_first task.
     // Update ghost cells (local and non local), prolongate and apply bound cond.
@@ -285,7 +320,7 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
     // best impl. Go with default call (split local/nonlocal) for now.
     // TODO(pgrete) optimize (in parthenon) to only send subset of updated vars
     auto bounds_exchange = parthenon::AddBoundaryExchangeTasks(
-        rkl2_step_first | start_bnd, tl, base, pmesh->multilevel);
+        after_step | start_bnd, tl, base, pmesh->multilevel);
 
     tl.AddTask(bounds_exchange, parthenon::Update::FillDerived<MeshData<Real>>,
                base.get());
@@ -331,12 +366,19 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
                                           base.get(), DiffTermSet::parabolic,
                                           refill_eta_stages);
 
-      auto send_flx =
-          tl.AddTask(hydro_diff_fluxes, parthenon::LoadAndSendFluxCorrections, base);
+      // CT: rebuild the diffusive edge EMF into base.Bf.flux for the current sub-stage Yjm1.
+      TaskID diff_ready = hydro_diff_fluxes;
+      if (use_ct) {
+        auto zero_emf = tl.AddTask(hydro_diff_fluxes, Hydro::CT::CT_ZeroEMF, base.get());
+        auto ohm_emf = tl.AddTask(zero_emf, Hydro::CT::CT_AddOhmicEMF, base.get());
+        diff_ready = tl.AddTask(ohm_emf, Hydro::CT::CT_AddAmbipolarEMF, base.get());
+      }
+
+      auto send_flx = tl.AddTask(diff_ready, parthenon::LoadAndSendFluxCorrections, base);
       auto recv_flx =
           tl.AddTask(start_flxcor_recv, parthenon::ReceiveFluxCorrections, base);
       auto set_flx =
-          tl.AddTask(recv_flx | hydro_diff_fluxes, parthenon::SetFluxCorrections, base);
+          tl.AddTask(recv_flx | diff_ready, parthenon::SetFluxCorrections, base);
 
       auto &Y0 = pmesh->mesh_data.GetOrAdd("u1", i);
       auto &MY0 = pmesh->mesh_data.GetOrAdd("MY0", i);
@@ -346,6 +388,16 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
           tl.AddTask(set_flx, RKL2StepOther, Y0.get(), base.get(), Yjm2.get(), MY0.get(),
                      mu_j, nu_j, mu_tilde_j, gamma_tilde_j, tau);
 
+      // CT: RKL2 sub-step on Bf (MYjm1 = -curl(edge EMF in base.Bf.flux), formed inline),
+      // then project Bf onto cons IB1..IB3.
+      TaskID after_step = rkl2_step_other;
+      if (use_ct) {
+        auto ct_other = tl.AddTask(set_flx | rkl2_step_other, Hydro::CT::CT_RKL2OtherBf,
+                                   Y0.get(), base.get(), Yjm2.get(), MY0.get(), mu_j, nu_j,
+                                   mu_tilde_j, gamma_tilde_j, tau);
+        after_step = tl.AddTask(ct_other, Hydro::CT::CT_ProjectBfToCC, base.get());
+      }
+
       // update ghost cells of base (currently storing Yj)
       // Update ghost cells (local and non local), prolongate and apply bound cond.
       // TODO(someone) experiment with split (local/nonlocal) comms with respect to
@@ -353,7 +405,7 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
       // best impl. Go with default call (split local/nonlocal) for now.
       // TODO(pgrete) optimize (in parthenon) to only send subset of updated vars
       auto bounds_exchange = parthenon::AddBoundaryExchangeTasks(
-          rkl2_step_other | start_bnd, tl, base, pmesh->multilevel);
+          after_step | start_bnd, tl, base, pmesh->multilevel);
 
       tl.AddTask(bounds_exchange, parthenon::Update::FillDerived<MeshData<Real>>,
                  base.get());
@@ -572,17 +624,17 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
       } else {
         emf = tl.AddTask(calc_flux, Hydro::CT::CT_AssembleEMF, mu0.get());
       }
-      // CT increment 4 (non-ideal): add the Ohmic edge EMF (eta*curl(Bf), edge-centered)
-      // onto the ideal edge EMF, BEFORE the flux-correction round so the coarse-fine
-      // reflux restricts it too. No-op unless resistivity is active. The matching cons
-      // induction deposit in OhmicDiffFluxIsoFixed is gated off under CT (no double
-      // count); its resistive-energy term stays on the FV flux. Unsplit only.
-      emf = tl.AddTask(emf, Hydro::CT::CT_AddOhmicEMF, mu0.get());
-      // CT increment 4 (non-ideal): ambipolar perp-current edge EMF, face-evaluated and
-      // averaged to edges (same four-face pattern as GS05). No-op unless AD is active.
-      // Its cons induction deposit in AmbipolarDiffFluxIsoFixed is gated off under CT; its
-      // AD-Poynting energy term stays on the FV flux. Unsplit only.
-      emf = tl.AddTask(emf, Hydro::CT::CT_AddAmbipolarEMF, mu0.get());
+      // CT increment 4 (non-ideal): add the PARABOLIC (Ohmic + ambipolar) diffusive edge
+      // EMFs onto the ideal edge EMF, BEFORE the flux-correction round so the coarse-fine
+      // reflux restricts them too. No-op unless the respective term is active; the matching
+      // cons induction deposits are gated off under CT (no double count); their energy
+      // (Poynting) terms stay on the FV flux. ONLY in the unsplit integrator: under RKL2 the
+      // parabolic induction is super-time-stepped on Bf in AddSTSTasks, so adding it here
+      // too would double-apply the diffusion (over-damping / instability).
+      if (hydro_pkg->Param<DiffInt>("diffint") != DiffInt::rkl2) {
+        emf = tl.AddTask(emf, Hydro::CT::CT_AddOhmicEMF, mu0.get());
+        emf = tl.AddTask(emf, Hydro::CT::CT_AddAmbipolarEMF, mu0.get());
+      }
       // CT increment 4 (non-ideal): dispersive Hall edge EMF, same face->edge averaging.
       // No-op unless Hall is active. Unsplit only (RKL2+CT forbidden). Its cons induction
       // deposit in HallDiffFluxIsoFixed is gated off; the Poynting term stays FV.
