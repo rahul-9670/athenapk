@@ -87,14 +87,19 @@
   than face-averaged), a genuine future increment. Decks: `runs/ct_tests/hall_whistler_{glm,ct}.in`.
   **PENDING:** compact edge-current Hall for CT; RKL2 STS-curl for CT (STS advances cell-centered B via
   flux-divergence, which the projection clobbers) remains unsupported.
-- **Increment 7 (CT-vs-GLM collapse flux-retention gate) — the Phase-2 science gate. IN PROGRESS.**
-  Groundwork done: `collapse_be` now initializes `Bf` (uniform B0z on F3 faces) on the CT path, so a
-  CT collapse shares the GLM IC. Finding (2026-07-22): a *lean* gate config (`eos=adiabatic` +
-  self-gravity + barotropic cooling + uniform B, reduced res) is numerically unstable at cycle 1 for
-  **both** `glm` and `ct` identically (dt-doubling limiter → huge CFL dt → MHD NaN) — a config issue,
-  not CT. The gate therefore needs the production-quality `eos=hydrogen` setup (known stable), non-ideal
-  turned off for the ideal-first comparison, at reduced resolution. Depends on a GPU rebuild that
-  includes the collapse `Bf` init; the full ideal-vs-AD comparison additionally needs increment 4.
+- **Increment 7 (CT-vs-GLM collapse flux-retention gate) — the Phase-2 science gate. CODE-READY, config+GPU-bound.**
+  Groundwork done: `collapse_be` initializes `Bf` (uniform B0z on F3 faces) on the CT path, so a CT
+  collapse shares the GLM IC — VERIFIED div-free at t=0 (div-B=0). Finding (updated 2026-07-23): the *lean*
+  gate config `runs/ct_tests/collapse_ideal_ct.in` (`eos=adiabatic` + multipole self-gravity + barotropic
+  cooling + uniform B0z) is numerically unstable from cycle 1 for **both** `glm` and `ct` identically — the
+  mass collapses to `dfloor·N_cells` (whole domain to the density floor). This is **dt-independent** (it
+  persists with `dt_ceil`=0.01 ≪ the CFL dt), so the earlier "dt-doubling → CFL blow-up" attribution was
+  WRONG; it is a config/physics blow-up (adiabatic EOS + gravity + cooling), NOT CT (GLM fails identically).
+  The gate therefore needs the production-quality `eos=hydrogen` setup (known stable) adapted for a
+  GLM-vs-CT comparison. **The GPU CT binary is rebuilt and clean** (`build_gpu/bin/athenaPK`, 2026-07-23,
+  all CT non-ideal device code compiles on Hopper/nvcc), so the gate is code-ready — remaining work is a
+  stable collapse config + a matched GLM/CT GPU campaign (competes with production GPU time). The ideal leg
+  needs no increment 4; an AD leg can use unsplit at reduced resolution (STS-curl not required for a gate).
 
 **Status:** design / scoping note (read-only investigation, no code changed).
 **Scope:** replace GLM/Dedner hyperbolic divergence cleaning with staggered/face-centered
