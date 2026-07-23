@@ -120,7 +120,23 @@ the gate must run full production physics (GLM leg = re-baselined production, CT
 **Risk:** high (touches the core update, AMR operators, restart). Largest single effort. **[done]**
 **Unblocks:** a defensible *flux* claim.
 
-## Phase 3 — Microphysics: EOS + conductivity (audit Workstreams A.1, A.2, D.2)
+## Phase 3 — Microphysics: EOS + conductivity (audit Workstreams A.1, A.2, D.2) — **STARTED (2026-07-23)**
+
+**Survey (evidence-first, 2026-07-23):** the core machinery already exists — a tabulated
+**multi-Saha** EOS (`src/eos/eos_table.hpp` + `gen_eos_table.py`: H₂ dissociation, H & He/He⁺
+ionization, H₂ rot/vib, inert He, in shared FHC units) and the full **Wardle conductivity
+tensor** (`src/hydro/diffusion/ionization.hpp`: σ_O/σ_H/σ_P over e + i + charged grain bins,
+signed η_H, two AD closures). Phase 3 is therefore a *consistency* phase, not greenfield.
+**EOS consistency gate built + run** (`src/eos/tests/test_eos_consistency.py`, read-only over
+the shipped `eos_table.bin`): charge neutrality **5e-15**, H/He element conservation exact,
+and the fundamental free-energy identity `(∂u/∂v)|_T = T(∂P/∂T)|_ρ − P` holds to **2.5e-3**
+(finite-difference-limited) — i.e. the underlying Saha EOS is **already thermodynamically
+consistent**, so a full Helmholtz-free-energy rewrite is NOT needed for consistency.
+**Actionable finding:** the shipped bilinear table is ~0.7% accurate typically but degrades to
+**~5–7% right at the H₂-dissociation (~2200 K) and H-ionization (~7000–10000 K) γ-softening
+kinks** — a *tabulation-resolution* limit at exactly the transitions that set first/second-core
+thermodynamics. **Next EOS increment:** finer/adaptive grid (or better representation) at the
+kinks + an entropy-along-adiabat gate; **then** the conductivity-vs-independent-solver gate.
 
 **Deliverables:** thermodynamically-consistent free-energy H/He(+metals) EOS (rot/vib H₂,
 ortho/para, dissociation, ionization stages, degeneracy, Coulomb, radiation) with all
