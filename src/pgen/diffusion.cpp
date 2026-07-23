@@ -214,36 +214,41 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
       });
 
   // ---- Constrained Transport: initialize the face-centered field Bf ----
-  // Two diffusion tests are CT-wired, both with a field that varies only in x so the face
+  // Three diffusion tests are CT-wired, all with a field that varies only in x so the face
   // init is div-B-free by construction and the projection reproduces the cell-centered u:
-  //   iprob=40 (Ohmic Gaussian):     B_y = G(x), B_x=B_z=0  -> F2(i,j-1/2)=G(x_i), F1=F3=0.
-  //   iprob=50 (ambipolar eigenmode): B_x=B0 (uniform guide), B_y=amp*sin(k x), B_z=0
-  //                                   -> F1(i-1/2)=B0, F2(i,j-1/2)=amp*sin(k x_i), F3=0.
+  //   iprob=40 (Ohmic Gaussian):      B_y = G(x), B_x=B_z=0.
+  //   iprob=50 (ambipolar eigenmode): B_x=B0 (uniform guide), B_y=amp*sin(k x), B_z=0.
+  //   iprob=60 (Hall whistler):       B_x=B0, B_y=amp*cos(k x), B_z=h*amp*sin(k x). 3D box
+  //                                   (2D CT freezes B_z=F3), so the whistler needs ndim=3.
   if (hydro_pkg->Param<bool>("use_ct")) {
     PARTHENON_REQUIRE_THROWS(
-        (iprob == 40) || (iprob == 50),
+        (iprob == 40) || (iprob == 50) || (iprob == 60),
         "Constrained Transport (divergence_control=ct) in the diffusion pgen is currently "
-        "only wired for iprob=40 (Ohmic Gaussian) and iprob=50 (ambipolar eigenmode).");
+        "only wired for iprob=40 (Ohmic Gaussian), 50 (ambipolar), 60 (Hall whistler).");
     const bool is_ad = (iprob == 50);
-    const Real gnorm = is_ad ? 0.0 : amp / std::sqrt(4. * M_PI * diff_coeff * t0);
-    const Real inv4dt = is_ad ? 0.0 : 1.0 / (4. * diff_coeff * t0);
-    const Real B0 = Bx;   // guide field (iprob=50); 0 for iprob=40 by input
-    const Real kx = kpar; // wavenumber (iprob=50); 0 for iprob=40
+    const bool is_hall = (iprob == 60);
+    const bool has_guide = is_ad || is_hall;
+    const Real gnorm =
+        (is_ad || is_hall) ? 0.0 : amp / std::sqrt(4. * M_PI * diff_coeff * t0);
+    const Real inv4dt = (is_ad || is_hall) ? 0.0 : 1.0 / (4. * diff_coeff * t0);
+    const Real B0 = Bx;   // guide field (iprob=50/60); 0 for iprob=40 by input
+    const Real kx = kpar; // wavenumber (iprob=50/60); 0 for iprob=40
     const Real amp_l = amp;
+    const Real hh = hall_h; // helicity (iprob=60)
     auto desc = parthenon::MakePackDescriptor<Hydro::CT::Bf>(mbd.get());
     auto pack = desc.GetPack(mbd.get());
     const int bidx = 0;
     using TE = parthenon::TopologicalElement;
-    // F1 (x-face, B_x): guide field B0 for iprob=50, else 0.
+    // F1 (x-face, B_x): guide field B0 for iprob=50/60, else 0.
     IndexRange fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F1);
     IndexRange fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F1);
     IndexRange fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F1);
     pmb->par_for(
         "diffusion CT F1", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
         KOKKOS_LAMBDA(const int k, const int j, const int i) {
-          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) = is_ad ? B0 : 0.0;
+          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) = has_guide ? B0 : 0.0;
         });
-    // F2 (y-face, B_y): Gaussian(x) (iprob=40) or amp*sin(k x) (iprob=50).
+    // F2 (y-face, B_y): Gaussian(x) (40), amp*sin(k x) (50), amp*cos(k x) (60).
     fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F2);
     fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F2);
     fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F2);
@@ -253,16 +258,21 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
           const auto &c = pack.GetCoordinates(bidx);
           const Real x = c.X<X1DIR, TE::F2>(k, j, i);
           pack(bidx, TE::F2, Hydro::CT::Bf(), k, j, i) =
-              is_ad ? amp_l * std::sin(kx * x) : gnorm * std::exp(-x * x * inv4dt);
+              is_hall ? amp_l * std::cos(kx * x)
+                      : (is_ad ? amp_l * std::sin(kx * x)
+                               : gnorm * std::exp(-x * x * inv4dt));
         });
-    // F3 (z-face, B_z) = 0
+    // F3 (z-face, B_z): h*amp*sin(k x) for iprob=60, else 0.
     fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F3);
     fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F3);
     fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F3);
     pmb->par_for(
         "diffusion CT F3", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
         KOKKOS_LAMBDA(const int k, const int j, const int i) {
-          pack(bidx, TE::F3, Hydro::CT::Bf(), k, j, i) = 0.0;
+          const auto &c = pack.GetCoordinates(bidx);
+          const Real x = c.X<X1DIR, TE::F3>(k, j, i);
+          pack(bidx, TE::F3, Hydro::CT::Bf(), k, j, i) =
+              is_hall ? hh * amp_l * std::sin(kx * x) : 0.0;
         });
   }
 }

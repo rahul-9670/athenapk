@@ -583,6 +583,10 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
       // Its cons induction deposit in AmbipolarDiffFluxIsoFixed is gated off under CT; its
       // AD-Poynting energy term stays on the FV flux. Unsplit only.
       emf = tl.AddTask(emf, Hydro::CT::CT_AddAmbipolarEMF, mu0.get());
+      // CT increment 4 (non-ideal): dispersive Hall edge EMF, same face->edge averaging.
+      // No-op unless Hall is active. Unsplit only (RKL2+CT forbidden). Its cons induction
+      // deposit in HallDiffFluxIsoFixed is gated off; the Poynting term stays FV.
+      emf = tl.AddTask(emf, Hydro::CT::CT_AddHallEMF, mu0.get());
     }
     auto send_flx = tl.AddTask(first_order_flux_correct | emf,
                                parthenon::LoadAndSendFluxCorrections, mu0);

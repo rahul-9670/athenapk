@@ -128,6 +128,13 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
   auto cons_pack = md->PackVariablesAndFluxes(cons_names, cons_names);
   auto hydro_pkg = pmb->packages.Get("Hydro");
 
+  // Under Constrained Transport (divergence_control=ct) the Hall induction is advanced from
+  // an edge-centered curl assembled in CT_AddHallEMF (ct.cpp), so the cell-centered
+  // cons.flux(IB*) induction deposits below are gated OFF (GS05 would double-count them).
+  // The Hall cons.flux(IEN) Poynting term stays on the FV energy flux. GLM path bit-identical.
+  // CT forbids RKL2, so under CT this kernel is only ever called unsplit (eta_h_on=floor_on).
+  const bool ct_induction = hydro_pkg->Param<bool>("use_ct");
+
   auto const &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
 
   const int ndim = pmb->pmy_mesh->ndim;
@@ -203,8 +210,10 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
         Real e1, e2, e3;
         HallEMF(eta_h, eta_floor, bmag, j1, j2, j3, b1, b2, b3, e1, e2, e3);
 
-        cons.flux(X1DIR, IB2, k, j, i) += -e3;
-        cons.flux(X1DIR, IB3, k, j, i) += e2;
+        if (!ct_induction) {
+          cons.flux(X1DIR, IB2, k, j, i) += -e3;
+          cons.flux(X1DIR, IB3, k, j, i) += e2;
+        }
         cons.flux(X1DIR, IEN, k, j, i) += e2 * b3 - e3 * b2;
       });
 
@@ -267,8 +276,10 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
         Real e1, e2, e3;
         HallEMF(eta_h, eta_floor, bmag, j1, j2, j3, b1, b2, b3, e1, e2, e3);
 
-        cons.flux(X2DIR, IB1, k, j, i) += e3;
-        cons.flux(X2DIR, IB3, k, j, i) += -e1;
+        if (!ct_induction) {
+          cons.flux(X2DIR, IB1, k, j, i) += e3;
+          cons.flux(X2DIR, IB3, k, j, i) += -e1;
+        }
         cons.flux(X2DIR, IEN, k, j, i) += e3 * b1 - e1 * b3;
       });
 
@@ -327,8 +338,10 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
         Real e1, e2, e3;
         HallEMF(eta_h, eta_floor, bmag, j1, j2, j3, b1, b2, b3, e1, e2, e3);
 
-        cons.flux(X3DIR, IB1, k, j, i) += -e2;
-        cons.flux(X3DIR, IB2, k, j, i) += e1;
+        if (!ct_induction) {
+          cons.flux(X3DIR, IB1, k, j, i) += -e2;
+          cons.flux(X3DIR, IB2, k, j, i) += e1;
+        }
         cons.flux(X3DIR, IEN, k, j, i) += e1 * b2 - e2 * b1;
       });
 }

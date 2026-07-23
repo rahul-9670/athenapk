@@ -111,6 +111,16 @@ TaskStatus CT_AddOhmicEMF(MeshData<Real> *md);
 // after CT_AssembleEMF[_GS05] and before the flux-correction round. Unsplit only.
 TaskStatus CT_AddAmbipolarEMF(MeshData<Real> *md);
 
+// Non-ideal (Hall) edge EMF for CT (Phase 2, increment 4). Adds the dispersive Hall EMF
+// E_H = eta_H (J x B)/|B| (plus the optional Ohmic stabilizer floor eta_O J) onto the ideal
+// edge EMF, built by the same four-face-average construction as CT_AddAmbipolarEMF (perp
+// EMF evaluated at faces with the GLM stencils, averaged to edges). Hall is dispersive
+// (whistler) and unsplit-only under CT (RKL2+CT is forbidden), so the whistler part and the
+// floor are both applied here. cons.flux(IBn) induction deposit in HallDiffFluxIsoFixed is
+// gated OFF under CT; cons.flux(IEN) Poynting term stays on the FV energy flux. Must run
+// after CT_AssembleEMF[_GS05] and before the flux-correction round.
+TaskStatus CT_AddHallEMF(MeshData<Real> *md);
+
 // VL2 low-storage face update: Bf_base = gam0*Bf_base + gam1*Bf_u1
 //                                       + beta_dt * curl(edge EMF stored in Bf.flux).
 TaskStatus CT_UpdateBf(MeshData<Real> *md_base, MeshData<Real> *md_u1, const Real gam0,

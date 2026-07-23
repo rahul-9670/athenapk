@@ -75,8 +75,17 @@
   of "4.5e-18 / 3.38e-18" for these loops was a mis-record; the true loop floor is ~1e-13, and the
   *1D* Gaussian/eigenmode tests read exactly 0 because their field varies only in x.)
   Decks: `runs/ct_tests/diffusion_ohmic_{glm,ct}.in`, `diffusion_ad_{glm,ct}.in`,
-  `field_loop_resistive_{ct,glm}.in`, `field_loop_ad_{ct,glm}.in`. **PENDING:** Hall
-  (`eta_H (JxB)/|B|`, dispersive) edge-routing; RKL2 STS-curl for CT (STS advances cell-centered B via
+  `field_loop_resistive_{ct,glm}.in`, `field_loop_ad_{ct,glm}.in`.
+  *Hall — IMPLEMENTED but DISABLED (dispersion-incorrect).* `CT_AddHallEMF` routes
+  `E_H = eta_H (JxB)/|B| (+ Ohmic floor)` through the identical four-face-average construction (sharing
+  `FaceCurrentAndB_X{1,2,3}` with AD). It preserves div B and is bit-identical on GLM, BUT the
+  face-EMF-averaging (a box filter, only 2nd-order for parabolic terms) **corrupts the dispersive
+  whistler**: measured 3D whistler `omega` runs **~25% slow at Q_H=0.05 and ~90% slow at Q_H=0.5** vs
+  the analytic Hall dispersion (GLM ~6% on the same box; GLM itself goes unstable at Q_H=0.5 in 3D — the
+  cross-code Hall is moot anyway since Athena++'s Hall is a stub). An init-time `PARTHENON_REQUIRE`
+  therefore forbids Hall+CT. Fixing it needs a COMPACT edge-current Hall EMF (edge-direct `J x B` rather
+  than face-averaged), a genuine future increment. Decks: `runs/ct_tests/hall_whistler_{glm,ct}.in`.
+  **PENDING:** compact edge-current Hall for CT; RKL2 STS-curl for CT (STS advances cell-centered B via
   flux-divergence, which the projection clobbers) remains unsupported.
 - **Increment 7 (CT-vs-GLM collapse flux-retention gate) — the Phase-2 science gate. IN PROGRESS.**
   Groundwork done: `collapse_be` now initializes `Bf` (uniform B0z on F3 faces) on the CT path, so a
