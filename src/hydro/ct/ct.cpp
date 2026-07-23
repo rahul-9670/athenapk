@@ -441,22 +441,44 @@ TaskStatus CT_CurlEMFToBf(MeshData<Real> *md_emf, MeshData<Real> *md_out) {
   auto emf = desc_e.GetPack(md_emf);
   auto out = desc_o.GetPack(md_out);
   const int nb = emf.GetNBlocks();
-  auto run = [&](auto comp_c, TE te, const char *name) {
-    constexpr int comp = decltype(comp_c)::value;
-    IndexRange ib = md_emf->GetBoundsI(CellLevel::same, IndexDomain::interior, te);
-    IndexRange jb = md_emf->GetBoundsJ(CellLevel::same, IndexDomain::interior, te);
-    IndexRange kb = md_emf->GetBoundsK(CellLevel::same, IndexDomain::interior, te);
+  // Explicit per-face blocks (not a generic lambda: nvcc forbids an extended
+  // __host__ __device__ lambda inside a generic lambda).
+  {
+    IndexRange ib = md_emf->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::F1);
+    IndexRange jb = md_emf->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::F1);
+    IndexRange kb = md_emf->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::F1);
     parthenon::par_for(
-        DEFAULT_LOOP_PATTERN, name, parthenon::DevExecSpace(), 0, nb - 1, kb.s, kb.e, jb.s,
-        jb.e, ib.s, ib.e,
+        DEFAULT_LOOP_PATTERN, "CT_CurlEMF_F1", parthenon::DevExecSpace(), 0, nb - 1, kb.s,
+        kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
           const auto &c = emf.GetCoordinates(b);
-          out(b, te, Bf(), k, j, i) = CurlEMF<comp>(emf, c, b, k, j, i, three_d);
+          out(b, TE::F1, Bf(), k, j, i) = CurlEMF<1>(emf, c, b, k, j, i, three_d);
         });
-  };
-  run(std::integral_constant<int, 1>{}, TE::F1, "CT_CurlEMF_F1");
-  run(std::integral_constant<int, 2>{}, TE::F2, "CT_CurlEMF_F2");
-  if (three_d) run(std::integral_constant<int, 3>{}, TE::F3, "CT_CurlEMF_F3");
+  }
+  {
+    IndexRange ib = md_emf->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::F2);
+    IndexRange jb = md_emf->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::F2);
+    IndexRange kb = md_emf->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::F2);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "CT_CurlEMF_F2", parthenon::DevExecSpace(), 0, nb - 1, kb.s,
+        kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &c = emf.GetCoordinates(b);
+          out(b, TE::F2, Bf(), k, j, i) = CurlEMF<2>(emf, c, b, k, j, i, three_d);
+        });
+  }
+  if (three_d) {
+    IndexRange ib = md_emf->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::F3);
+    IndexRange jb = md_emf->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::F3);
+    IndexRange kb = md_emf->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::F3);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "CT_CurlEMF_F3", parthenon::DevExecSpace(), 0, nb - 1, kb.s,
+        kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &c = emf.GetCoordinates(b);
+          out(b, TE::F3, Bf(), k, j, i) = CurlEMF<3>(emf, c, b, k, j, i, three_d);
+        });
+  }
   return TaskStatus::complete;
 }
 
@@ -513,29 +535,64 @@ TaskStatus CT_RKL2OtherBf(MeshData<Real> *md_Y0, MeshData<Real> *md_base,
   auto Yjm2 = desc.GetPack(md_Yjm2);
   auto MY0 = desc.GetPack(md_MY0);
   const int nb = base.GetNBlocks();
-  auto run = [&](auto comp_c, TE te, const char *name) {
-    constexpr int comp = decltype(comp_c)::value;
-    IndexRange ib = md_base->GetBoundsI(CellLevel::same, IndexDomain::interior, te);
-    IndexRange jb = md_base->GetBoundsJ(CellLevel::same, IndexDomain::interior, te);
-    IndexRange kb = md_base->GetBoundsK(CellLevel::same, IndexDomain::interior, te);
+  // Explicit per-face blocks (nvcc forbids an extended lambda inside a generic lambda).
+  {
+    IndexRange ib = md_base->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::F1);
+    IndexRange jb = md_base->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::F1);
+    IndexRange kb = md_base->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::F1);
     parthenon::par_for(
-        DEFAULT_LOOP_PATTERN, name, parthenon::DevExecSpace(), 0, nb - 1, kb.s, kb.e, jb.s,
-        jb.e, ib.s, ib.e,
+        DEFAULT_LOOP_PATTERN, "CT_RKL2Other_F1", parthenon::DevExecSpace(), 0, nb - 1, kb.s,
+        kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
           const auto &c = base.GetCoordinates(b);
-          const Real MYjm1 = CurlEMF<comp>(base, c, b, k, j, i, three_d);
-          const Real yjm1 = base(b, te, Bf(), k, j, i);
-          const Real yj = mu_j * yjm1 + nu_j * Yjm2(b, te, Bf(), k, j, i) +
-                          (1.0 - mu_j - nu_j) * Y0(b, te, Bf(), k, j, i) +
+          const Real MYjm1 = CurlEMF<1>(base, c, b, k, j, i, three_d);
+          const Real yjm1 = base(b, TE::F1, Bf(), k, j, i);
+          const Real yj = mu_j * yjm1 + nu_j * Yjm2(b, TE::F1, Bf(), k, j, i) +
+                          (1.0 - mu_j - nu_j) * Y0(b, TE::F1, Bf(), k, j, i) +
                           mu_tilde_j * tau * MYjm1 +
-                          gamma_tilde_j * tau * MY0(b, te, Bf(), k, j, i);
-          Yjm2(b, te, Bf(), k, j, i) = yjm1;
-          base(b, te, Bf(), k, j, i) = yj;
+                          gamma_tilde_j * tau * MY0(b, TE::F1, Bf(), k, j, i);
+          Yjm2(b, TE::F1, Bf(), k, j, i) = yjm1;
+          base(b, TE::F1, Bf(), k, j, i) = yj;
         });
-  };
-  run(std::integral_constant<int, 1>{}, TE::F1, "CT_RKL2Other_F1");
-  run(std::integral_constant<int, 2>{}, TE::F2, "CT_RKL2Other_F2");
-  if (three_d) run(std::integral_constant<int, 3>{}, TE::F3, "CT_RKL2Other_F3");
+  }
+  {
+    IndexRange ib = md_base->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::F2);
+    IndexRange jb = md_base->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::F2);
+    IndexRange kb = md_base->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::F2);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "CT_RKL2Other_F2", parthenon::DevExecSpace(), 0, nb - 1, kb.s,
+        kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &c = base.GetCoordinates(b);
+          const Real MYjm1 = CurlEMF<2>(base, c, b, k, j, i, three_d);
+          const Real yjm1 = base(b, TE::F2, Bf(), k, j, i);
+          const Real yj = mu_j * yjm1 + nu_j * Yjm2(b, TE::F2, Bf(), k, j, i) +
+                          (1.0 - mu_j - nu_j) * Y0(b, TE::F2, Bf(), k, j, i) +
+                          mu_tilde_j * tau * MYjm1 +
+                          gamma_tilde_j * tau * MY0(b, TE::F2, Bf(), k, j, i);
+          Yjm2(b, TE::F2, Bf(), k, j, i) = yjm1;
+          base(b, TE::F2, Bf(), k, j, i) = yj;
+        });
+  }
+  if (three_d) {
+    IndexRange ib = md_base->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::F3);
+    IndexRange jb = md_base->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::F3);
+    IndexRange kb = md_base->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::F3);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "CT_RKL2Other_F3", parthenon::DevExecSpace(), 0, nb - 1, kb.s,
+        kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &c = base.GetCoordinates(b);
+          const Real MYjm1 = CurlEMF<3>(base, c, b, k, j, i, three_d);
+          const Real yjm1 = base(b, TE::F3, Bf(), k, j, i);
+          const Real yj = mu_j * yjm1 + nu_j * Yjm2(b, TE::F3, Bf(), k, j, i) +
+                          (1.0 - mu_j - nu_j) * Y0(b, TE::F3, Bf(), k, j, i) +
+                          mu_tilde_j * tau * MYjm1 +
+                          gamma_tilde_j * tau * MY0(b, TE::F3, Bf(), k, j, i);
+          Yjm2(b, TE::F3, Bf(), k, j, i) = yjm1;
+          base(b, TE::F3, Bf(), k, j, i) = yj;
+        });
+  }
   return TaskStatus::complete;
 }
 
