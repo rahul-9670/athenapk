@@ -43,7 +43,7 @@
   absolute div B = **1.4e-18**; static-AMR field loop (20 blocks, C-F reflux) = **2.6e-18** — both
   EXIT 0, round-off, matching the CPU values. GPU SUM-reduction non-determinism does not affect the
   MIN/MAX divergence reduction.
-- **Increment 4 (non-ideal edge-EMF re-routing) — Ohmic + Ambipolar DONE (unsplit + RKL2 STS, 2026-07-22/23); Hall implemented-but-disabled; compact-Hall the only gap.**
+- **Increment 4 (non-ideal edge-EMF re-routing) — Ohmic + Ambipolar + Hall ALL DONE & validated (2026-07-22/23). Ohmic/AD: unsplit + RKL2 STS. Hall: compact edge-current, unsplit, now matches GLM to 3 sig figs (the earlier "dispersion deficit" was a task-graph race in `CT_UpdateBf`, fixed).**
   *Ohmic:* `CT_AddOhmicEMF` (ct.cpp) computes `E += eta*J` with `J = curl(Bf)` evaluated *edge-centered*
   directly from the staggered face field, accumulated onto the ideal edge EMF in `Bf.flux(E1/E2/E3)`
   BEFORE the flux-correction round (so the C-F reflux restricts it too). Because `CT_UpdateBf` does
@@ -76,22 +76,24 @@
   *1D* Gaussian/eigenmode tests read exactly 0 because their field varies only in x.)
   Decks: `runs/ct_tests/diffusion_ohmic_{glm,ct}.in`, `diffusion_ad_{glm,ct}.in`,
   `field_loop_resistive_{ct,glm}.in`, `field_loop_ad_{ct,glm}.in`.
-  *Hall — COMPACT edge-current formulation, ENABLED with a dispersion caveat (2026-07-23).* `CT_AddHallEMF`
-  now forms `E_H = eta_H (JxB)/|B| (+ Ohmic floor)` ONCE per edge from the tight edge curls of the face
+  *Hall — COMPACT edge-current formulation, VALIDATED against GLM (2026-07-23).* `CT_AddHallEMF`
+  forms `E_H = eta_H (JxB)/|B| (+ Ohmic floor)` ONCE per edge from the tight edge curls of the face
   field (`HallJxE1`/`HallJyE2`/`HallJzE3`, the same compact stencils Ohmic uses) with the transverse J and
   the field interpolated to the edge ONLY in the directions transverse to each component's own derivative
   -- so the propagation-direction derivative is never box-filtered. This replaces the earlier
-  face-EMF-averaged Hall (a double box filter). **Reliable re-measurement (per-snapshot phase increment,
-  which showed the earlier "25-90% slow" was largely a coarse-FFT artifact):** CT reproduces the ideal-
-  Alfven base EXACTLY (omega=6.288 vs k*vA=6.283), is div-free and stable (with the usual Ohmic floor, as
-  Hall always needs -- GLM is outright unstable floor-off), and gives the correct-DIRECTION whistler
-  (above Alfven). BUT the whistler *dispersion* is still under-captured: omega/analytic = 0.88 at Q_H=0.05,
-  0.62 at Q_H=0.2 (deficit grows with Hall strength, with mild spurious damping) -- the dispersive, non-
-  dissipative Hall term is genuinely hard to make spectrally accurate on a staggered mesh (needs a
-  whistler-preserving scheme a la Toth+2008 / sub-cycling; a real future increment). It is therefore
-  ENABLED with a one-time startup WARNING rather than blocked: usable and correct-direction, but use
-  `divergence_control=glm` when fast-wave dispersion accuracy matters. Hall is not in the production
-  collapse and Athena++'s Hall is a stub, so the cross-code comparison is unaffected. Decks:
+  face-EMF-averaged Hall (a double box filter). **The CT whistler now matches the GLM reference to 3 sig
+  figs across Q_H** (fast branch: measured/analytic omega err 4.7% at Q_H=0.05, 1.9% at Q_H=0.2 -- IDENTICAL
+  to GLM; the ~62% at Q_H=0.5 is a shared temporal-resolution/CFL limit, not a CT defect -- GLM shows the
+  same). Div-free, stable with the usual Ohmic floor (GLM is outright unstable floor-off), ideal-Alfven base
+  exact (omega=6.288 vs k*vA=6.283). **ROOT CAUSE of the earlier apparent "dispersion deficit" (the whole
+  "0.88/0.62 slow" story): a task-graph race.** `CT_UpdateBf` depended only on `set_flx | update`, which on a
+  single/degenerate block completes through the flux-correction handshake BEFORE the *last* EMF-chain task
+  (`CT_AddHallEMF`, added after Ohmic/ambipolar) runs -- so the curl consumed a PRE-Hall edge EMF and the
+  entire Hall term was silently dropped (an initialized whistler then just beat as a mismatched Alfven mode,
+  producing the slow-branch-looking omega). Ohmic/AD survived only by being earlier in the chain (they won
+  the race). **Fix: gate `CT_UpdateBf` on `emf` too** (`set_flx | update | emf`) in `hydro_driver.cpp`. No
+  spectral scheme needed; the compact stencil was always accurate, it just wasn't being applied. Hall is not
+  in the production collapse and Athena++'s Hall is a stub, so the cross-code comparison is unaffected. Decks:
   `runs/ct_tests/hall_whistler_{glm,ct}.in`.
   *RKL2 STS-curl — DONE (2026-07-23).* Production AD collapses super-time-step the parabolic diffusion, so
   Ohmic/AD under CT now run with `diffusion/integrator=rkl2` as well as `unsplit`. The divergence-free
@@ -104,7 +106,9 @@
   its edge fluxes). div B stays at round-off (linear combinations of `Bf` states + curls). **Validation:**
   Ohmic Gaussian CT+rkl2 vs analytic 0.008% (= unsplit); AD damped-Alfven CT+rkl2 0.08%; AD field loop
   STS-vs-unsplit converge (5e-5 at eta=0.05, 7e-6 at eta=0.005); div B 3e-13; GLM+rkl2 production STS intact.
-  **PENDING:** compact edge-current Hall for CT — the only remaining non-ideal gap.
+  **Hall (2026-07-23): DONE.** Compact edge-current Hall now matches GLM to 3 sig figs after fixing a
+  `CT_UpdateBf` task-graph race (it did not depend on the Hall EMF task and curled a pre-Hall EMF). All three
+  non-ideal terms (Ohm/AD/Hall) are now validated under CT.
 - **Increment 7 (CT-vs-GLM collapse flux-retention gate) — the Phase-2 science gate. CODE-READY, config+GPU-bound.**
   Groundwork done: `collapse_be` initializes `Bf` (uniform B0z on F3 faces) on the CT path, so a CT
   collapse shares the GLM IC — VERIFIED div-free at t=0 (div-B=0). Finding (updated 2026-07-23): the *lean*

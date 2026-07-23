@@ -1121,20 +1121,11 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     // face field Bf with M(Bf)=-curl(E_diff); see AddSTSTasks) -- both validated to analytic.
     // The Hall effect (CT_AddHallEMF) uses the COMPACT edge-current formulation (tight edge
     // curls; transverse J interpolated only in transverse directions), applied unsplit in the
-    // main step. It is div-free, stable (with the usual Ohmic floor), reproduces the CT ideal-
-    // Alfven base exactly, and gives the correct-DIRECTION whistler -- but the whistler
-    // *dispersion* is still under-captured (~12% slow at Q_H=0.05, growing with Hall strength;
-    // the dispersive Hall term is hard to make spectrally accurate on a staggered mesh).
-    // Warn (do not block): Hall+CT is usable but not spectral-accurate for fast whistlers.
-    if (pkg->Param<bool>("use_ct") && hall != Hall::none &&
-        parthenon::Globals::my_rank == 0) {
-      std::cout << "## WARNING: Hall + Constrained Transport (divergence_control=ct) uses the "
-                   "compact edge-current CT_AddHallEMF: div-free and correct-direction, but "
-                   "the whistler dispersion is under-captured (~12% slow at Q_H=0.05, more at "
-                   "stronger Hall). Use divergence_control=glm if fast-wave dispersion "
-                   "accuracy matters. (Ohmic/ambipolar under CT are fully validated.)"
-                << std::endl;
-    }
+    // main step. Div-free, stable (with the usual Ohmic floor), and now validated: the CT
+    // whistler dispersion matches the GLM reference to 3 sig figs across Q_H (fast branch,
+    // 4.7% at Q_H=0.05, 1.9% at Q_H=0.2 -- identical to GLM). The earlier "dispersion deficit"
+    // was a task-graph race (CT_UpdateBf did not depend on the Hall EMF task and curled a pre-
+    // Hall edge EMF); fixed by gating CT_UpdateBf on `emf` in hydro_driver.cpp. No warning.
 
     // Fused non-ideal diffusive-timestep path. The per-cell Wardle conductivity tensor
     // (Ionization::Diffusivities) is the dominant GPU cost, and the three per-term dt

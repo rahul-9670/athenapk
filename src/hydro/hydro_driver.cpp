@@ -680,9 +680,14 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
       const Real bdt = integrator->beta[stage - 1] * integrator->dt;
       // Bf.flux now holds the coarse-fine-corrected edge EMF (via set_flx above). Curl
       // it onto the faces (VL2 combine), then project Bf -> cell-centered IB1..IB3.
+      // Depend on `emf` explicitly: set_flx only transitively covers the edge EMF through
+      // the send/recv flux-correction handshake, which on a single/degenerate block can
+      // complete before the *later* EMF-chain tasks (Hall is added after Ohmic/ambipolar),
+      // letting CT_UpdateBf curl a pre-Hall edge EMF. Gating on emf guarantees the full
+      // ideal+Ohmic+ambipolar+Hall edge EMF is assembled before the curl.
       auto ct_update =
-          tl.AddTask(set_flx | update, Hydro::CT::CT_UpdateBf, mu0.get(), mu1.get(), gam0,
-                     gam1, bdt);
+          tl.AddTask(set_flx | update | emf, Hydro::CT::CT_UpdateBf, mu0.get(), mu1.get(),
+                     gam0, gam1, bdt);
       after_ct = tl.AddTask(ct_update | after_cooling, Hydro::CT::CT_ProjectBfToCC,
                             mu0.get());
     }
