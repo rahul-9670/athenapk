@@ -68,7 +68,7 @@ collapse) emitting machine-readable norms.
 **Gate:** all seven fixes GPU-validated; test suite green; a re-baselined collapse whose
 flux-retention differs from the old scheme by a *quantified, understood* amount.
 
-## Phase 1 — Unified microphysics & units foundation (audit Workstream A infra, D.2 prep) — **STARTED**
+## Phase 1 — Unified microphysics & units foundation (audit Workstream A infra, D.2 prep) — **COMPLETE (2026-07-23)**
 
 The substrate every later phase consumes; also the permanent root-fix for audit #3/#4.
 **Deliverables:**
@@ -83,21 +83,41 @@ The substrate every later phase consumes; also the permanent root-fix for audit 
   radionuclide floor, composition, grain population, thermal-ionization params; consumed by
   chemistry AND every non-ideal coefficient (generalizes the #1 fix from an init-time
   assertion to a shared object).
-**Started this session:** #1 input-level unification + init consistency check; #3 pgen
-source fix. **Next:** the `PhysicalUnits` header + package and migration of consumers;
-consistency acceptance tests (1000-sample cgs round-trip, `B²/2 ↔ B_cgs²/8π`, identical
-physical T across radiation/EOS/chemistry/ionization for identical code state).
-**Risk:** low (centralization, not new numerics). **Unblocks:** clean comparisons in all
-later phases.
+**Done:** `PhysicalUnits` (`src/units/physical_units.hpp`) + `IonizationEnvironment`
+(`src/units/ionization_environment.hpp`) built and consumed by hydro/diffusion-ionization,
+chemistry, radiation. Acceptance test `src/units/tests/test_physical_units.cpp` (host g++,
+4/4: cgs round-trip 2e-16, `B²/2 ↔ B_cgs²/8π` bridge 6e-16, single T₀=10.0151 K, RSLA
+c_code). Unit **provenance** stamped into every restart/output (13 `phys_units/*`
+Restart-params in `hydro.cpp` Initialize; verified write + restart read-back).
+**Units-authority resolved = Option A (2026-07-23):** the FHC base scales are DERIVED from
+the BE IC (mass,temperature,f) via ONE shared function `DeriveBENormalization`
+(`src/units/be_normalization.hpp`), used by both the collapse_be pgen AND `BuildPhysicalUnits`.
+This eliminated the historical ~0.13% drift where the microphysics ran on rounded `<units>`
+defaults (ρ 5.467e-19, l 2.81e16) while the dynamics used exact BE (ρ 5.4668e-19, l 2.8063e16);
+`diffusivity_unit`/`opacity_unit` now match the dynamics exactly. **This is a one-time
+re-baseline** of the AD/RT/chemistry coefficients (~0.13%) vs the prod_v9 lineage — reaches
+production only on the next GPU rebuild; a `<units>` base-scale override for collapse_be is now
+rejected, and a pgen guard asserts the two paths agree. **Risk:** low (centralization).
+**Unblocks:** clean comparisons in all later phases.
 
-## Phase 2 — Constrained transport (audit Workstream D.1)
+## Phase 2 — Constrained transport (audit Workstream D.1) — **IMPLEMENTED, AT GATE (2026-07-23)**
 
 **Deliverable:** staggered/face CT so discrete ∇·B = 0 to round-off, with AMR-compatible
 divergence-preserving prolongation/restriction and reflux-curl; keep GLM as an optional
-comparison path.
+comparison path. **DONE** — branch `flagship-phase2-ct`, increments 1–4 (face Bf, edge EMF,
+CT_UpdateBf curl, CT_ProjectBfToCC, RKL2 STS-curl for Ohmic/AD, unsplit Hall EMF). The
+increment-4 Hall bug was a **task-graph race** (`CT_UpdateBf` missing the `emf` dependency,
+dropping the last edge-EMF chain task on degenerate blocks) — fixed in 456b05a, whistler now
+matches GLM. Full-production-physics smoke (chem+RT+non-ideal+AMR+gravity) PASSED under CT:
+`ct_maxRelDivB ≈ 2e-14`, mass +0.007%, 0 NaN/floor over 50 cycles.
 **Gate:** CT vs GLM flux-retention measured on the fiducial collapse — the result must not
 be set by the divergence-control choice, or the difference is reported as systematic.
-**Risk:** high (touches the core update, AMR operators, restart). Largest single effort.
+**IN FLIGHT** — matched gate pair `runs/inc7_gate/{glm_run,ct_run}` (= `fhc.in` + one-line
+`divergence_control` toggle), full production physics to first-core formation (`tlim=1.0945`,
+~cyc 804, ~2.5–3 h @ 4 GPU). Diagnostic = `runs/flux_retention.py`. NOTE: the *lean* ideal
+gate is impossible — adaptive-AMR + multigrid-gravity is unstable without the full stack, so
+the gate must run full production physics (GLM leg = re-baselined production, CT leg = new).
+**Risk:** high (touches the core update, AMR operators, restart). Largest single effort. **[done]**
 **Unblocks:** a defensible *flux* claim.
 
 ## Phase 3 — Microphysics: EOS + conductivity (audit Workstreams A.1, A.2, D.2)
@@ -175,7 +195,11 @@ uncertainties reported separately; conclusions survive alternate analysis surfac
 
 ---
 
-**Immediate next actions (this program's live edge):**
-1. GPU-validate the seven audit fixes (job 2375916 build → smoke) and re-baseline the collapse.
-2. Land the `PhysicalUnits` package (Phase 1) and migrate consumers off duplicated calibrations.
-3. Scope Phase 2 (CT) design note before touching the core update.
+**Immediate next actions (this program's live edge, updated 2026-07-23):**
+1. Read the running Phase-2 gate result (`runs/inc7_gate/{glm_run,ct_run}`), run
+   `flux_retention.py`, and record whether divergence control sets the flux number — closes Phase 2.
+2. Land the `PhysicalUnits` package (Phase 1) and migrate consumers off duplicated calibrations —
+   **this is now the next coding edge** once Phase 2's gate is read.
+3. (Phase 0 tail) full provenance-into-restart capture + the machine-readable test suite.
+
+See `~/HANDOFF_2026-07-23.md` for the live operational state (gate jobs, prod_v9 hold, binaries).

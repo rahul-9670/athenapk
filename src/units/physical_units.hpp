@@ -35,7 +35,8 @@
 #include <parthenon/package.hpp>
 
 #include "basic_types.hpp"
-#include "../units.hpp" // canonical Units: the sqrt(4*pi) magnetic-unit definition (#3)
+#include "../units.hpp"        // canonical Units: the sqrt(4*pi) magnetic-unit definition (#3)
+#include "be_normalization.hpp" // Phase 1 Option A: shared BE base-scale derivation
 
 namespace PhysUnits {
 
@@ -87,9 +88,37 @@ struct PhysicalUnits {
 inline PhysicalUnits BuildPhysicalUnits(parthenon::ParameterInput *pin) {
   const std::string bn = "units";
   PhysicalUnits U;
-  U.rho_unit = pin->GetOrAddReal(bn, "rho_unit_cgs", 5.467e-19);
-  U.v_unit = pin->GetOrAddReal(bn, "v_unit_cgs", 1.9e4);
-  U.length_unit = pin->GetOrAddReal(bn, "length_unit_cgs", 2.81e16);
+  // Phase 1 Option A: for the BE collapse problem the base scales are DERIVED from the
+  // physical IC via the SAME normalization the pgen uses (single source of truth), so the
+  // microphysics units match the dynamics exactly (kills the ~0.13% rounded-defaults drift).
+  // Any other problem uses the <units> block (defaults = the historical FHC scales). An
+  // explicit <units> base-scale override for a BE run is REJECTED, not silently honored: it
+  // would desync the microphysics cgs mapping from the IC-fixed dynamics -- exactly the drift
+  // this consolidation removes. (mu_thermal is still read from <units>; it is a calibration,
+  // not a base scale.)
+  const std::string pb = "problem/collapse_be";
+  const bool have_be = pin->DoesParameterExist(pb, "mass") &&
+                       pin->DoesParameterExist(pb, "temperature") &&
+                       pin->DoesParameterExist(pb, "f");
+  if (have_be) {
+    PARTHENON_REQUIRE(
+        !(pin->DoesParameterExist(bn, "rho_unit_cgs") ||
+          pin->DoesParameterExist(bn, "v_unit_cgs") ||
+          pin->DoesParameterExist(bn, "length_unit_cgs")),
+        "<units> rho_unit_cgs/v_unit_cgs/length_unit_cgs override is not allowed for the "
+        "collapse_be problem: the base scales are fixed by the BE IC (mass, temperature, f) "
+        "so the microphysics units stay in sync with the dynamics. Remove the override.");
+    const auto be = DeriveBENormalization(pin->GetReal(pb, "mass"),
+                                          pin->GetReal(pb, "temperature"),
+                                          pin->GetReal(pb, "f"));
+    U.rho_unit = be.rho0;
+    U.v_unit = be.v0;
+    U.length_unit = be.l0;
+  } else {
+    U.rho_unit = pin->GetOrAddReal(bn, "rho_unit_cgs", 5.467e-19);
+    U.v_unit = pin->GetOrAddReal(bn, "v_unit_cgs", 1.9e4);
+    U.length_unit = pin->GetOrAddReal(bn, "length_unit_cgs", 2.81e16);
+  }
   U.mu_thermal = pin->GetOrAddReal(bn, "mu_thermal", 2.29);
 
   U.time_unit = U.length_unit / U.v_unit;

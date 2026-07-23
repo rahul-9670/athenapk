@@ -383,6 +383,33 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   bool pack_in_one = pin->GetOrAddBoolean("parthenon/mesh", "pack_in_one", true);
   pkg->AddParam<>("pack_in_one", pack_in_one);
 
+  // Flagship Phase 1 provenance: stamp the authoritative unit system + shared ionization
+  // environment into the Hydro package as Restart-flagged params so EVERY restart/output
+  // records the exact code->cgs mapping and cosmic-ray/composition inputs the run used --
+  // no more reconstructing units from the deck. Numerically inert (metadata only; no kernel
+  // reads these). Reading an older restart that predates these attrs is safe: Parthenon's
+  // ReadFromHDF5AllParamsOfType catches the missing-attribute error and keeps the value
+  // recomputed here (params.cpp). These are the SAME builders the physics packages consume.
+  {
+    const auto Uprov = PhysUnits::BuildPhysicalUnits(pin);
+    const auto envprov = PhysUnits::BuildIonizationEnvironment(pin);
+    using RM = Params::Mutability;
+    pkg->AddParam<Real>("phys_units/rho_unit_cgs", Uprov.rho_unit, RM::Restart);
+    pkg->AddParam<Real>("phys_units/v_unit_cgs", Uprov.v_unit, RM::Restart);
+    pkg->AddParam<Real>("phys_units/length_unit_cgs", Uprov.length_unit, RM::Restart);
+    pkg->AddParam<Real>("phys_units/time_unit_cgs", Uprov.time_unit, RM::Restart);
+    pkg->AddParam<Real>("phys_units/mass_unit_cgs", Uprov.mass_unit, RM::Restart);
+    pkg->AddParam<Real>("phys_units/energy_density_unit_cgs", Uprov.energy_density_unit,
+                        RM::Restart);
+    pkg->AddParam<Real>("phys_units/magnetic_unit_G", Uprov.magnetic_unit, RM::Restart);
+    pkg->AddParam<Real>("phys_units/temperature_unit_K", Uprov.temperature_unit, RM::Restart);
+    pkg->AddParam<Real>("phys_units/diffusivity_unit", Uprov.diffusivity_unit, RM::Restart);
+    pkg->AddParam<Real>("phys_units/opacity_unit", Uprov.opacity_unit, RM::Restart);
+    pkg->AddParam<Real>("phys_units/mu_thermal", Uprov.mu_thermal, RM::Restart);
+    pkg->AddParam<Real>("phys_units/zeta_cr_cgs", envprov.zeta_cr_cgs, RM::Restart);
+    pkg->AddParam<Real>("phys_units/mu_n", envprov.mu_n, RM::Restart);
+  }
+
   const auto fluid_str = pin->GetOrAddString("hydro", "fluid", "euler");
   auto fluid = Fluid::undefined;
   bool calc_c_h = false; // calculate hyperbolic divergence cleaning speed

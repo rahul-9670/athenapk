@@ -24,6 +24,8 @@
 #include "../main.hpp"
 #include "../hydro/ct/ct.hpp" // Constrained Transport face field (Phase 2)
 #include "../units.hpp" // canonical Heaviside-Lorentz magnetic-unit definition (audit #3)
+#include "../units/be_normalization.hpp" // Phase 1: shared BE base-scale derivation
+#include "../units/physical_units.hpp"   // Phase 1: authoritative units (consistency guard)
 #include "pgen.hpp"
 
 namespace collapse_be {
@@ -88,12 +90,15 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   const Real omegatff  = pin->GetOrAddReal("problem/collapse_be", "omegatff", 0.0);
   const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit");
 
-  // Derive normalization units
-  const Real m0   = mass_msun * msun / (bemass_code * f);   // total mass = bemass*f in code units
-  const Real v0   = cs10 * std::sqrt(temp_K / 10.0);         // code c_s = 1
-  const Real rho0 = std::pow(v0, 6) / (m0 * m0) / (64.0 * M_PI * M_PI * M_PI * G * G * G);
-  const Real t0   = 1.0 / std::sqrt(4.0 * M_PI * G * rho0);  // code t = 1
-  const Real l0   = v0 * t0;
+  // Derive normalization units via the ONE shared BE derivation (flagship Phase 1 Option A).
+  // Bit-identical to the historical inline block; PhysicalUnits now uses the same function so
+  // the microphysics units match these exactly (no rounded-<units>-defaults drift).
+  const auto be   = PhysUnits::DeriveBENormalization(mass_msun, temp_K, f);
+  const Real m0   = be.m0;   // total mass = bemass*f in code units
+  const Real v0   = be.v0;   // code c_s = 1
+  const Real rho0 = be.rho0;
+  const Real t0   = be.t0;   // code t = 1
+  const Real l0   = be.l0;
 
   // Angular velocity: omega * t_ff = omegatff
   const Real tff_code = std::sqrt(3.0 / (8.0 * f)) * M_PI;
@@ -112,6 +117,18 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
     hydro_pkg->AddParam("collapse_be_mhd", mhd);
     hydro_pkg->AddParam("collapse_be_rc", rc_code);
     hydro_pkg->AddParam("collapse_be_gamma", gam);
+
+    // Consistency guard (flagship Phase 1): the authoritative unit system the microphysics
+    // packages consume (chemistry/radiation/non-ideal) must reproduce this BE normalization
+    // exactly. Both now route through DeriveBENormalization, so this is a regression sentinel
+    // -- it fires only if that sharing is broken or a <units> override slips in.
+    const auto U = PhysUnits::BuildPhysicalUnits(pin);
+    const Real utol = 1.0e-10;
+    PARTHENON_REQUIRE(std::abs(U.rho_unit - rho0) <= utol * rho0 &&
+                          std::abs(U.v_unit - v0) <= utol * v0 &&
+                          std::abs(U.length_unit - l0) <= utol * l0,
+                      "collapse_be: PhysicalUnits base scales disagree with the BE IC "
+                      "normalization -- microphysics units would desync from the dynamics.");
 
     // === Unit conversion factors to cgs ===
     // Multiply a code-unit value by these to obtain cgs.

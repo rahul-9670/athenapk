@@ -49,8 +49,9 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
 
   // Flagship Phase 1: read the shared code-unit scales from the single authoritative unit
   // system (was: rho_unit/t_unit/T_unit hardcoded here, in ionization.hpp, and derived in
-  // radiation.cpp -- audit findings #3/#4). rho_unit is bit-identical (5.467e-19); T_unit
-  // is the single T0 (~10.015 K); t_unit = length/v (only used by the WS-2 thermo path).
+  // radiation.cpp -- audit findings #3/#4). Option A: for collapse_be these are the EXACT BE
+  // normalization (rho_unit=5.4668e-19, not the old rounded 5.467e-19), so the network's cgs
+  // densities match the dynamics; T_unit is the single T0 (~10.015 K); t_unit = length/v.
   const auto U = PhysUnits::BuildPhysicalUnits(pin);
   const Real rho_unit = U.rho_unit;
   const Real t_unit = U.time_unit;
