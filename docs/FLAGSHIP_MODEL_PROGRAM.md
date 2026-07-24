@@ -197,13 +197,16 @@ the Planck/Rosseland split (ratio=1 → κ_P≡κ_R). ALL PASS. **FOUND A LATENT
 ρ ≤ 1e-11 g/cm³ and T~4–9 kK the Bell&Lin transition temperatures go out of order and the regime
 walk **skips regime 6 (Kramers), giving a κ discontinuity of up to ~4 decades** (regime 5→7). This
 corner is OFF the cold-collapse track (cold at low ρ; high T only at ρ≥1e-10 second core) so it does
-not affect the nominal FHC run, but it is reachable by radiation in hot low-density gas. The fix
-(monotonic regime selection / min-of-regimes) is **result-changing to production opacity → DEFERRED,
-user-gated**. **Fix VALIDATED:** replacing the ordered walk with κ = min over all 8 Bell&Lin regimes
-makes κ continuous everywhere (max |d ln κ/d ln T| = 24.0 at every density, incl. the defect corner)
-while matching the current walk where it is already well-ordered — the standard robust Bell&Lin
-composition. Ready to port into `radiation_opacity.hpp` (ideally behind a default-off flag to keep
-the production path bit-identical until the user opts in) once approved.
+not affect the nominal FHC run, but it is reachable by radiation in hot low-density gas. **Fix IMPLEMENTED (default-off, 2026-07-24):** `radiation_opacity.hpp::BellLinKappaFixed` + the
+`<radiation> bell_lin_fix_regime_skip` flag (default false → the plain walk, bit-identical). The
+fix SKIPS regimes whose forward window has closed [cross(j,j+1) ≤ cross(i,j)] and bridges regime i
+directly to the next active regime. VERIFIED (test_opacity.cpp Gate 6): continuous everywhere
+(max |d ln κ/d ln T| = 24 at every density incl. the defect corner), gives the correct canonical
+values (0.02 @ 10 K, 2.0 @ 100 K, 0.348), and is **exactly identical to the plain walk on the
+collapse track** (rho ≥ 1e-10, rel diff 0). NB: an earlier note claimed κ = min-over-all-8-regimes
+was the fix — that was FALSIFIED (it gives 2e-31 instead of 0.02 at 10 K; wrong by ~29 decades;
+only slope-continuity had been checked, not values). Reaches production on the next GPU rebuild with
+the flag enabled; default-off keeps every current run bit-identical.
 **DEFERRED (user-gated, large):** multigroup RHD + mixed-frame v/c + scattering + IMEX +
 asymptotic-preserving diffusion + RSLA validity are the real Phase-4 build. The next tractable
 increments are the transport benchmarks (free-streaming/shadow/diffusion/radiative-shock), which

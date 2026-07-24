@@ -125,6 +125,10 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   op.planck_ross_ratio = pin->GetOrAddReal(bn, "planck_ross_ratio", 1.0);
   PARTHENON_REQUIRE(op.planck_ross_ratio > 0.0,
                     "radiation/planck_ross_ratio must be > 0.");
+  // Regime-skip-robust Bell&Lin walk (default false = bit-identical; fixes the off-track
+  // low-rho/high-T kappa discontinuity). Only meaningful for opacity_model=belllin.
+  op.bell_lin_fix_regime_skip =
+      pin->GetOrAddBoolean(bn, "bell_lin_fix_regime_skip", false);
   pkg->AddParam("opacity", op);
   // Back-compat scalar params (constant model still reads these directly).
   pkg->AddParam("kappa_a", op.kappa_a0);

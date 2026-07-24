@@ -111,6 +111,29 @@ int main() {
   kP = PlanckOpacity(op, 1e5, 20.0);
   report("ratio=3 -> kappa_P == 3*kappa_R", rel(kP, 3.0 * kR, 1e-12), kP, 3.0 * kR);
 
+  // Gate 6: the regime-skip-robust walk (BellLinKappaFixed) -- continuous everywhere, correct
+  // canonical values, and IDENTICAL to the plain walk on the collapse track (rho>=1e-10).
+  std::printf("--- GATE 6: BellLinKappaFixed continuous everywhere + == walk on-track ---\n");
+  double fx_maxslope = 0.0, fx_ontrack_diff = 0.0;
+  for (double lrho = -16; lrho <= -4; lrho += 1.0) {
+    const double rho = std::pow(10.0, lrho);
+    const int N = 6000;
+    double prevk = BellLinKappaFixed(rho, 10.0), prevlT = std::log(10.0);
+    for (int n = 1; n <= N; ++n) {
+      const double lT = std::log(10.0) + (std::log(1e7) - std::log(10.0)) * n / N;
+      const double Tk = std::exp(lT);
+      const double k = BellLinKappaFixed(rho, Tk);
+      fx_maxslope = std::max(fx_maxslope, std::fabs((std::log(k) - std::log(prevk)) / (lT - prevlT)));
+      if (lrho >= -10.0) // on the collapse track the fix must be identical to the walk
+        fx_ontrack_diff = std::max(fx_ontrack_diff, std::fabs(k - BellLinKappa(rho, Tk)) / k);
+      prevk = k; prevlT = lT;
+    }
+  }
+  report("fixed walk continuous everywhere: max|slope|<=24.5", fx_maxslope <= 24.5, fx_maxslope, 24.0);
+  report("fixed walk == plain walk on-track (rho>=1e-10)", fx_ontrack_diff < 1e-12, fx_ontrack_diff, 0.0);
+  report("fixed walk canonical kappa(10K,1e-14)=0.02",
+         rel(BellLinKappaFixed(1e-14, 10.0), 0.02, 1e-6), BellLinKappaFixed(1e-14, 10.0), 0.02);
+
   std::printf("\n%s (%d failures)\n", fails == 0 ? "ALL GATES PASS" : "GATE FAILURES", fails);
   return fails ? 1 : 0;
 }
