@@ -160,6 +160,61 @@ def main():
               f"rho={worst_loc[2]:.0e} (a dissociation/ionization kink) -> Phase-3 EOS item.")
         fails += not g4
 
+        # ---- Gate 5: sound-speed (entropy-along-adiabat) consistency ----
+        # The tabulated cs2 IS the adiabatic sound speed = the isentrope slope (dP/drho)|_s,
+        # equivalently cs2 = (dP/drho)|_u + (P/rho^2)(dP/du)|_rho with u the SPECIFIC internal
+        # energy. Recompute it INDEPENDENTLY from the Saha EOS by pointwise finite differences
+        # of P_e_of_rho_T in (rho,T) + the chain rule to fixed-u partials, and compare to the
+        # table's cs2 (which the generator built by grid-gradient of P over the (rho,esp) grid,
+        # then the C++ reads bilinearly). Agreement validates the shipped sound speed -- the
+        # entropy-along-adiabat consistency the Riemann solver relies on -- independently of P.
+        print("--- GATE 5: sound-speed consistency  cs2_table == cs2_Saha(isentrope) ---")
+        hln = 1e-3
+        cs_errs = []
+        cs_worst = (0.0, 0.0, 0.0)
+
+        def _PU(r, tK):
+            P, e = G.P_e_of_rho_T(r, tK)
+            return P, e / r  # P[cgs], specific u[cgs]
+
+        for rho in np.logspace(-15, -5, 21):
+            lr = np.log10(rho / rho0)
+            if lr < t['lr0'] or lr > t['lr0'] + (t['nr'] - 1) * t['dlr']:
+                continue
+            for T in np.logspace(1.4, 4.2, 24):
+                P0, u0 = _PU(rho, T)
+                Pp, up = _PU(rho * (1 + hln), T); Pm, um = _PU(rho * (1 - hln), T)
+                dP_drho_T = (Pp - Pm) / (2 * hln * rho)
+                du_drho_T = (up - um) / (2 * hln * rho)
+                PTp, uTp = _PU(rho, T * (1 + hln)); PTm, uTm = _PU(rho, T * (1 - hln))
+                dP_dT_rho = (PTp - PTm) / (2 * hln * T)
+                du_dT_rho = (uTp - uTm) / (2 * hln * T)
+                if du_dT_rho == 0.0:
+                    continue
+                dT_drho_u = -du_drho_T / du_dT_rho
+                dP_drho_u = dP_drho_T + dP_dT_rho * dT_drho_u
+                dP_du_rho = dP_dT_rho / du_dT_rho
+                cs2_saha_code = (dP_drho_u + (P0 / (rho * rho)) * dP_du_rho) / (v0 * v0)
+                le = np.log10((u0) / (v0 * v0))
+                if le < t['le0'] or le > t['le0'] + (t['ne'] - 1) * t['dle']:
+                    continue
+                cs2_tab = bilin(t['cs2'], t['lr0'], t['dlr'], t['le0'], t['dle'], lr, le)
+                if cs2_saha_code <= 0 or cs2_tab <= 0:
+                    continue
+                re = abs(cs2_tab - cs2_saha_code) / cs2_saha_code
+                cs_errs.append(re)
+                if re > cs_worst[0]:
+                    cs_worst = (re, T, rho)
+        ce = np.array(cs_errs)
+        cmed = float(np.median(ce)); cmx = float(ce.max())
+        # cs2 carries a derivative of P so it is noisier (FD + grid-gradient); gate the median.
+        g5 = cmed < 3e-2
+        print(f"  n={len(ce)}  median={cmed:.2e}  max={cmx:.2e}  (gate: median<3e-2)  "
+              f"{'PASS' if g5 else 'FAIL'}")
+        print(f"  CHARACTERIZATION: worst {cs_worst[0]:.1%} at T={cs_worst[1]:.0f} K "
+              f"rho={cs_worst[2]:.0e} (cs2 is derivative-sensitive at the kinks).")
+        fails += not g5
+
     print(f"\n{'ALL GATES PASS' if fails == 0 else 'GATE FAILURES'} ({fails} failures)")
     return 1 if fails else 0
 

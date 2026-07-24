@@ -145,7 +145,10 @@ thermodynamics.
 needs GPU rebuild). `gen_eos_table.py` now takes `build <nr> <ne> <nT> [out.h5]`; a plain
 `build` still reproduces the shipped `eos_table.bin` **bit-for-bit** (md5 07e5423b…), so
 production is untouched. Validated hi-res candidate = `src/eos/eos_table_hires.bin`
-(gitignored, regenerable); passes ALL consistency gates.
+(gitignored, regenerable); passes ALL consistency gates. A new **Gate 5 (sound-speed /
+entropy-along-adiabat consistency)** — the tabulated cs2 vs an independent Saha isentrope-slope
+computation — shows cs2 is the more derivative-sensitive quantity: **17.8% worst at the
+H-ionization cusp in the shipped table → 3.3% in the hi-res** (median 0.85% → 0.16%).
 **DEFERRED / user-gated:** swapping production onto the hi-res table is result-changing AND the
 table is loaded at RUNTIME (the currently-running GLM gate job is reading `eos_table.bin` live),
 so the swap must be coordinated with the user (and a matched GLM/CT gate pair). **Next EOS
