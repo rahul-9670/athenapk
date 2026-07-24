@@ -199,7 +199,11 @@ walk **skips regime 6 (Kramers), giving a κ discontinuity of up to ~4 decades**
 corner is OFF the cold-collapse track (cold at low ρ; high T only at ρ≥1e-10 second core) so it does
 not affect the nominal FHC run, but it is reachable by radiation in hot low-density gas. The fix
 (monotonic regime selection / min-of-regimes) is **result-changing to production opacity → DEFERRED,
-user-gated**.
+user-gated**. **Fix VALIDATED:** replacing the ordered walk with κ = min over all 8 Bell&Lin regimes
+makes κ continuous everywhere (max |d ln κ/d ln T| = 24.0 at every density, incl. the defect corner)
+while matching the current walk where it is already well-ordered — the standard robust Bell&Lin
+composition. Ready to port into `radiation_opacity.hpp` (ideally behind a default-off flag to keep
+the production path bit-identical until the user opts in) once approved.
 **DEFERRED (user-gated, large):** multigroup RHD + mixed-frame v/c + scattering + IMEX +
 asymptotic-preserving diffusion + RSLA validity are the real Phase-4 build. The next tractable
 increments are the transport benchmarks (free-streaming/shadow/diffusion/radiative-shock), which
