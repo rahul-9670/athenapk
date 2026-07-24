@@ -151,8 +151,18 @@ computation — shows cs2 is the more derivative-sensitive quantity: **17.8% wor
 H-ionization cusp in the shipped table → 3.3% in the hi-res** (median 0.85% → 0.16%).
 **DEFERRED / user-gated:** swapping production onto the hi-res table is result-changing AND the
 table is loaded at RUNTIME (the currently-running GLM gate job is reading `eos_table.bin` live),
-so the swap must be coordinated with the user (and a matched GLM/CT gate pair). **Next EOS
-increment:** entropy-along-adiabat gate; **then** the conductivity-vs-independent-solver gate.
+so the swap must be coordinated with the user (and a matched GLM/CT gate pair).
+
+**Conductivity gate (2026-07-24):** `src/hydro/diffusion/tests/test_conductivity.py` — an
+INDEPENDENT pure-Python reimplementation of the Pandey & Wardle (2008) tensor + η_{O,H,A} that
+`ionization.hpp::Diffusivities` computes, evaluated on the same gas-phase CR↔recombination
+balance. Validates: **σ_O == scalar conductivity Σ n_j Z_j² e²/(m_j ν_j) to 4e-16** (the B
+cancels exactly — guards the β/ecB assembly), η_O = c²/(4πσ_O), **exact parity in B** (η_O,η_A
+even; η_H odd — the Hall sign structure), σ_⊥² = σ_H²+σ_P², and the **canonical ambipolar→Ohmic
+crossover** (η_A/η_O = 2.7e6 at 1e-17 g/cm³ → 2.7e-3 at 1e-8). ALL PASS. **Remaining:** a direct
+numerical C++-vs-Python cross-check *including the charged MRN grain bins* needs a small debug
+dump hook in `Diffusivities()` + a CPU build (grains are the C++ model's extension beyond this
+gas-phase reference) — the last Phase-3 conductivity item.
 
 **Deliverables:** thermodynamically-consistent free-energy H/He(+metals) EOS (rot/vib H₂,
 ortho/para, dissociation, ionization stages, degeneracy, Coulomb, radiation) with all
