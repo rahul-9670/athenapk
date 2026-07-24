@@ -159,10 +159,14 @@ INDEPENDENT pure-Python reimplementation of the Pandey & Wardle (2008) tensor + 
 balance. Validates: **σ_O == scalar conductivity Σ n_j Z_j² e²/(m_j ν_j) to 4e-16** (the B
 cancels exactly — guards the β/ecB assembly), η_O = c²/(4πσ_O), **exact parity in B** (η_O,η_A
 even; η_H odd — the Hall sign structure), σ_⊥² = σ_H²+σ_P², and the **canonical ambipolar→Ohmic
-crossover** (η_A/η_O = 2.7e6 at 1e-17 g/cm³ → 2.7e-3 at 1e-8). ALL PASS. **Remaining:** a direct
-numerical C++-vs-Python cross-check *including the charged MRN grain bins* needs a small debug
-dump hook in `Diffusivities()` + a CPU build (grains are the C++ model's extension beyond this
-gas-phase reference) — the last Phase-3 conductivity item.
+crossover** (η_A/η_O = 2.7e6 at 1e-17 g/cm³ → 2.7e-3 at 1e-8). ALL PASS.
+**Direct C++-vs-Python numerical cross-check DONE** (`tests/xcheck_conductivity.cpp` +
+`tests/host_shims/`): compiles the REAL `ionization.hpp` host-only and dumps η_{O,H,A}; the
+shipped device tensor matches the independent Python reference to **η_O 3e-7, η_H 4e-7, η_A
+2.4e-3** — all < the Phase-3 <1% criterion (η_A is cancellation-limited: `σ_P/σ_⊥² − η_O` with
+η_A ≪ η_O at the worst point). Grains OFF (`f_dg=0`) so it matches the gas-phase reference.
+**Remaining Phase-3 conductivity item:** the grain-INCLUSIVE cross-check needs `SolveCharges`'
+MRN grain-charge model reimplemented in Python (the C++ model's extension beyond gas phase).
 
 **Deliverables:** thermodynamically-consistent free-energy H/He(+metals) EOS (rot/vib H₂,
 ortho/para, dissociation, ionization stages, degeneracy, Coulomb, radiation) with all
