@@ -1,0 +1,5 @@
+# Generated EOS tables. The shipped device table src/eos/eos_table.bin is committed
+# (tracked; not ignored here). The HDF5 sidecars and the Phase-3 hi-res candidate are
+# regenerable via gen_eos_table.py and too large to version.
+*.h5
+eos_table_hires.bin

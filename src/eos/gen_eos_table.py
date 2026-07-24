@@ -209,7 +209,21 @@ def build_table(path, nr=180, ne=220, nT=200,
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "build":
-        build_table("/beegfs/u/bbg6470/athenapk/src/eos/eos_table.h5")
+        # `build`                       -> shipped table (180x220x200) at the default path.
+        #   Reproduces src/eos/eos_table.bin bit-for-bit; do NOT change these defaults, so a
+        #   plain rebuild never silently alters the production EOS the runs load at runtime.
+        # `build <nr> <ne> <nT> [out.h5]` -> a higher-resolution table at an explicit path.
+        #   Use this for the Phase-3 kink-fidelity table (e.g. 400 1000 920 -> ~0.9% worst at
+        #   the H2-dissociation/H-ionization cusps vs ~6.9% at shipped res). Swapping it into
+        #   production is a result-changing, runtime-loaded change -> user-gated.
+        out = "/beegfs/u/bbg6470/athenapk/src/eos/eos_table.h5"
+        if len(sys.argv) >= 5:
+            nr, ne, nT = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+            if len(sys.argv) >= 6:
+                out = sys.argv[5]
+            build_table(out, nr=nr, ne=ne, nT=nT)
+        else:
+            build_table(out)
         sys.exit(0)
     # quick validation: gamma_eff(T) at fixed rho showing the two softening dips
     print("# code units: esp_unit(v0^2)=%.4e erg/g, e_unit=%.4e, rho0=%.3e" %

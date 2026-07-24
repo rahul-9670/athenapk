@@ -25,7 +25,11 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GEN = os.path.normpath(os.path.join(HERE, "..", "gen_eos_table.py"))
-TABLE = os.path.normpath(os.path.join(HERE, "..", "eos_table.bin"))
+# Table under test: argv[1] or $EOS_TABLE_BIN overrides the shipped table, so a candidate
+# hi-res table can be validated against the same gates before any production swap.
+TABLE = (sys.argv[1] if len(sys.argv) > 1 else
+         os.environ.get("EOS_TABLE_BIN",
+                        os.path.normpath(os.path.join(HERE, "..", "eos_table.bin"))))
 
 # import gen_eos_table as a module (its build action is guarded by __main__)
 spec = importlib.util.spec_from_file_location("gen_eos_table", GEN)

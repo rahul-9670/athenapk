@@ -135,8 +135,21 @@ consistent**, so a full Helmholtz-free-energy rewrite is NOT needed for consiste
 **Actionable finding:** the shipped bilinear table is ~0.7% accurate typically but degrades to
 **~5–7% right at the H₂-dissociation (~2200 K) and H-ionization (~7000–10000 K) γ-softening
 kinks** — a *tabulation-resolution* limit at exactly the transitions that set first/second-core
-thermodynamics. **Next EOS increment:** finer/adaptive grid (or better representation) at the
-kinks + an entropy-along-adiabat gate; **then** the conductivity-vs-independent-solver gate.
+thermodynamics.
+
+**EOS kink-fidelity increment (2026-07-24):** resolution sweep (worst-case P error vs Saha):
+180×220×200 (shipped) 6.85% → 240×520×480 2.72% → 300×760×700 1.26% → **400×1000×920 0.80%**
+(median 0.12%, 12.5 MB, ~4.5 min to generate). Convergence is only ~O(h) at the near-cuspy
+γ-drops, so uniform refinement reaches <1% but not much better without a *non-uniform* grid
+(which needs a C++ loader change — the device loader assumes an even log grid — DEFERRED,
+needs GPU rebuild). `gen_eos_table.py` now takes `build <nr> <ne> <nT> [out.h5]`; a plain
+`build` still reproduces the shipped `eos_table.bin` **bit-for-bit** (md5 07e5423b…), so
+production is untouched. Validated hi-res candidate = `src/eos/eos_table_hires.bin`
+(gitignored, regenerable); passes ALL consistency gates.
+**DEFERRED / user-gated:** swapping production onto the hi-res table is result-changing AND the
+table is loaded at RUNTIME (the currently-running GLM gate job is reading `eos_table.bin` live),
+so the swap must be coordinated with the user (and a matched GLM/CT gate pair). **Next EOS
+increment:** entropy-along-adiabat gate; **then** the conductivity-vs-independent-solver gate.
 
 **Deliverables:** thermodynamically-consistent free-energy H/He(+metals) EOS (rot/vib H₂,
 ortho/para, dissociation, ionization stages, degeneracy, Coulomb, radiation) with all
