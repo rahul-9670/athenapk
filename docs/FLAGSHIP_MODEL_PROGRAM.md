@@ -207,10 +207,18 @@ collapse track** (rho ≥ 1e-10, rel diff 0). NB: an earlier note claimed κ = m
 was the fix — that was FALSIFIED (it gives 2e-31 instead of 0.02 at 10 K; wrong by ~29 decades;
 only slope-continuity had been checked, not values). Reaches production on the next GPU rebuild with
 the flag enabled; default-off keeps every current run bit-identical.
-**DEFERRED (user-gated, large):** multigroup RHD + mixed-frame v/c + scattering + IMEX +
-asymptotic-preserving diffusion + RSLA validity are the real Phase-4 build. The next tractable
-increments are the transport benchmarks (free-streaming/shadow/diffusion/radiative-shock), which
-need running the C++ M1 solver on test setups (CPU build).
+**MULTIGROUP RHD — STARTED (scaffold increment 1, 2026-07-24):** `radiation_groups.hpp` adds the
+frequency-group structure (`RadGroups`: n_group + log-spaced edges) and the group-integrated
+Planck function (`PlanckCumFraction` = Clark-1965 tail series; `PlanckFraction(g,T)`), designed so
+**n_group=1 reduces EXACTLY to gray** (fraction 1) → production bit-identical. VERIFIED
+(`test_rad_groups.cpp`): Planck series vs an independent numerical integral 3e-10; F(0)=0/F(∞)=1/
+monotonic; **Σ_g PlanckFraction = 1 exactly** (energy partition conserved); gray reduction exact.
+A bug (series was the upper tail, needed 1−tail) was caught by the gate. This is a NON-transport
+foundation only; the remaining large build (per-group Er_g/Fr_g moments + per-group M1 closure +
+per-group Planck/Rosseland opacity means + IMEX group coupling + mixed-frame v/c + AP diffusion
++ RSLA validity) is the multi-increment effort ahead — best done with fresh context, NOT rushed.
+Other next increments: the M1 TRANSPORT benchmarks (free-streaming/shadow/diffusion/radiative-shock;
+need running the C++ M1 solver on test setups, CPU build).
 
 **Deliverables:** multigroup RHD (dust-IR → ionizing), consistent mixed-frame v/c terms,
 scattering, IMEX/implicit transport for optically thick cells; hybrid moment + ray-trace/Monte-
