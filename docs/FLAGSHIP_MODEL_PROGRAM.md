@@ -190,6 +190,16 @@ new, large, high-risk numerics (NOT to be greenfielded unilaterally in an autono
 REAL closure host-only and validates every M1 identity — Eddington-factor limits χ_Edd(0)=1/3 /
 χ_Edd(1)=1, Eddington-tensor trace ≡ E (2e-16), beam (P=n_i n_j) & diffusion (P=⅓δ) limits, causal
 wave speeds (|λ|≤1; 1/√3 diffusion, 1 beam), flux clamping. ALL PASS.
+**Opacity gate DONE** (`src/radiation/tests/test_opacity.cpp`): compiles the REAL
+`radiation_opacity.hpp` host-only; validates Bell&Lin continuity on the collapse track, canonical
+dust values (κ=0.02 at 10 K, 2.0 at 100 K; e-scatter floor 0.348), the T⁻²⁴ sublimation gap, and
+the Planck/Rosseland split (ratio=1 → κ_P≡κ_R). ALL PASS. **FOUND A LATENT DEFECT (deferred):** at
+ρ ≤ 1e-11 g/cm³ and T~4–9 kK the Bell&Lin transition temperatures go out of order and the regime
+walk **skips regime 6 (Kramers), giving a κ discontinuity of up to ~4 decades** (regime 5→7). This
+corner is OFF the cold-collapse track (cold at low ρ; high T only at ρ≥1e-10 second core) so it does
+not affect the nominal FHC run, but it is reachable by radiation in hot low-density gas. The fix
+(monotonic regime selection / min-of-regimes) is **result-changing to production opacity → DEFERRED,
+user-gated**.
 **DEFERRED (user-gated, large):** multigroup RHD + mixed-frame v/c + scattering + IMEX +
 asymptotic-preserving diffusion + RSLA validity are the real Phase-4 build. The next tractable
 increments are the transport benchmarks (free-streaming/shadow/diffusion/radiative-shock), which
