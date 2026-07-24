@@ -229,7 +229,15 @@ single-fluid breaks, evolve ions/electrons/charged grains separately or a genera
 multifluid Ohm law, with drag heating. **Gate:** single-fluid validity map; agreement with
 multifluid where both valid.
 
-## Phase 7 — Gravity/dynamics, ICs, ensembles, UQ, cross-code (audit E, F, K, J)
+## Phase 7 — Gravity/dynamics, ICs, ensembles, UQ, cross-code (audit E, F, K, J) — **gravity-BC gate DONE (2026-07-24)**
+
+**Gravity-BC gate:** `src/self_gravity/tests/test_multipole.py` turns the WS-5a multipole-BC
+validation into a committed reproducible test — checks `MultipolePhi` (monopole + traceless
+quadrupole exterior potential) against the analytic identities: monopole −GM/r (1e-16) + 1/r
+scaling, quadrupole P₂ structure + 1/r³ scaling, superposition linearity (2e-16), and the
+traceless-Q shell-average → 0. ALL PASS. (Formula mirror of `multipole.hpp`; the header pulls
+heavy parthenon deps so a host-g++ shim isn't worth it.) The rest of Phase 7 (torque diagnostics,
+physics-based AMR, IC ensembles, UQ classes, cross-code) is new capability → user direction.
 
 Stage-centered gravity with validated isolated/Green-function BCs (Phase 0's #2 is the first
 step); torque-budget diagnostics; physics-based AMR (Jeans + pressure scale height + non-ideal
