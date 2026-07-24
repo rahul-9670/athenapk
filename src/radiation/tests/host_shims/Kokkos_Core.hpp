@@ -1,0 +1,7 @@
+#pragma once
+#ifndef KOKKOS_INLINE_FUNCTION
+#define KOKKOS_INLINE_FUNCTION inline
+#endif
+#ifndef KOKKOS_FORCEINLINE_FUNCTION
+#define KOKKOS_FORCEINLINE_FUNCTION inline
+#endif

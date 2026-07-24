@@ -179,7 +179,21 @@ model. Published microphysics tables with uncertainty bands.
 independent solver <1% off sign changes; charge neutrality + element conservation to roundoff.
 **Risk:** high. **Unblocks:** trustworthy non-ideal flux loss and collapse thermodynamics.
 
-## Phase 4 — Radiation beyond grey M1 (audit Workstream C)
+## Phase 4 — Radiation beyond grey M1 (audit Workstream C) — **BASELINE CHARACTERIZED (2026-07-24)**
+
+**Survey:** the radiation package (`src/radiation/`) is **gray single-group M1** — Er/Fr moments,
+Artemis-ported M1 closure (`radiation_closure.hpp`), explicit HLL transport (`radiation_moments.cpp`),
+implicit matter coupling, gray Planck/Rosseland opacity (`radiation_opacity.hpp`, WS-3a split).
+**No multigroup structure exists** — so unlike Phase 3, the core Phase-4 deliverable is genuinely
+new, large, high-risk numerics (NOT to be greenfielded unilaterally in an autonomous run).
+**Baseline gate DONE:** `src/radiation/tests/test_m1_closure.cpp` (+ `host_shims/`) compiles the
+REAL closure host-only and validates every M1 identity — Eddington-factor limits χ_Edd(0)=1/3 /
+χ_Edd(1)=1, Eddington-tensor trace ≡ E (2e-16), beam (P=n_i n_j) & diffusion (P=⅓δ) limits, causal
+wave speeds (|λ|≤1; 1/√3 diffusion, 1 beam), flux clamping. ALL PASS.
+**DEFERRED (user-gated, large):** multigroup RHD + mixed-frame v/c + scattering + IMEX +
+asymptotic-preserving diffusion + RSLA validity are the real Phase-4 build. The next tractable
+increments are the transport benchmarks (free-streaming/shadow/diffusion/radiative-shock), which
+need running the C++ M1 solver on test setups (CPU build).
 
 **Deliverables:** multigroup RHD (dust-IR → ionizing), consistent mixed-frame v/c terms,
 scattering, IMEX/implicit transport for optically thick cells; hybrid moment + ray-trace/Monte-
