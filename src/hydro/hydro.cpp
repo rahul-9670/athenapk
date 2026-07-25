@@ -352,6 +352,13 @@ Ionization::IonizationModel BuildIonizationModel(ParameterInput *pin) {
   ion.gamma_AD = pin->GetOrAddReal("diffusion", "ion_gamma_AD", ion.gamma_AD);
   // grains (MRN distribution)
   ion.f_dg = pin->GetOrAddReal("diffusion", "ion_f_dg", ion.f_dg);
+  // Phase-3 fix (2026-07-25): the pre-fix charge-state solvers were both defective -- the
+  // relaxed fixed point in SolveCharges does not converge once grains dominate the charge
+  // budget (rho >~ 1e-12), and SahaThermal's fixed-step absolute bisection injects spurious
+  // electrons in cold gas. Default is now the robust pair. RESULT-CHANGING where grains
+  // matter -- set true only to bit-reproduce pre-fix runs.
+  ion.legacy_charge_solver =
+      pin->GetOrAddBoolean("diffusion", "ion_legacy_charge_solver", false);
   ion.rho_grain = pin->GetOrAddReal("diffusion", "ion_rho_grain", ion.rho_grain);
   ion.T_subl = pin->GetOrAddReal("diffusion", "ion_T_subl", ion.T_subl);
   const Real a_min = pin->GetOrAddReal("diffusion", "ion_a_min_cm", 5.0e-7);

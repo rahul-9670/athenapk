@@ -109,6 +109,12 @@ struct IonizationModel {
   Real xe_floor = 1.0e-20;                       // minimum ionization fraction
   ADClosure ad_closure = ADClosure::single_fluid; // ambipolar closure (see header)
   Real gamma_AD = 3.5e13; // ion-neutral drag coeff for single_fluid AD [cm^3 g^-1 s^-1]
+  // Charge-state solvers (SolveCharges + SahaThermal). false = the robust solves (default);
+  // true = the pre-2026-07-25 pair, BOTH of which are defective: the grain fixed point does
+  // not converge once grains dominate (neutrality violated by up to ~1e7), and the thermal
+  // Saha bisection has an absolute resolution floor that injects spurious electrons in cold
+  // gas. Kept only to bit-reproduce pre-fix results. See the Phase-3 conductivity gate.
+  bool legacy_charge_solver = false;
 };
 
 //----------------------------------------------------------------------------------------
@@ -159,13 +165,43 @@ Real SahaThermal(const IonizationModel &m, const Real n_n, const Real T) {
   const Real fH = le3 * std::exp(-13.598 * cgs::eV / (cgs::k_B * T));   // H: gII/gI net 1
   const Real n_K = m.x_K * n_n;
   const Real n_H = n_n * m.mu_n * m.x_H; // H-nucleus density = rho X_H/m_H = n_n mu_n X_H
-  Real lo = 0.0, hi = n_K + n_H;
-  for (int it = 0; it < 64; ++it) {
-    const Real ne = 0.5 * (lo + hi);
-    const Real res = n_K * fK / (fK + ne) + n_H * fH / (fH + ne) - ne;
-    if (res > 0.0) lo = ne; else hi = ne;
+
+  if (m.legacy_charge_solver) {
+    // LEGACY (pre-2026-07-25): absolute bisection on [0, n_K+n_H] with a FIXED 64 steps.
+    // Its resolution floor is (n_K+n_H)/2^64, so in cold gas -- where the true thermal
+    // ionization underflows -- it returns ~(n_K+n_H)*2^-65 instead of ~0: a spurious
+    // electron floor of x_e ~ 9e-20 (about 9x the intended xe_floor) that grows with
+    // density and can dominate the real n_e in the dense core. Kept for bit-reproduction.
+    Real lo = 0.0, hi = n_K + n_H;
+    for (int it = 0; it < 64; ++it) {
+      const Real ne = 0.5 * (lo + hi);
+      const Real res = n_K * fK / (fK + ne) + n_H * fH / (fH + ne) - ne;
+      if (res > 0.0) lo = ne; else hi = ne;
+    }
+    return 0.5 * (lo + hi);
   }
-  return 0.5 * (lo + hi);
+
+  // Relative-precision solve of  n_e = n_K fK/(fK+n_e) + n_H fH/(fH+n_e).
+  // Newton from the weak-ionization limit n_e ~ sqrt(n_K fK + n_H fH) (exact when n_e >> f);
+  // capped by full ionization n_K + n_H. Accurate down to underflow, unlike the fixed-step
+  // absolute bisection above.
+  const Real sum_nf = n_K * fK + n_H * fH;
+  if (!(sum_nf > 0.0)) return 0.0; // both Boltzmann factors underflowed: no thermal electrons
+  const Real ne_max = n_K + n_H;
+  Real ne = std::sqrt(sum_nf);
+  if (ne > ne_max) ne = ne_max;
+  for (int it = 0; it < 100; ++it) {
+    const Real gK = n_K * fK / (fK + ne);
+    const Real gH = n_H * fH / (fH + ne);
+    const Real g = ne - gK - gH;
+    const Real dg = 1.0 + gK / (fK + ne) + gH / (fH + ne);
+    Real dne = -g / dg;
+    if (ne + dne <= 0.0) dne = -0.5 * ne; // keep the iterate positive
+    ne += dne;
+    if (std::abs(dne) <= 1e-15 * ne) break;
+  }
+  if (ne > ne_max) ne = ne_max;
+  return ne;
 }
 
 //----------------------------------------------------------------------------------------
@@ -193,6 +229,76 @@ void SolveCharges(const IonizationModel &m, const Real n_n, const Real T, Real &
   const Real alpha = m.alpha0 * std::pow(T / 300.0, m.alpha_Texp);
   const Real P = m.zeta * n_n; // CR ion-pair production rate
 
+  // ---------------------------------------------------------------------------------
+  // ROBUST grain-charge solve (default; Phase-3 fix 2026-07-25).
+  //
+  // The legacy path below is a relaxed fixed point on n_i with an inner Newton on psi; it
+  // DIVERGES once grains dominate the charge budget (rho >~ 1e-12 g/cm^3 on the collapse
+  // track), returning states that violate its own neutrality constraint by up to ~1e7 in
+  // relative terms -- and even n_e > n_i, impossible with negatively charged grains.
+  //
+  // Reduction used here: the per-bin capture balance n_e v_e e^psi = n_i v_i (1-psi) has NO
+  // bin dependence (the pi a^2 cross-sections cancel between electrons and ions), so psi is a
+  // single global unknown with Z_k = psi tau_k. That makes r = n_e/n_i an EXPLICIT function
+  //   r(psi) = (v_i/v_e) (1 - psi) e^{-psi},
+  // and the remaining constraints close on psi alone:
+  //   neutrality : n_i (1 - r) = Q = -psi S,      S  = sum_k tau_k ng_k
+  //   ionization : alpha r n_i^2 + (1-psi) K0 n_i = P,   K0 = sum_k ng_k ki0_k
+  // R(psi) is +inf at psi_lo (where r -> 1, n_i -> inf) and -P at psi -> 0^-, so a bracketed
+  // bisection converges unconditionally -- no relaxation, no iteration-count failure mode.
+  // ---------------------------------------------------------------------------------
+  Real Ssum = 0.0, K0 = 0.0;
+  for (int k = 0; k < N_BIN; ++k) {
+    Ssum += tau[k] * ng[k];
+    K0 += ng[k] * ki0[k];
+  }
+
+  if (!m.legacy_charge_solver) {
+    if (Ssum <= 0.0) { // no grains (sublimated or f_dg = 0): pure gas-phase balance
+      n_i = std::sqrt(P / alpha);
+      n_e = n_i;
+      for (int k = 0; k < N_BIN; ++k)
+        Zk[k] = 0.0;
+    } else {
+      const Real vr = vi / ve; // = r at psi = 0
+      // psi_lo: the psi where r(psi) = 1 (n_i -> inf). r is strictly decreasing in psi.
+      Real lo = -200.0, hi = 0.0;
+      for (int it = 0; it < 60; ++it) {
+        const Real mid = 0.5 * (lo + hi);
+        const Real ex = std::exp((-mid > 200.0) ? 200.0 : -mid);
+        if (vr * (1.0 - mid) * ex > 1.0) lo = mid;
+        else hi = mid;
+      }
+      // bracket [a,b] with R(a) > 0 > R(b); b = 0^- gives R = -P.
+      Real a = hi, b = 0.0;
+      for (int it = 0; it < 80; ++it) {
+        const Real psi = 0.5 * (a + b);
+        const Real ex = std::exp((-psi > 200.0) ? 200.0 : -psi);
+        const Real r = vr * (1.0 - psi) * ex;
+        const Real ni = -psi * Ssum / (1.0 - r);
+        const Real R = alpha * r * ni * ni + (1.0 - psi) * K0 * ni - P;
+        if (R > 0.0) a = psi;
+        else b = psi;
+      }
+      const Real psi = 0.5 * (a + b);
+      const Real ex = std::exp((-psi > 200.0) ? 200.0 : -psi);
+      const Real r = vr * (1.0 - psi) * ex;
+      n_i = -psi * Ssum / (1.0 - r);
+      n_e = r * n_i;
+      if (n_e < 1e-30) n_e = 1e-30;
+      for (int k = 0; k < N_BIN; ++k)
+        Zk[k] = (ng[k] > 0.0) ? psi * tau[k] : 0.0;
+    }
+    // thermal channel + floor (shared tail with the legacy path)
+    const Real n_th_r = SahaThermal(m, n_n, T);
+    n_e += n_th_r;
+    n_i += n_th_r;
+    const Real n_e_min_r = m.xe_floor * n_n;
+    if (n_e < n_e_min_r) n_e = n_e_min_r;
+    return;
+  }
+
+  // ---------------- LEGACY relaxed fixed point (non-convergent; see above) -------------
   // initial guess: pure gas-phase recombination
   n_i = std::sqrt(P / alpha);
   n_e = n_i;
