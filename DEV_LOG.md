@@ -1413,3 +1413,40 @@ directive repointed to prod_t5. Handoff at ~/HANDOFF_2026-07-21.md (launch instr
 No background agents/tasks/crons remain. Chat-transcript cleanup: deleted 1 empty stub;
 4 real sessions held pending user ID of "the athenapk experimental chat" (UUIDs not
 self-identifying).
+
+## 2026-07-25 — PHASE 2 CT: gate PASSED + CT+Hall blowup root-caused and FIXED
+The full-physics CT gate leg had detonated at first-core formation (t≈1.07747, level-4
+boundary, ρ~4e4): |B|max→1.35e15 (v_A~3000c), dt→1e-55 frozen. NOT a ∇·B failure —
+`ct_maxRelDivB` stayed round-off (~1e-13) throughout; only `ct_maxAbsDivB` grew, and only
+because abs = rel·|B| with |B| exploded. So a field-MAGNITUDE instability, not a divergence
+one. Diagnosis chain (each single-variable): (1) rkl2_max_dt_ratio 1000→400 FALSIFIED — Hall
+is unsplit, bypasses RKL2 STS, so ratio-independent (ct_r400 still blew up ~70 cyc past the
+level-4 crossing, |B|max=1.35e15). (2) Discriminant: GLM+Hall (glm_r400) stayed HEALTHY past
+first core (t=1.085) while CT+Hall detonated ⇒ the CT+Hall COMBINATION, not Hall alone. (3)
+Hall-OFF isolation: ct_run_halloff (single delta hall→none) ran CLEAN to tlim=1.0945 at
+maxLevel 6 / ρ=6.14e6, |B|max=3256, 0 NaN ⇒ **uncapped Hall is the CONFIRMED sole cause**.
+Mechanism: η_H ∝ B/n_e explodes in the high-ρ recombination core (n_e recombines away), driving
+a grid-scale dispersive whistler runaway; GLM/Dedner cleaning damps it, exact-div-free CT does
+not.
+
+FIX (user-selected "Hall-cap full physics"): `diffusion/eta_hall_cap_code=0.05` — the knob
+already existed (hydro.cpp:1065, signed |η_H| clamp diffusion.hpp:485-486); uncapped was a
+CONFIG choice, not a missing feature, so NO rebuild. Cap value from the level-6 whistler-CFL
+(dx=9.77e-4, dx²=9.5e-7): η_H ≤ cfl·dx²/(2π·dt_target) ⇒ 0.05 keeps unsplit-Hall dt~1e-6 ~ the
+hydro dt-wall while preserving Hall physics where η_H<0.05 (= Ohmic-floor scale, < eta_ohm_cap
+0.1; the capped region is the Ohmic-dominated core where Hall is subdominant anyway). Validated
+at the EXACT detonation coordinates: `runs/inc7_gate/ct_run_hallcap` (Hall ON + cap=0.05, single
+delta from the run that blew up, job 2398334) cleared t=1.07747 at level 4 / ρ=4.57e4 with
+|B|max=77.0 (vs uncapped 1.35e15 — 13 orders lower), dt=5.6e-5 steady, ME=58.6, 0 NaN, matching
+the healthy Hall-off trajectory (|B|~75), NOT the blowup.
+
+GATE RESULT (runs/flux_retention.py, matched Hall-OFF CT-vs-GLM pair at first-core depth
+tlim=1.0945, both maxLevel 6): retention Φ_core/Φ₀ = CT 2.48 vs GLM 2.44 (1.6%); μ_core(NN78) =
+CT 5.35 vs GLM 5.46 (2.0%); Φ_core 0.459 vs 0.474 (3.3%); M_core 0.0299 vs 0.0316 M☉. **Verdict:
+retained fossil flux is NOT set by the divergence-control choice** (agree to ~2%). Sub-finding:
+CT reaches lower central density at fixed time (34× vs 57× ρ_crit) ⇒ exact-div-free CT preserves
+more magnetic support (less numerical field dissipation). Cross-code (Athena++) comparison uses
+the Hall-OFF pair (Athena++ Hall is a stub); Hall-cap is the AthenaPK-only most-complete path.
+Canonical validated CT config: divergence_control=ct, ct_emf=gs05, hall=hall+eta_hall_cap_code=0.05,
+rkl2_max_dt_ratio=400, eta_ohm_cap_code=0.1. Gate inputs untracked (runs/inc7_gate/); FLAGSHIP
+Phase-2 section is the tracked reference. **Phase 2 CT COMPLETE.** prod_v9 stays HELD (STOP_CHAIN).

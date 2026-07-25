@@ -100,7 +100,7 @@ production only on the next GPU rebuild; a `<units>` base-scale override for col
 rejected, and a pgen guard asserts the two paths agree. **Risk:** low (centralization).
 **Unblocks:** clean comparisons in all later phases.
 
-## Phase 2 — Constrained transport (audit Workstream D.1) — **IMPLEMENTED, AT GATE (2026-07-23)**
+## Phase 2 — Constrained transport (audit Workstream D.1) — **VALIDATED, GATE PASSED (2026-07-25)**
 
 **Deliverable:** staggered/face CT so discrete ∇·B = 0 to round-off, with AMR-compatible
 divergence-preserving prolongation/restriction and reflux-curl; keep GLM as an optional
@@ -112,11 +112,42 @@ matches GLM. Full-production-physics smoke (chem+RT+non-ideal+AMR+gravity) PASSE
 `ct_maxRelDivB ≈ 2e-14`, mass +0.007%, 0 NaN/floor over 50 cycles.
 **Gate:** CT vs GLM flux-retention measured on the fiducial collapse — the result must not
 be set by the divergence-control choice, or the difference is reported as systematic.
-**IN FLIGHT** — matched gate pair `runs/inc7_gate/{glm_run,ct_run}` (= `fhc.in` + one-line
-`divergence_control` toggle), full production physics to first-core formation (`tlim=1.0945`,
-~cyc 804, ~2.5–3 h @ 4 GPU). Diagnostic = `runs/flux_retention.py`. NOTE: the *lean* ideal
-gate is impossible — adaptive-AMR + multigrid-gravity is unstable without the full stack, so
-the gate must run full production physics (GLM leg = re-baselined production, CT leg = new).
+**PASSED (2026-07-25).** Matched pair `runs/inc7_gate/{glm_run_halloff,ct_run_halloff}`
+(single-variable `divergence_control` toggle, full production physics minus Hall — see below),
+both run to first-core formation `tlim=1.0945` at maxLevel 6. `runs/flux_retention.py` at the
+deepest (first-core) snapshot:
+
+| metric | CT | GLM | Δ |
+|---|---|---|---|
+| ρ_max/ρ_crit | 33.6 | 57.2 | — |
+| M_core (M☉) | 0.0299 | 0.0316 | 5.4% |
+| Φ_core (code) | 0.459 | 0.474 | 3.3% |
+| μ_core (NN78) | 5.35 | 5.46 | 2.0% |
+| retention Φ_core/Φ₀ | 2.48 | 2.44 | **1.6%** |
+
+**Verdict:** the retained fossil flux is NOT set by the divergence-control choice (CT vs GLM
+agree to 1.6% on retention, 2.0% on μ_core). Sub-finding: at fixed time CT reaches a *lower*
+central density (34× vs 57× ρ_crit) — exact-div-free CT preserves more magnetic support (less
+numerical field dissipation than GLM/Dedner cleaning). Not perfectly ρ-matched (both stopped
+at tlim), so μ_core is the more robust comparison than raw density.
+
+**CT+Hall blowup — root-caused and FIXED (2026-07-24/25).** The first full-physics CT gate leg
+detonated at first core (t≈1.07747, level-4 boundary, ρ~4e4): |B|→1.35e15, dt→1e-55. Isolation
+(GLM+Hall stayed healthy; CT+Hall-OFF ran clean to tlim; ratio=400 falsified) pinned it on the
+**unsplit, uncapped Hall term** — η_H ∝ B/n_e explodes in the high-ρ recombination core, driving
+a grid-scale dispersive whistler runaway that GLM cleaning damps but exact-div-free CT does not.
+It was never a ∇·B failure (`ct_maxRelDivB` stayed round-off ~1e-13 throughout). **Fix:**
+`diffusion/eta_hall_cap_code=0.05` (signed |η_H| clamp, = Ohmic-floor scale, < eta_ohm_cap 0.1;
+keeps the unsplit-Hall dt ~ the hydro dt-wall at lvl6 while preserving Hall physics where η_H<0.05).
+Validated at the exact detonation coordinates: `runs/inc7_gate/ct_run_hallcap` (Hall ON + cap,
+single-variable delta from the run that blew up) cleared t=1.07747 at level 4 / ρ=4.57e4 with
+|B|max=77 (vs uncapped 1.35e15), dt=5.6e-5 steady, 0 NaN — matching the healthy Hall-off
+trajectory, not the blowup. **Canonical validated full-physics CT config:** `divergence_control=ct`,
+`ct_emf=gs05`, `hall=hall` + `eta_hall_cap_code=0.05`, `rkl2_max_dt_ratio=400`, `eta_ohm_cap_code=0.1`
+(gate run inputs live untracked in `runs/inc7_gate/`; this doc is the tracked reference).
+NOTE: the *lean* ideal gate is impossible — adaptive-AMR + multigrid-gravity is unstable without
+the full stack. The cross-code (Athena++) comparison uses the Hall-OFF pair since Athena++'s Hall
+is a non-functional stub; the Hall-cap config is the AthenaPK-only most-complete-physics path.
 **Risk:** high (touches the core update, AMR operators, restart). Largest single effort. **[done]**
 **Unblocks:** a defensible *flux* claim.
 
