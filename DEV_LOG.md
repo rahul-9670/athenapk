@@ -1450,3 +1450,62 @@ the Hall-OFF pair (Athena++ Hall is a stub); Hall-cap is the AthenaPK-only most-
 Canonical validated CT config: divergence_control=ct, ct_emf=gs05, hall=hall+eta_hall_cap_code=0.05,
 rkl2_max_dt_ratio=400, eta_ohm_cap_code=0.1. Gate inputs untracked (runs/inc7_gate/); FLAGSHIP
 Phase-2 section is the tracked reference. **Phase 2 CT COMPLETE.** prod_v9 stays HELD (STOP_CHAIN).
+
+## 2026-07-25 — PHASE 3 COMPLETE: grain conductivity gate (2 defects found+fixed) + EOS resolved
+**Conductivity (remaining Phase-3 item) DONE — and it caught two real bugs.** Built the
+grain-INCLUSIVE cross-check by reimplementing the MRN grain-charge model in Python with a
+deliberately different algorithm: the per-bin capture balance n_e v_e e^psi = n_i v_i (1-psi)
+has NO bin dependence (the pi a^2 cross-sections cancel between e and i), so psi is a single
+global unknown, Z_k = psi tau_k, r = n_e/n_i is an explicit function of psi, and the coupled
+system collapses to a 1-D bracketed root find — vs the C++ relaxed fixed point + inner Newton.
+`xcheck_conductivity.cpp` extended to dump the charge state (n_e, n_i, Z_k, ng_k), not just eta.
+
+DEFECT 1 — `SolveCharges` does not converge once grains dominate the charge budget. Provable
+from the C++ output ALONE (no Python needed): its own neutrality constraint n_i - n_e =
+sum(-Z_k ng_k) is violated by up to **3.6e7** relative, and it returns n_e > n_i, which is
+impossible with negatively charged grains. Onset ~rho 1e-14 (T=300) / 1e-12 (all T<T_subl),
+worsening with grain density. FIX: the exact reduction above -> bracketed bisection in psi that
+cannot fail to converge. Neutrality residual **3.6e7 -> 4.2e-11**.
+
+DEFECT 2 — `SahaThermal` bisects [0, n_K+n_H] with a FIXED 64 steps, so its resolution floor is
+(n_K+n_H)/2^64. In cold gas, where true thermal ionization underflows, it returns ~1.2e-4
+electrons instead of ~1e-43: a spurious electron floor x_e ~ 9e-20, ~9x the intended xe_floor,
+scaling with density so it can dominate the real n_e in the dense core. It exactly accounted for
+the last 3.4% of the cross-check residual. FIX: relative-precision Newton from the
+weak-ionization limit n_e ~ sqrt(n_K fK + n_H fH).
+
+Both gated by `diffusion/ion_legacy_charge_solver` (default false = fixed). FINAL AGREEMENT
+C++ vs independent Python: n_e/n_i/Z_k and eta_O to **5e-11**; eta_H 4.2e-4, eta_A 2.9e-3 —
+cancellation-limited (sigma_H's net is ~1e-13 of its summed |term| magnitude near the
+grain-induced Hall sign reversal; at that point eta_H is 5 decades BELOW eta_O) and well inside
+the Phase-3 <1% criterion. All 8 gates PASS.
+
+PRODUCTION IMPACT (impact_charge_solver_fix.cpp, fiducial collapse track): **0.0% for
+rho <= 1e-13** — the entire pre-first-core collapse — and 0.0% again for rho >= 1e-9 where
+grains have sublimated. It matters ONLY in the grain-dominated first-core band rho ~ 1e-12..1e-10:
+eta_O up to +375%, eta_A up to 52%, and **eta_H CHANGES SIGN** (1e-11: -3.4e16 -> +8.2e17;
+1e-10: -1.0e13 -> +3.1e15). The Hall sign sets the DIRECTION of field transport, so this is a
+physics-level correction. Needs a GPU rebuild to reach production. CAVEAT on the just-committed
+Phase-2 flux gate: its deepest snapshots (rho_max 3.4e-12 / 5.7e-12 g/cm^3) sit inside the
+affected band, so the ABSOLUTE retention 2.48/2.44 may shift slightly on re-baseline; the
+CT-vs-GLM COMPARISON is unaffected (both legs used identical microphysics).
+
+**EOS hi-res table RESOLVED.** The deferral reason (result-changing + table read at RUNTIME by
+live jobs) is void: `hydro/eos_table_file` is an INPUT KEY, so adoption needs no file overwrite
+and no code change. Verified: `eos_table_hires.bin` (400x1000x920) passes ALL consistency gates
+and is loader-compatible as-is — the header is self-describing (nr,ne,nT), the domain spans are
+identical to shipped, the finer grids are still uniform in log (the device bilin's assumption),
+and the size is byte-exact (12,544,072 = 72 + 8*(nr*ne*3 + nr*nT)). Measured side by side:
+P vs Saha median/max = 0.68%/6.68% (shipped) -> 0.16%/0.55% (hi-res); cs2 vs isentrope
+0.85%/17.8% -> 0.16%/3.31%. So 12x better on P, 5.4x on cs2, at the H2-dissociation/H-ionization
+kinks that set first/second-core thermodynamics. Adoption = one input line
+`<hydro> eos_table_file=.../eos_table_hires.bin`; default stays the shipped table so a clean
+checkout always runs. Did NOT overwrite eos_table.bin (git-tracked AND being read right now by
+the live ct_hallcap job). The non-uniform-grid idea is CLOSED on cost/benefit: it would require
+replacing the even-log-grid assumption in the EOS hot path with a per-axis search to buy only
+the last cusp point (cs2 median is already 0.16%).
+VERIFICATIONS this session: (a) CPU build of the charge-solver fix under REAL Kokkos PASSED
+(make -C build_cpu athenaPK, RC=0, no errors) — the fix is not merely host-shim-compilable;
+(b) hi-res EOS regeneration is bit-for-bit reproducible (md5 6b8e3999eca19806d8f4d43054e0447c).
+NOT done (needs user go, both result-changing): the GPU rebuild that carries the charge-solver
+fix into production, and the production EOS input-key swap. prod_v9 remains HELD.

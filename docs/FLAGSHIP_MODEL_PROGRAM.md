@@ -151,7 +151,61 @@ is a non-functional stub; the Hall-cap config is the AthenaPK-only most-complete
 **Risk:** high (touches the core update, AMR operators, restart). Largest single effort. **[done]**
 **Unblocks:** a defensible *flux* claim.
 
-## Phase 3 — Microphysics: EOS + conductivity (audit Workstreams A.1, A.2, D.2) — **STARTED (2026-07-23)**
+## Phase 3 — Microphysics: EOS + conductivity (audit Workstreams A.1, A.2, D.2) — **COMPLETE (2026-07-25)**
+
+**Closing summary (2026-07-25).** Both remaining items are resolved and the Phase-3 gate
+("EOS round-trips + entropy-along-adiabat to tolerance; conductivities vs an independent
+solver <1% off sign changes; charge neutrality + element conservation to roundoff") is MET.
+
+*Conductivity — grain-inclusive cross-check DONE, and it found two real defects.* The MRN
+grain-charge model is now reimplemented independently in Python
+(`tests/test_conductivity.py` gates 6–8) via a genuinely different algorithm: the per-bin
+capture balance has no bin dependence (the πa² cross-sections cancel between electrons and
+ions), so ψ is one global unknown, Z_k = ψ τ_k, and the system reduces to a 1-D bracketed
+root find in r = n_e/n_i — versus the C++ relaxed fixed point. It immediately exposed two
+defects, both provable from the C++ output alone:
+1. **`SolveCharges` did not converge** once grains dominate (ρ ≳ 1e-12): its output violated
+   its own neutrality constraint n_i − n_e = Σ(−Z_k ng_k) by up to **3.6e7**, and returned
+   n_e > n_i (impossible with negative grains). Fixed by the exact reduction above →
+   bracketed bisection that cannot fail; neutrality residual **3.6e7 → 4.2e-11**.
+2. **`SahaThermal` had an absolute-resolution floor**: fixed 64-step bisection on
+   [0, n_K+n_H] ⇒ it cannot resolve below (n_K+n_H)/2⁶⁴ and returned ~1e-4 electrons in cold
+   gas where the true value underflows — a spurious floor x_e ≈ 9e-20 (~9× the intended
+   `xe_floor`) that grows with density. Fixed by relative-precision Newton from the
+   weak-ionization limit.
+Both behind `diffusion/ion_legacy_charge_solver` (default false = fixed). Final agreement
+C++ vs independent Python: charge state and η_O to **5e-11**; η_H 4.2e-4 and η_A 2.9e-3,
+cancellation-limited (σ_H's net is ~1e-13 of its summed |term| magnitude near the
+grain-induced Hall sign reversal) and well inside the <1% criterion. **Result-changing but
+narrow:** identical (0.0%) for ρ ≤ 1e-13 (the entire pre-first-core collapse) and again for
+ρ ≥ 1e-9 (grains sublimated); it matters only in the grain-dominated first-core band
+ρ ~ 1e-12…1e-10, where η_O shifts by up to 375% and **η_H changes sign** — a physics-level
+correction, since the Hall sign sets the direction of field transport. Reproduce with
+`tests/impact_charge_solver_fix.cpp`. **Reaches production on the next GPU rebuild.**
+
+*EOS — hi-res table RESOLVED (swap is an input key, no code change).* Verified 2026-07-25:
+`eos_table_hires.bin` (400×1000×920) passes ALL consistency gates and is **loader-compatible
+without any C++ change** — the binary header is self-describing (nr, ne, nT) and the hi-res
+file spans the identical (log ρ, log esp, log T) domain on finer *uniform* log grids, with
+byte-exact layout (12 544 072 B = 72 + 8·(nr·ne·3 + nr·nT)). Measured side by side:
+
+| table | P vs Saha (median / max) | cs² vs isentrope (median / max) |
+|---|---|---|
+| shipped 180×220×200 | 0.68% / **6.68%** | 0.85% / **17.8%** |
+| hi-res 400×1000×920 | 0.16% / **0.55%** | 0.16% / **3.31%** |
+
+⇒ 12× better on P, 5.4× better on cs², both at the H₂-dissociation / H-ionization kinks that
+set first/second-core thermodynamics. **Adoption = one input line**,
+`<hydro> eos_table_file=…/src/eos/eos_table_hires.bin` (default stays the shipped table so a
+clean checkout always runs; the hi-res file is gitignored but regeneration was VERIFIED
+bit-for-bit — `gen_eos_table.py build 400 1000 920 <out>.h5` reproduces md5
+`6b8e3999eca19806d8f4d43054e0447c`). Deliberately NOT overwriting
+`eos_table.bin`: it is git-tracked and read at RUNTIME by live jobs. The remaining
+*non-uniform* grid idea is CLOSED on cost/benefit — it would require replacing the device
+bilinear's even-log-grid assumption with a per-axis search in the EOS hot path, to buy only
+the last cusp point (cs² median is already 0.16%).
+
+### Original survey and increments (2026-07-23/24)
 
 **Survey (evidence-first, 2026-07-23):** the core machinery already exists — a tabulated
 **multi-Saha** EOS (`src/eos/eos_table.hpp` + `gen_eos_table.py`: H₂ dissociation, H & He/He⁺
