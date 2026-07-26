@@ -23,6 +23,7 @@
 
 #include "../main.hpp"
 #include "../hydro/ct/ct.hpp" // Constrained Transport face field (Phase 2)
+#include "../radiation/radiation_groups.hpp" // multigroup LTE seeding (GroupFieldNames)
 #include "../units.hpp" // canonical Heaviside-Lorentz magnetic-unit definition (audit #3)
 #include "../units/be_normalization.hpp" // Phase 1: shared BE base-scale derivation
 #include "../units/physical_units.hpp"   // Phase 1: authoritative units (consistency guard)
@@ -505,10 +506,21 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   if (pmb->packages.AllPackages().count("radiation") > 0) {
     auto rad_pkg = pmb->packages.Get("radiation");
     const Real arad = rad_pkg->Param<Real>("arad");
-    auto Er = data->Get("rad.Er").data.GetHostMirrorAndCopy();
-    auto Fx = data->Get("rad.Fr1").data.GetHostMirrorAndCopy();
-    auto Fy = data->Get("rad.Fr2").data.GetHostMirrorAndCopy();
-    auto Fz = data->Get("rad.Fr3").data.GetHostMirrorAndCopy();
+    // Multigroup: seed EACH group in LTE, Er_g = arad*T^4 * PlanckFraction(g,T), Fr_g = 0.
+    // For n_group=1 PlanckFraction(0)=1 => Er_0 = arad*T^4 (bit-identical to the gray seed).
+    // Parthenon does not zero-init Independent fields, so the group>0 fields MUST be seeded
+    // here or the first multigroup step reads garbage.
+    const int n_group = rad_pkg->Param<int>("n_group");
+    const Real T_unit = rad_pkg->Param<Real>("T_unit");
+    const Radiation::RadGroups groups = rad_pkg->Param<Radiation::RadGroups>("groups");
+    std::vector<decltype(data->Get("rad.Er").data.GetHostMirrorAndCopy())> gEr, gFx, gFy, gFz;
+    for (int g = 0; g < n_group; ++g) {
+      const auto nm = Radiation::GroupFieldNames(g);
+      gEr.push_back(data->Get(nm[0]).data.GetHostMirrorAndCopy());
+      gFx.push_back(data->Get(nm[1]).data.GetHostMirrorAndCopy());
+      gFy.push_back(data->Get(nm[2]).data.GetHostMirrorAndCopy());
+      gFz.push_back(data->Get(nm[3]).data.GetHostMirrorAndCopy());
+    }
     for (int k = kb.s; k <= kb.e; ++k) {
       for (int j = jb.s; j <= jb.e; ++j) {
         for (int i = ib.s; i <= ib.e; ++i) {
@@ -524,17 +536,23 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
           // T_code (= 1 at the 10 K IC). For the tabulated EOS the ideal relation p/rho
           // does not hold; the BE-sphere IC is isothermal at 10 K everywhere => T_code=1.
           const Real T   = use_h2diss ? 1.0 : p / rho;
-          Er(0, k, j, i) = arad * T * T * T * T;
-          Fx(0, k, j, i) = 0.0;
-          Fy(0, k, j, i) = 0.0;
-          Fz(0, k, j, i) = 0.0;
+          const Real Beq = arad * T * T * T * T;
+          for (int g = 0; g < n_group; ++g) {
+            gEr[g](0, k, j, i) = Beq * groups.PlanckFraction(g, T * T_unit);
+            gFx[g](0, k, j, i) = 0.0;
+            gFy[g](0, k, j, i) = 0.0;
+            gFz[g](0, k, j, i) = 0.0;
+          }
         }
       }
     }
-    data->Get("rad.Er").data.DeepCopy(Er);
-    data->Get("rad.Fr1").data.DeepCopy(Fx);
-    data->Get("rad.Fr2").data.DeepCopy(Fy);
-    data->Get("rad.Fr3").data.DeepCopy(Fz);
+    for (int g = 0; g < n_group; ++g) {
+      const auto nm = Radiation::GroupFieldNames(g);
+      data->Get(nm[0]).data.DeepCopy(gEr[g]);
+      data->Get(nm[1]).data.DeepCopy(gFx[g]);
+      data->Get(nm[2]).data.DeepCopy(gFy[g]);
+      data->Get(nm[3]).data.DeepCopy(gFz[g]);
+    }
   }
 
   // ---- Constrained Transport: initialize the face field Bf ----
