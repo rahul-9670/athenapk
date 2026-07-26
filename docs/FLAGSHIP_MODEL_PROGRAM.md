@@ -388,6 +388,15 @@ with ≥1 independent RMHD non-ideal code; blinded analysis.
 **Gate:** primary observables converge <5% (or credible extrapolation) between the two finest
 resolutions; ensemble scatter quantified; two-code agreement within combined uncertainty.
 
+**Convergence machinery DONE (2026-07-26):** `runs/convergence.py` (harness) + `runs/
+convergence_ladder/` (parameterized njeans={4,8,16} launcher + workflow README). Compares the
+primary flux observables (mu_core=M_core/Phi_core, M_core, Phi_core, peak|B|) at matched PHYSICAL
+STATE (matched rho_max, not time — reusing flux_retention.measure_snapshot), reports pairwise %diff
+between the two finest + resolution-reach ("how far we can push"). Harness logic unit-tested
+(recovers an injected 3% offset exactly). **Running the ladder is the compute step** (3 chained
+campaigns to a matched 1e-13 first-core epoch), gated on GPU availability + user go — deferred with
+the ensemble/UQ (Phase-3 plan: validate + know limits first, ensemble last).
+
 ## Phase 8 — Protostar & observational connection (audit G, L)
 
 Continue through second-core accretion to a physically-defined protostellar surface (couple a
