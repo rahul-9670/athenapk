@@ -233,15 +233,16 @@ KOKKOS_INLINE_FUNCTION
 Real MGResidual(const Real Tt, const Real rho, const Real kdust, const Real arad,
                 const Real chat, const Real c, const Real dt, const Real gm1,
                 const Real T_unit, const bool use_h2, const EOSTable::EosTable &eos_tab,
-                const OpacityParams &op, const RadGroups &groups, const int n_group,
-                const Real *Eg0, const Real e0_ref) {
+                const OpacityParams &op, const RadGroups &groups,
+                const GroupOpacityTable &optab, const int n_group, const Real *Eg0,
+                const Real e0_ref) {
   const Real kP = PlanckOpacity(op, rho, Tt) * kdust; // gray Planck opacity at Tt
   const Real e = use_h2 ? eos_tab.EintFromRhoTk(rho, Tt * T_unit) : rho * Tt / gm1;
   Real S = 0.0;
   const Real T4 = Tt * Tt * Tt * Tt;
   for (int g = 0; g < n_group; ++g) {
     const Real Bg = arad * T4 * groups.PlanckFraction(g, Tt * T_unit);
-    const Real ag = chat * dt * rho * kP * groups.PlanckBandMult(g, Tt * T_unit);
+    const Real ag = chat * dt * rho * kP * optab.PlanckMult(g, Tt * T_unit);
     S += ag * (Eg0[g] - Bg) / (1.0 + ag);
   }
   return (e - e0_ref) - c / chat * S;
@@ -281,6 +282,7 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
   const auto eos_tab = pkg->Param<EOSTable::EosTable>("eos_tab");
   const Real T_unit = pkg->Param<Real>("T_unit");
   const RadGroups groups = pkg->Param<RadGroups>("groups");
+  const GroupOpacityTable optab = pkg->Param<GroupOpacityTable>("optable");
   const int n_group = groups.n_group;
 
   // Pack gas cons + ALL groups' moments.
@@ -364,7 +366,7 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
         for (int it = 0; it < inner_max; ++it) {
           const Real R0 =
               MGResidual(T, rho, kdust, arad, chat, c, dt, gm1, T_unit, use_h2, eos_tab, op,
-                         groups, n_group, Eg0, e0_ref);
+                         groups, optab, n_group, Eg0, e0_ref);
           if (std::abs(R0) / etot <= inner_tol) {
             conv = true;
             break;
@@ -372,7 +374,7 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
           const Real dT = 1.0e-4 * T + 1.0e-12;
           const Real Rp =
               (MGResidual(T + dT, rho, kdust, arad, chat, c, dt, gm1, T_unit, use_h2, eos_tab,
-                          op, groups, n_group, Eg0, e0_ref) -
+                          op, groups, optab, n_group, Eg0, e0_ref) -
                R0) /
               dT;
           Real Tn = T - R0 / (Rp + RadFuzz());
@@ -388,7 +390,7 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
         Real Esum_new = 0.0;
         for (int g = 0; g < n_group; ++g) {
           const Real Bg = arad * T4 * groups.PlanckFraction(g, T * T_unit);
-          const Real ag = chat * dt * rho * kP * groups.PlanckBandMult(g, T * T_unit);
+          const Real ag = chat * dt * rho * kP * optab.PlanckMult(g, T * T_unit);
           Egn[g] = std::max((Eg0[g] + ag * Bg) / (1.0 + ag), efloor);
           Esum_new += Egn[g];
         }
@@ -401,7 +403,7 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
         const Real kR = RosselandOpacity(op, rho, T) * kdust;
         const Real ks = ScatteringOpacity(op, rho, T);
         for (int g = 0; g < n_group; ++g) {
-          const Real ag = chat * dt * rho * (kR * groups.RossBandMult(g, T * T_unit) + ks);
+          const Real ag = chat * dt * rho * (kR * optab.RossMult(g, T * T_unit) + ks);
           const Real fac = -ag / (1.0 + ag);
           dFx[g] = fac * Fxg0[g];
           dFy[g] = fac * Fyg0[g];

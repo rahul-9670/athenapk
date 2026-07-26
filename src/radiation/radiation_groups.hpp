@@ -22,10 +22,12 @@
 
 #include <Kokkos_Core.hpp>
 
-#include <basic_types.hpp> // parthenon::Real
+#include <basic_types.hpp>      // parthenon::Real
+#include <parthenon_arrays.hpp> // parthenon::ParArray2D (device tables)
 
 namespace Radiation {
 
+using parthenon::ParArray2D;
 using parthenon::Real;
 
 // Max compile-time group count (POD-friendly; N_GROUP=1 default keeps the gray path).
@@ -179,6 +181,65 @@ inline void FillGroupOpacity(RadGroups &g, const Real beta) {
               PlanckMoment(3.0, 1.0e-8, X, 4000);
   g.cR_full = RossMoment(4.0, 1.0e-8, X, 4000) /
               RossMoment(4.0 - beta, 1.0e-8, X, 4000);
+}
+
+//----------------------------------------------------------------------------------------
+//! Tabulated per-group opacity multipliers vs matter temperature. The band means
+//! (RadGroups::PlanckBandMult/RossBandMult) are a per-cell Simpson quadrature -- fine for the
+//! validation runs, but a real cost in a production 3D collapse. This precomputes them on a
+//! log10(T[K]) grid once at init and does an O(1) linear interpolation on device (the same
+//! by-value-Views-into-kernel pattern as EosTable). active_=false (beta=0 or gray) => mult=1,
+//! bit-identical to the gray-per-group / on-the-fly beta=0 path.
+struct GroupOpacityTable {
+  ParArray2D<Real> wP_, wR_; // [n_group][nT] Planck- and Rosseland-mean multipliers
+  Real lT0_ = 0.0, dlT_ = 1.0; // log10(T[K]) grid origin + spacing
+  int ng_ = 1, nT_ = 0;
+  bool active_ = false;
+
+  KOKKOS_INLINE_FUNCTION
+  Real Lookup(const ParArray2D<Real> &W, const int g, const Real Tk) const {
+    if (!active_) return 1.0;
+    Real f = (std::log10(Tk) - lT0_) / dlT_;
+    int i = static_cast<int>(f);
+    if (i < 0) i = 0;
+    if (i > nT_ - 2) i = nT_ - 2;
+    Real t = f - i;
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    return (1.0 - t) * W(g, i) + t * W(g, i + 1);
+  }
+  KOKKOS_INLINE_FUNCTION Real PlanckMult(const int g, const Real Tk) const {
+    return Lookup(wP_, g, Tk);
+  }
+  KOKKOS_INLINE_FUNCTION Real RossMult(const int g, const Real Tk) const {
+    return Lookup(wR_, g, Tk);
+  }
+};
+
+//! Build the tabulated multipliers from the (validated) on-the-fly band means over
+//! [Tmin,Tmax] K, log-spaced with nT points. beta=0 / gray => inactive (mult==1).
+inline GroupOpacityTable BuildGroupOpacityTable(const RadGroups &g, const Real Tmin_K,
+                                                const Real Tmax_K, const int nT) {
+  GroupOpacityTable tab;
+  tab.ng_ = g.n_group;
+  tab.nT_ = nT;
+  if (g.n_group == 1 || g.beta == 0.0) return tab; // inactive => Lookup returns 1
+  tab.active_ = true;
+  tab.lT0_ = std::log10(Tmin_K);
+  tab.dlT_ = (std::log10(Tmax_K) - tab.lT0_) / (nT - 1);
+  tab.wP_ = ParArray2D<Real>("rad_wP", g.n_group, nT);
+  tab.wR_ = ParArray2D<Real>("rad_wR", g.n_group, nT);
+  auto hP = Kokkos::create_mirror_view(tab.wP_);
+  auto hR = Kokkos::create_mirror_view(tab.wR_);
+  for (int ig = 0; ig < g.n_group; ++ig)
+    for (int it = 0; it < nT; ++it) {
+      const Real Tk = std::pow(10.0, tab.lT0_ + it * tab.dlT_);
+      hP(ig, it) = g.PlanckBandMult(ig, Tk);
+      hR(ig, it) = g.RossBandMult(ig, Tk);
+    }
+  Kokkos::deep_copy(tab.wP_, hP);
+  Kokkos::deep_copy(tab.wR_, hR);
+  return tab;
 }
 
 //----------------------------------------------------------------------------------------

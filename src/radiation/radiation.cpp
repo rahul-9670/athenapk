@@ -167,6 +167,13 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   pkg->AddParam("groups", groups);
   pkg->AddParam("n_group", n_group);
   pkg->AddParam("opacity_beta", opacity_beta);
+  // Precompute the per-group band-mean multipliers on a log(T) grid (device table) so the
+  // matter coupling does an O(1) interpolation instead of a per-cell Simpson quadrature.
+  // Inactive (multiplier == 1) for gray/beta=0, so the equivalence gate is untouched.
+  const int op_nT = pin->GetOrAddInteger(bn, "opacity_table_nT", 256);
+  const Real op_Tmin = pin->GetOrAddReal(bn, "opacity_table_Tmin_K", 3.0);
+  const Real op_Tmax = pin->GetOrAddReal(bn, "opacity_table_Tmax_K", 1.0e6);
+  pkg->AddParam("optable", BuildGroupOpacityTable(groups, op_Tmin, op_Tmax, op_nT));
 
   // --- Transport controls (increment 2b) -------------------------------------
   pkg->AddParam("cfl", pin->GetOrAddReal(bn, "cfl", 0.4));       // radiation CFL number
