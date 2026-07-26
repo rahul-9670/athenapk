@@ -277,6 +277,7 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
   const Real efloor = pkg->Param<Real>("efloor");
   const int inner_max = pkg->Param<int>("inner_iteration_max");
   const Real inner_tol = pkg->Param<Real>("inner_iteration_tol");
+  const Real coupling_tmax = pkg->Param<Real>("coupling_tmax"); // rtsafe upper bracket (code T)
   const Real Bfloor = arad * tfloor * tfloor * tfloor * tfloor;
   const bool use_h2 = pkg->Param<bool>("use_h2diss");
   const auto eos_tab = pkg->Param<EOSTable::EosTable>("eos_tab");
@@ -360,27 +361,53 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
         }
         const Real etot = e0_ref + c / chat * Esum0 + RadFuzz();
 
-        // Newton on T with a numerical derivative (robust to the tabulated EOS + Planck
-        // fractions). MGResidual eliminates the groups analytically. Clamp T >= tfloor.
+        // Solve MGResidual(T) = 0 by SAFEGUARDED Newton+bisection (rtsafe, NR). The residual is
+        // MONOTONICALLY INCREASING in T (both e(T) and the emission a_R T^4 rise with T), so a
+        // bracketed method is guaranteed to converge and can NEVER write garbage. The plain
+        // numerical-derivative Newton previously here overshot near the tabulated-EOS e(T) kinks
+        // (H2 dissociation / H ionization) at collapse onset -> non-convergence -> NaN blowup.
+        auto Rof = [&](const Real Tt) {
+          return MGResidual(Tt, rho, kdust, arad, chat, c, dt, gm1, T_unit, use_h2, eos_tab, op,
+                            groups, optab, n_group, Eg0, e0_ref);
+        };
+        // Bracket [Tlo, Thi]. Thi capped inside the tabulated EOS/opacity range (Tmax_table).
+        Real Tlo = tfloor;
+        Real Thi = coupling_tmax; // code T; opacity/EOS-table Tmax (stay in range)
+        if (Thi <= Tlo) Thi = 1.0e5; // fallback (ideal EOS: no table cap)
+        Real flo = Rof(Tlo), fhi = Rof(Thi);
         bool conv = false;
-        for (int it = 0; it < inner_max; ++it) {
-          const Real R0 =
-              MGResidual(T, rho, kdust, arad, chat, c, dt, gm1, T_unit, use_h2, eos_tab, op,
-                         groups, optab, n_group, Eg0, e0_ref);
-          if (std::abs(R0) / etot <= inner_tol) {
-            conv = true;
-            break;
+        if (flo >= 0.0) {            // root at/below floor: gas cools to tfloor
+          T = Tlo; conv = true;
+        } else if (fhi <= 0.0) {     // root above table cap: clamp (unphysical; safe)
+          T = Thi; conv = true;
+        } else {
+          // rtsafe: orient so f(Tlo)<0<f(Thi); Newton step if in-bracket & decreasing, else bisect.
+          T = 0.5 * (Tlo + Thi);
+          Real dTold = Thi - Tlo, dTstep = dTold;
+          Real f = Rof(T);
+          for (int it = 0; it < inner_max; ++it) {
+            const Real dT = 1.0e-4 * T + 1.0e-12;
+            const Real df = (Rof(T + dT) - f) / dT; // numerical derivative (monotone => df>0)
+            // bisect if Newton would leave the bracket or converge too slowly
+            if (((T - Thi) * df - f) * ((T - Tlo) * df - f) > 0.0 ||
+                std::abs(2.0 * f) > std::abs(dTold * df)) {
+              dTold = dTstep;
+              dTstep = 0.5 * (Thi - Tlo);
+              T = Tlo + dTstep;
+            } else {
+              dTold = dTstep;
+              dTstep = f / (df + RadFuzz());
+              T = T - dTstep;
+            }
+            if (std::abs(dTstep) < inner_tol * T || std::abs(f) / etot <= inner_tol) {
+              conv = true;
+              break;
+            }
+            f = Rof(T);
+            if (f < 0.0) { Tlo = T; } else { Thi = T; } // maintain the bracket
           }
-          const Real dT = 1.0e-4 * T + 1.0e-12;
-          const Real Rp =
-              (MGResidual(T + dT, rho, kdust, arad, chat, c, dt, gm1, T_unit, use_h2, eos_tab,
-                          op, groups, optab, n_group, Eg0, e0_ref) -
-               R0) /
-              dT;
-          Real Tn = T - R0 / (Rp + RadFuzz());
-          if (!(Tn > tfloor)) Tn = 0.5 * (T + tfloor); // guard NaN/undershoot
-          T = Tn;
         }
+        T = std::max(T, tfloor);
         if (!conv) lnfail += 1;
 
         // Converged T -> per-group implicit energies + gas thermal change.

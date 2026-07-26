@@ -240,6 +240,10 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   pkg->AddParam("tfloor", pin->GetOrAddReal(bn, "tfloor_code", 1.0e-3)); // T floor (code)
   pkg->AddParam("inner_iteration_max", pin->GetOrAddInteger(bn, "inner_iteration_max", 100));
   pkg->AddParam("inner_iteration_tol", pin->GetOrAddReal(bn, "inner_iteration_tol", 1.0e-8));
+  // Upper T bracket for the multigroup coupling rtsafe solve (code T). Default = the opacity/EOS
+  // table Tmax (stay in range); overridable. Ideal-EOS runs (no table) use a large fixed cap.
+  pkg->AddParam("coupling_tmax",
+                pin->GetOrAddReal(bn, "coupling_tmax_K", op_Tmax) / T_unit);
 
   // --- Fields: M1 two-moment radiation (Er, Fr1, Fr2, Fr3) -------------------
   // Independent (evolved state: communicated, refined, checkpointed) + WithFluxes (our
