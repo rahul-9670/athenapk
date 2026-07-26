@@ -109,16 +109,6 @@ struct RadGroups {
   // group frequency edges [Hz], size n_group+1; nu_edge[0]=0, nu_edge[n_group]=+inf (HUGE).
   Real nu_edge[MAX_GROUP + 1] = {0.0};
   Real h_over_k = 4.799243e-11; // h/k_B [s*K]  (Planck const / Boltzmann)
-  // Monochromatic dust opacity spectral index: kappa_nu(rho,T) = kappa_gray(rho,T) * phi(nu),
-  // phi(nu) = (nu/nu_ref)^beta, normalized so the FULL-SPECTRUM Planck (resp. Rosseland) mean
-  // of kappa_nu equals kappa_gray. Then the per-group Planck/Rosseland means are the band-limited
-  // averages below. beta=0 => phi=1 => every group mean == kappa_gray (gray-per-group; the
-  // equivalence gate holds exactly). Filled by FillGroupOpacity (host, at package init).
-  Real beta = 0.0;
-  Real cP_full = 1.0; // full-band Planck normalization  I_{3+beta}(0,inf)/I_3(0,inf)
-  Real cR_full = 1.0; // full-band Rosseland normalization J_4(0,inf)/J_{4-beta}(0,inf)
-  int qpts = 64;      // Simpson panels per band moment
-  Real nquad_hi = 60.0; // integrate at most x_lo+60 in each band (weight ~ e^-x beyond => lost part negligible)
 
   //! Equilibrium Planck energy fraction in group g at matter temperature T [K].
   //! sum_g PlanckFraction(g,T) == 1 exactly (edges span [0,inf)).
@@ -128,68 +118,94 @@ struct RadGroups {
     const Real xhi = (g == n_group - 1) ? 1.0e30 : h_over_k * nu_edge[g + 1] / T;
     return PlanckCumFraction(xhi) - PlanckCumFraction(xlo);
   }
+};
 
-  //! group g's band edges in x = h*nu/(k*T) at matter temperature Tk [K]. The upper edge is
-  //! capped at x_lo + nquad_hi so the fixed-panel Simpson keeps its resolution where the weight
-  //! lives (the integrand decays like e^-x, so a very wide band [x_lo, x_hi>>x_lo] would waste
-  //! all panels on the negligible tail and misestimate the ratio). The lost tail is ~e^-nquad_hi.
-  KOKKOS_INLINE_FUNCTION void BandX(const int g, const Real Tk, Real &a, Real &b) const {
-    a = h_over_k * nu_edge[g] / Tk;
-    const Real bphys = (g == n_group - 1) ? (a + nquad_hi) : h_over_k * nu_edge[g + 1] / Tk;
-    b = (bphys < a + nquad_hi) ? bphys : (a + nquad_hi);
+//----------------------------------------------------------------------------------------
+//! Semenov-class monochromatic dust+gas opacity SHAPE phi(nu,T): the frequency dependence of
+//! kappa_nu(rho,T) = kappa_gray(rho,T) * phi(nu,T), where kappa_gray is the existing gray
+//! Bell&Lin/dust law (which already carries the rho,T magnitude AND the sublimation drop). phi
+//! only redistributes that magnitude across frequency, normalized (by the ratio anchoring in the
+//! table build) so the full-spectrum Planck/Rosseland means of kappa_nu equal kappa_gray exactly.
+//!
+//! Physics captured (protostellar dust, Semenov et al. 2003 / Draine grain emissivity):
+//!  - Dust emissivity rises as nu^beta in the far-IR (Q_abs ~ nu^beta, beta~1.5-2 for
+//!    silicate/carbon+ice aggregates) and FLATTENS to the geometric (gray) limit above a
+//!    grain-size break nu_break (lambda ~ 2*pi*a ~ few micron => nu_break ~ 1e14 Hz).
+//!  - Above dust sublimation (~1500 K) grains are destroyed: the opacity becomes gas-dominated
+//!    (molecular / H- / Kramers continuum), taken here as ~gray (phi -> 1). survival(T) ramps
+//!    the dust frequency structure off across [T_sub_lo, T_sub_hi].
+//! beta=0 => phi==1 everywhere => gray-per-group (equivalence gate exact).
+struct DustOpacityModel {
+  Real beta = 0.0;             // far-IR dust emissivity index (0 => gray)
+  Real nu_break_hz = 1.0e14;   // grain-size turnover: Q_abs flattens to gray above this
+  Real T_sub_lo = 1400.0;      // dust sublimation ramp start [K]
+  Real T_sub_hi = 1600.0;      // dust sublimation ramp end   [K] (phi->1, gray gas)
+  Real h_over_k = 4.799243e-11;
+
+  //! Dust survival fraction (1 cold, 0 above sublimation).
+  Real survival(const Real Tk) const {
+    if (Tk <= T_sub_lo) return 1.0;
+    if (Tk >= T_sub_hi) return 0.0;
+    return (T_sub_hi - Tk) / (T_sub_hi - T_sub_lo);
   }
-
-  //! PLANCK-mean opacity multiplier for group g at matter temperature Tk [K]:
-  //!   kappa_P,g / kappa_gray = [ Int_g x^{3+beta}/(e^x-1) dx / Int_g x^3/(e^x-1) dx ] / cP_full.
-  //! Sum-weighted by the group Planck fractions this reproduces the gray Planck emission exactly.
-  KOKKOS_INLINE_FUNCTION Real PlanckBandMult(const int g, const Real Tk) const {
-    if (n_group == 1 || beta == 0.0) return 1.0;
-    Real a, b;
-    BandX(g, Tk, a, b);
-    const Real num = PlanckMoment(3.0 + beta, a, b, qpts);
-    const Real den = PlanckMoment(3.0, a, b, qpts);
-    return (num / (den + 1.0e-300)) / cP_full;
-  }
-
-  //! ROSSELAND-mean opacity multiplier for group g at matter temperature Tk [K]:
-  //!   kappa_R,g / kappa_gray = [ Int_g x^4 w dx / Int_g x^{4-beta} w dx ] / cR_full,
-  //! w = e^x/(e^x-1)^2 (the harmonic/Rosseland average of kappa_nu ~ nu^beta over the band).
-  KOKKOS_INLINE_FUNCTION Real RossBandMult(const int g, const Real Tk) const {
-    if (n_group == 1 || beta == 0.0) return 1.0;
-    Real a, b;
-    BandX(g, Tk, a, b);
-    const Real num = RossMoment(4.0, a, b, qpts);
-    const Real den = RossMoment(4.0 - beta, a, b, qpts);
-    return (num / (den + 1.0e-300)) / cR_full;
+  //! Opacity frequency shape at x = h*nu/(k*T), matter temperature Tk. Host-side (table build).
+  Real phi(const Real x, const Real Tk) const {
+    if (beta == 0.0) return 1.0;
+    const Real S = survival(Tk);
+    const Real xb = h_over_k * nu_break_hz / Tk;         // break in x-units at this T
+    Real psi = std::pow(x / (xb + 1.0e-300), beta);      // nu^beta far-IR rise
+    if (psi > 1.0) psi = 1.0;                            // geometric (gray) limit above break
+    return S * psi + (1.0 - S);                          // dust shape blended toward gray gas
   }
 };
 
 //----------------------------------------------------------------------------------------
-//! Configure the monochromatic-dust opacity model kappa_nu ~ nu^beta on the group structure:
-//! store beta and the full-spectrum normalizations so the band means reduce to kappa_gray when
-//! summed over all frequencies (=> beta=0 is exactly gray-per-group). Host-side, once at init.
-inline void FillGroupOpacity(RadGroups &g, const Real beta) {
-  g.beta = beta;
-  if (beta == 0.0) {
-    g.cP_full = 1.0;
-    g.cR_full = 1.0;
-    return;
-  }
-  // full-band [~0, X] moments (X large enough that the e^-x tail is negligible).
+//! Ratio-anchored per-group Planck & Rosseland opacity multipliers at matter temperature Tk:
+//!   mult_P,g = <phi>_{Planck,band g} / <phi>_{Planck,full}       (=> sum_g mult_P,g*frac_g = 1)
+//!   mult_R,g = <1/phi>_{Ross,full}  / <1/phi>_{Ross,band g}      (harmonic; mult_R,full = 1)
+//! <.>_Planck weights by B_nu (x^3/(e^x-1)); <.>_Ross by dB/dT (x^4 e^x/(e^x-1)^2). The e^{-a}
+//! factor is pulled out of each band ratio (integrand carries e^{a-x}) so deep-Wien bands stay
+//! finite. Host-side, called once per T-grid point in the table build.
+inline void GroupMultsAtT(const DustOpacityModel &m, const RadGroups &g, const Real Tk,
+                          Real *mP, Real *mR) {
+  const int NQ = 240;
   const Real X = 80.0;
-  g.cP_full = PlanckMoment(3.0 + beta, 1.0e-8, X, 4000) /
-              PlanckMoment(3.0, 1.0e-8, X, 4000);
-  g.cR_full = RossMoment(4.0, 1.0e-8, X, 4000) /
-              RossMoment(4.0 - beta, 1.0e-8, X, 4000);
+  // <phi^{inv?}>_weight over [a,b]; weight: 0=Planck (x^3), 1=Rosseland (x^4 * e^x/(e^x-1))
+  auto phimean = [&](Real a, Real b, bool ross, bool inv) -> Real {
+    if (a < 1.0e-8) a = 1.0e-8;
+    if (b <= a) return 1.0;
+    const int n = NQ;
+    const Real h = (b - a) / n;
+    Real num = 0.0, den = 0.0;
+    for (int k = 0; k <= n; ++k) {
+      const Real x = a + k * h;
+      const Real w = (k == 0 || k == n) ? 1.0 : ((k % 2) ? 4.0 : 2.0);
+      const Real ex = std::exp(-x);
+      Real base = std::exp(a - x); // e^{a-x}, common factor pulled out (cancels in the ratio)
+      base *= ross ? (x * x * x * x / ((1.0 - ex) * (1.0 - ex))) : (x * x * x / (1.0 - ex));
+      Real ph = m.phi(x, Tk);
+      if (inv) ph = 1.0 / ph;
+      num += w * ph * base;
+      den += w * base;
+    }
+    return num / (den + 1.0e-300);
+  };
+  const Real phiP_full = phimean(1.0e-8, X, false, false);
+  const Real invphiR_full = phimean(1.0e-8, X, true, true);
+  for (int gi = 0; gi < g.n_group; ++gi) {
+    Real a = g.h_over_k * g.nu_edge[gi] / Tk;
+    Real b = (gi == g.n_group - 1) ? (a + 60.0) : g.h_over_k * g.nu_edge[gi + 1] / Tk;
+    if (b > a + 60.0) b = a + 60.0;
+    mP[gi] = phimean(a, b, false, false) / (phiP_full + 1.0e-300);
+    mR[gi] = invphiR_full / (phimean(a, b, true, true) + 1.0e-300);
+  }
 }
 
 //----------------------------------------------------------------------------------------
-//! Tabulated per-group opacity multipliers vs matter temperature. The band means
-//! (RadGroups::PlanckBandMult/RossBandMult) are a per-cell Simpson quadrature -- fine for the
-//! validation runs, but a real cost in a production 3D collapse. This precomputes them on a
-//! log10(T[K]) grid once at init and does an O(1) linear interpolation on device (the same
-//! by-value-Views-into-kernel pattern as EosTable). active_=false (beta=0 or gray) => mult=1,
-//! bit-identical to the gray-per-group / on-the-fly beta=0 path.
+//! Tabulated per-group opacity multipliers vs matter temperature. The band means are a
+//! per-T Simpson quadrature of the Semenov-class shape phi -- precomputed here on a log10(T[K])
+//! grid once at init and O(1) linear-interpolated on device (the by-value-Views-into-kernel
+//! pattern of EosTable). active_=false (beta=0 or gray) => mult=1, exact gray-per-group.
 struct GroupOpacityTable {
   ParArray2D<Real> wP_, wR_; // [n_group][nT] Planck- and Rosseland-mean multipliers
   Real lT0_ = 0.0, dlT_ = 1.0; // log10(T[K]) grid origin + spacing
@@ -216,14 +232,15 @@ struct GroupOpacityTable {
   }
 };
 
-//! Build the tabulated multipliers from the (validated) on-the-fly band means over
-//! [Tmin,Tmax] K, log-spaced with nT points. beta=0 / gray => inactive (mult==1).
-inline GroupOpacityTable BuildGroupOpacityTable(const RadGroups &g, const Real Tmin_K,
-                                                const Real Tmax_K, const int nT) {
+//! Build the tabulated multipliers from the Semenov-class band means over [Tmin,Tmax] K,
+//! log-spaced with nT points. beta=0 / gray => inactive (mult==1, exact gray equivalence).
+inline GroupOpacityTable BuildGroupOpacityTable(const DustOpacityModel &m, const RadGroups &g,
+                                                const Real Tmin_K, const Real Tmax_K,
+                                                const int nT) {
   GroupOpacityTable tab;
   tab.ng_ = g.n_group;
   tab.nT_ = nT;
-  if (g.n_group == 1 || g.beta == 0.0) return tab; // inactive => Lookup returns 1
+  if (g.n_group == 1 || m.beta == 0.0) return tab; // inactive => Lookup returns 1
   tab.active_ = true;
   tab.lT0_ = std::log10(Tmin_K);
   tab.dlT_ = (std::log10(Tmax_K) - tab.lT0_) / (nT - 1);
@@ -231,12 +248,15 @@ inline GroupOpacityTable BuildGroupOpacityTable(const RadGroups &g, const Real T
   tab.wR_ = ParArray2D<Real>("rad_wR", g.n_group, nT);
   auto hP = Kokkos::create_mirror_view(tab.wP_);
   auto hR = Kokkos::create_mirror_view(tab.wR_);
-  for (int ig = 0; ig < g.n_group; ++ig)
-    for (int it = 0; it < nT; ++it) {
-      const Real Tk = std::pow(10.0, tab.lT0_ + it * tab.dlT_);
-      hP(ig, it) = g.PlanckBandMult(ig, Tk);
-      hR(ig, it) = g.RossBandMult(ig, Tk);
+  Real mP[MAX_GROUP], mR[MAX_GROUP];
+  for (int it = 0; it < nT; ++it) {
+    const Real Tk = std::pow(10.0, tab.lT0_ + it * tab.dlT_);
+    GroupMultsAtT(m, g, Tk, mP, mR);
+    for (int ig = 0; ig < g.n_group; ++ig) {
+      hP(ig, it) = mP[ig];
+      hR(ig, it) = mR[ig];
     }
+  }
   Kokkos::deep_copy(tab.wP_, hP);
   Kokkos::deep_copy(tab.wR_, hR);
   return tab;

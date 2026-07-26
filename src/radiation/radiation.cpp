@@ -162,18 +162,22 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // is the key; `opacity_nu_index` (the earlier representative-frequency exponent) is accepted
   // as a fallback so existing decks keep working.
   const Real beta_fallback = pin->GetOrAddReal(bn, "opacity_nu_index", 0.0);
-  const Real opacity_beta = pin->GetOrAddReal(bn, "opacity_beta", beta_fallback);
-  FillGroupOpacity(groups, opacity_beta);
+  DustOpacityModel dmodel;
+  dmodel.beta = pin->GetOrAddReal(bn, "opacity_beta", beta_fallback);
+  dmodel.nu_break_hz = pin->GetOrAddReal(bn, "opacity_nu_break_hz", 1.0e14);
+  dmodel.T_sub_lo = pin->GetOrAddReal(bn, "opacity_T_sub_lo_K", 1400.0);
+  dmodel.T_sub_hi = pin->GetOrAddReal(bn, "opacity_T_sub_hi_K", 1600.0);
   pkg->AddParam("groups", groups);
   pkg->AddParam("n_group", n_group);
-  pkg->AddParam("opacity_beta", opacity_beta);
-  // Precompute the per-group band-mean multipliers on a log(T) grid (device table) so the
-  // matter coupling does an O(1) interpolation instead of a per-cell Simpson quadrature.
+  pkg->AddParam("opacity_beta", dmodel.beta);
+  pkg->AddParam("dust_opacity_model", dmodel);
+  // Precompute the per-group Semenov-class band-mean multipliers on a log(T) grid (device
+  // table) so the matter coupling does an O(1) interpolation instead of a per-cell quadrature.
   // Inactive (multiplier == 1) for gray/beta=0, so the equivalence gate is untouched.
   const int op_nT = pin->GetOrAddInteger(bn, "opacity_table_nT", 256);
   const Real op_Tmin = pin->GetOrAddReal(bn, "opacity_table_Tmin_K", 3.0);
   const Real op_Tmax = pin->GetOrAddReal(bn, "opacity_table_Tmax_K", 1.0e6);
-  pkg->AddParam("optable", BuildGroupOpacityTable(groups, op_Tmin, op_Tmax, op_nT));
+  pkg->AddParam("optable", BuildGroupOpacityTable(dmodel, groups, op_Tmin, op_Tmax, op_nT));
 
   // --- Transport controls (increment 2b) -------------------------------------
   pkg->AddParam("cfl", pin->GetOrAddReal(bn, "cfl", 0.4));       // radiation CFL number
