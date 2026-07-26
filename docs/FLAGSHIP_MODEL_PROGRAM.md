@@ -264,7 +264,21 @@ model. Published microphysics tables with uncertainty bands.
 independent solver <1% off sign changes; charge neutrality + element conservation to roundoff.
 **Risk:** high. **Unblocks:** trustworthy non-ideal flux loss and collapse thermodynamics.
 
-## Phase 4 — Radiation beyond grey M1 (audit Workstream C) — **BASELINE CHARACTERIZED (2026-07-24)**
+## Phase 4 — Radiation beyond grey M1 (audit Workstream C) — **COMPLETE (2026-07-26): multigroup RHD built + validated + GPU + campaign**
+
+**DONE (2026-07-26, full multigroup RHD):** per-group (Er_g,Fr_g) M1 transport + group-coupled
+implicit matter coupling (single Newton-on-T, GPU-safe) + physical band-mean opacity + the
+state-of-the-art **tabulated dust+gas opacity** (`gen_opacity_table.py` → `opacity_table.bin`;
+self-consistent Planck mean anchored to Bell&Lin, multi-species sublimation). Gates all PASS:
+n_group=1 bit-identical to gray (max|old-new|=0), 3-group free-stream sum==gray 1.7e-14,
+multigroup==gray coupling 7e-11, frequency reddening exp(−τ_g), restart+AMR safe, Er conservation
+EXACT (2.14e-16 incl. AMR reflux), production-config validated (256³, 5×H100), GPU compile clean.
+A bounded 256³ run validated + STOPPED; a **tabulated multigroup campaign to first core is running**
+(`runs/mg_prod_tab/`). Commits 6d378d6..6ee898e. See `runs/validation_rt/MG_MULTIGROUP_RESULT.md`.
+Not done (deferred, needs 2nd core / hybrid): mixed-frame v/c higher-order terms, ray-trace/MC
+hybrid for direct irradiation, formal AP-diffusion limit proof. Original baseline notes below.
+
+### Original baseline (2026-07-24)
 
 **Survey:** the radiation package (`src/radiation/`) is **gray single-group M1** — Er/Fr moments,
 Artemis-ported M1 closure (`radiation_closure.hpp`), explicit HLL transport (`radiation_moments.cpp`),
@@ -312,18 +326,28 @@ validity check.
 **Gate:** free-streaming/shadow/diffusion/radiative-shock benchmarks; grey-vs-multigroup and
 M1-vs-hybrid differences quantified against the flux result. **Depends on:** Phase 3 opacities.
 
-## Phase 5 — Grains & frequency-dependent opacity (audit Workstream B)
+## Phase 5 — Grains & frequency-dependent opacity (audit Workstream B) — **opacity half DELIVERED (2026-07-26)**
 
-Evolve grain size + charge distribution (coagulation/fragmentation/sublimation/ice/charging);
-composition- and size-dependent Planck/Rosseland/flux/energy means from one monochromatic
-dataset. **Feeds:** Phases 3 (grain charge → conductivity) and 4 (opacity).
+**Frequency-dependent opacity DONE:** the tabulated monochromatic dust+gas opacity
+(`gen_opacity_table.py`) with composition/size-motivated Planck & Rosseland band means, multi-
+species sublimation cascade (ice ~150 K, refractory ~1500 K), and a self-consistent Planck mean —
+the "size/composition-dependent means from one monochromatic dataset" deliverable (Phase 4 consumes
+it). WS-4 grain growth (coagulation/fragmentation/sublimation) already exists in `src/dust/`.
+**Remaining:** fully coupling an evolving grain-size/charge distribution INTO the opacity table per
+cell (currently the table is a fixed dust model; the DustFactor consumer scales it). Grain-charge →
+conductivity feed already covered by the MRN Wardle tensor (Phase 3). **Feeds:** 3 (done), 4 (done).
 
-## Phase 6 — Multifluid where single-fluid fails (audit Workstream D.3)
+## Phase 6 — Multifluid where single-fluid fails (audit Workstream D.3) — **GATE DELIVERED (2026-07-26): single-fluid ADEQUATE, multifluid NOT needed**
 
-Diagnose collision frequencies / drift / gyrofrequencies / coupling throughout the run; where
-single-fluid breaks, evolve ions/electrons/charged grains separately or a generalized
-multifluid Ohm law, with drag heating. **Gate:** single-fluid validity map; agreement with
-multifluid where both valid.
+**Single-fluid validity map DONE** (`src/hydro/diffusion/singlefluid_validity.py`, result in
+`docs/PHASE6_SINGLEFLUID_VALIDITY.md`): computed from the deepest FHC snapshot (ρ up to 3.6e-8
+g/cm³, the 2nd-collapse threshold), the ion strong-coupling parameter χ_ion=ν_in/ω_ff = 6.6e6…2e12
+(min ≫ 1) EVERYWHERE ⇒ ion inertia negligible ⇒ **single-fluid non-ideal MHD (the Wardle tensor the
+code already evolves) is adequate through the whole collapse; full multifluid is NOT on the critical
+path.** Self-validated: β_i maps ambipolar→Hall→Ohmic with density (canonical FHC sequence). A
+first pass using ν_ni was FALSIFIED (falsely flagged 80% multifluid — contradicts established AD
+theory; the correct criterion is ν_in). **Remaining (only if a non-fiducial regime demands it):**
+the actual separate-fluid evolution — deprioritized since the map shows it is unnecessary here.
 
 ## Phase 7 — Gravity/dynamics, ICs, ensembles, UQ, cross-code (audit E, F, K, J) — **gravity-BC gate DONE (2026-07-24)**
 
