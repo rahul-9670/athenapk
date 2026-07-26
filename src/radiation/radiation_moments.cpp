@@ -241,7 +241,7 @@ Real MGResidual(const Real Tt, const Real rho, const Real kdust, const Real arad
   const Real T4 = Tt * Tt * Tt * Tt;
   for (int g = 0; g < n_group; ++g) {
     const Real Bg = arad * T4 * groups.PlanckFraction(g, Tt * T_unit);
-    const Real ag = chat * dt * rho * kP * groups.KappaMult(g);
+    const Real ag = chat * dt * rho * kP * groups.PlanckBandMult(g, Tt * T_unit);
     S += ag * (Eg0[g] - Bg) / (1.0 + ag);
   }
   return (e - e0_ref) - c / chat * S;
@@ -255,7 +255,7 @@ Real MGResidual(const Real Tt, const Real rho, const Real kdust, const Real arad
 //! so E_g^new - B_g = (E_g^0 - B_g)/(1+a_g), and the gas energy balance closes on a SINGLE
 //! nonlinear equation in T (Newton):
 //!     R(T) = [e(T) - e0] - (c/chat) * sum_g a_g (E_g^0 - B_g(T))/(1+a_g) = 0 .
-//! With a nu-independent opacity (KappaMult=1) and sum_g B_g = arad*T^4, this reduces EXACTLY
+//! With a nu-independent opacity (beta=0 => band mult=1) and sum_g B_g = arad*T^4, this reduces EXACTLY
 //! to the gray solve (same T, same sum_g E_g). Groups couple ONLY through T. Flux attenuation
 //! + radiation-force momentum exchange are applied per group (Rosseland mean + scattering),
 //! and the kinetic radiation-energy exchange is removed pro-rata across groups.
@@ -388,7 +388,7 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
         Real Esum_new = 0.0;
         for (int g = 0; g < n_group; ++g) {
           const Real Bg = arad * T4 * groups.PlanckFraction(g, T * T_unit);
-          const Real ag = chat * dt * rho * kP * groups.KappaMult(g);
+          const Real ag = chat * dt * rho * kP * groups.PlanckBandMult(g, T * T_unit);
           Egn[g] = std::max((Eg0[g] + ag * Bg) / (1.0 + ag), efloor);
           Esum_new += Egn[g];
         }
@@ -401,7 +401,7 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
         const Real kR = RosselandOpacity(op, rho, T) * kdust;
         const Real ks = ScatteringOpacity(op, rho, T);
         for (int g = 0; g < n_group; ++g) {
-          const Real ag = chat * dt * rho * (kR * groups.KappaMult(g) + ks);
+          const Real ag = chat * dt * rho * (kR * groups.RossBandMult(g, T * T_unit) + ks);
           const Real fac = -ag / (1.0 + ag);
           dFx[g] = fac * Fxg0[g];
           dFy[g] = fac * Fyg0[g];

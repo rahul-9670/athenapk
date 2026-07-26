@@ -154,16 +154,19 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   const Real nu_min_hz = pin->GetOrAddReal(bn, "nu_min_hz", 1.0e12); // ~40 K blackbody peak
   const Real nu_max_hz = pin->GetOrAddReal(bn, "nu_max_hz", 1.0e15); // ~far-UV
   RadGroups groups = BuildRadGroups(n_group, nu_min_hz, nu_max_hz);
-  // Monochromatic opacity power-law index p in kappa_nu = kappa_gray*(nu/nu_ref)^p, used to
-  // form the per-group Planck/Rosseland means (MG-3). p=0 => every group mean == the gray
-  // opacity => multigroup reduces EXACTLY to n_group copies of gray (equivalence gate).
-  const Real opacity_nu_index = pin->GetOrAddReal(bn, "opacity_nu_index", 0.0);
-  const Real nu_ref_hz = pin->GetOrAddReal(bn, "nu_ref_hz", nu_min_hz);
-  FillKappaMult(groups, opacity_nu_index, nu_ref_hz);
+  // Monochromatic dust opacity spectral index beta in kappa_nu = kappa_gray*(nu/nu_ref)^beta.
+  // The per-group Planck/Rosseland means are the band-limited averages of kappa_nu with the
+  // correct weights (B_nu for emission/absorption, dB_nu/dT for flux), normalized so the
+  // full-spectrum means reproduce kappa_gray. beta=0 => every group mean == kappa_gray =>
+  // multigroup reduces EXACTLY to n_group copies of gray (equivalence gate). `opacity_beta`
+  // is the key; `opacity_nu_index` (the earlier representative-frequency exponent) is accepted
+  // as a fallback so existing decks keep working.
+  const Real beta_fallback = pin->GetOrAddReal(bn, "opacity_nu_index", 0.0);
+  const Real opacity_beta = pin->GetOrAddReal(bn, "opacity_beta", beta_fallback);
+  FillGroupOpacity(groups, opacity_beta);
   pkg->AddParam("groups", groups);
   pkg->AddParam("n_group", n_group);
-  pkg->AddParam("opacity_nu_index", opacity_nu_index);
-  pkg->AddParam("nu_ref_hz", nu_ref_hz);
+  pkg->AddParam("opacity_beta", opacity_beta);
 
   // --- Transport controls (increment 2b) -------------------------------------
   pkg->AddParam("cfl", pin->GetOrAddReal(bn, "cfl", 0.4));       // radiation CFL number

@@ -32,6 +32,51 @@ using parthenon::Real;
 constexpr int MAX_GROUP = 8;
 
 //----------------------------------------------------------------------------------------
+//! Band-limited moment of the Planck weight:  Int_a^b x^s / (e^x - 1) dx  (s = 3 gives the
+//! Planck energy weight; s = 3+beta weights a kappa_nu ~ nu^beta opacity for the Planck mean).
+//! Composite Simpson in x; the integrand ~ x^{s-1} as x->0 (finite for s>=1) and decays like
+//! x^s e^-x for large x. Device-callable.
+//! IMPORTANT: the moments are used ONLY inside same-band ratios (num/den with the same lower
+//! edge `a`), so a common factor e^{-a} is deliberately FACTORED OUT: the integrand carries
+//! e^{a-x} (<=1 on [a,b]) instead of e^{-x}. This makes the ratio robust even in the deep Wien
+//! tail (a >> 1) where e^{-x} underflows to 0 and would otherwise give 0/0 -> a spurious 0
+//! opacity for the hardest group. The returned value equals e^{a} * (true moment); every use
+//! divides two of these with the same a, so the e^{a} cancels exactly.
+KOKKOS_INLINE_FUNCTION Real PlanckMoment(const Real s, Real a, Real b, const int npts) {
+  if (a < 1.0e-8) a = 1.0e-8; // avoid the removable 1/x singularity of the weight at x=0
+  if (b <= a) return 0.0;
+  const int n = (npts % 2 == 0) ? npts : npts + 1; // Simpson needs an even number of panels
+  const Real h = (b - a) / n;
+  Real sum = 0.0;
+  for (int k = 0; k <= n; ++k) {
+    const Real x = a + k * h;
+    const Real w = (k == 0 || k == n) ? 1.0 : ((k % 2) ? 4.0 : 2.0);
+    // x^s/(e^x-1), with e^{-a} factored out: x^s e^{a-x}/(1-e^{-x}).
+    sum += w * std::pow(x, s) * std::exp(a - x) / (1.0 - std::exp(-x));
+  }
+  return sum * h / 3.0;
+}
+
+//! Band-limited moment of the Rosseland weight:  Int_a^b x^s e^x/(e^x-1)^2 dx  (s = 4 gives the
+//! Rosseland weight dB/dT; s = 4-beta forms the harmonic (Rosseland) mean of kappa_nu ~ nu^beta).
+//! Same e^{-a}-factored-out ratio convention as PlanckMoment (device-callable).
+KOKKOS_INLINE_FUNCTION Real RossMoment(const Real s, Real a, Real b, const int npts) {
+  if (a < 1.0e-8) a = 1.0e-8;
+  if (b <= a) return 0.0;
+  const int n = (npts % 2 == 0) ? npts : npts + 1;
+  const Real h = (b - a) / n;
+  Real sum = 0.0;
+  for (int k = 0; k <= n; ++k) {
+    const Real x = a + k * h;
+    const Real w = (k == 0 || k == n) ? 1.0 : ((k % 2) ? 4.0 : 2.0);
+    const Real d = 1.0 - std::exp(-x);
+    // x^s e^x/(e^x-1)^2, with e^{-a} factored out: x^s e^{a-x}/(1-e^{-x})^2.
+    sum += w * std::pow(x, s) * std::exp(a - x) / (d * d);
+  }
+  return sum * h / 3.0;
+}
+
+//----------------------------------------------------------------------------------------
 //! Cumulative Planck energy fraction F(x) = (15/pi^4) * Int_0^x u^3/(e^u - 1) du, x = h*nu/kT.
 //! F(0)=0, F(inf)=1; the fraction in a group [x1,x2] is F(x2)-F(x1). The tail integral
 //! Int_x^inf u^3/(e^u-1) du = sum_{n>=1} e^{-n x}( x^3/n + 3 x^2/n^2 + 6 x/n^3 + 6/n^4 )
@@ -62,10 +107,16 @@ struct RadGroups {
   // group frequency edges [Hz], size n_group+1; nu_edge[0]=0, nu_edge[n_group]=+inf (HUGE).
   Real nu_edge[MAX_GROUP + 1] = {0.0};
   Real h_over_k = 4.799243e-11; // h/k_B [s*K]  (Planck const / Boltzmann)
-  // Per-group opacity multiplier vs the gray opacity: kappa_{P/R},g = kappa_gray * mult[g],
-  // where mult[g] = (nu_rep[g]/nu_ref)^opacity_nu_index. Default 1.0 (nu-independent =>
-  // gray-per-group). Filled by FillKappaMult (host, at package init).
-  Real kappa_mult[MAX_GROUP] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+  // Monochromatic dust opacity spectral index: kappa_nu(rho,T) = kappa_gray(rho,T) * phi(nu),
+  // phi(nu) = (nu/nu_ref)^beta, normalized so the FULL-SPECTRUM Planck (resp. Rosseland) mean
+  // of kappa_nu equals kappa_gray. Then the per-group Planck/Rosseland means are the band-limited
+  // averages below. beta=0 => phi=1 => every group mean == kappa_gray (gray-per-group; the
+  // equivalence gate holds exactly). Filled by FillGroupOpacity (host, at package init).
+  Real beta = 0.0;
+  Real cP_full = 1.0; // full-band Planck normalization  I_{3+beta}(0,inf)/I_3(0,inf)
+  Real cR_full = 1.0; // full-band Rosseland normalization J_4(0,inf)/J_{4-beta}(0,inf)
+  int qpts = 64;      // Simpson panels per band moment
+  Real nquad_hi = 60.0; // integrate at most x_lo+60 in each band (weight ~ e^-x beyond => lost part negligible)
 
   //! Equilibrium Planck energy fraction in group g at matter temperature T [K].
   //! sum_g PlanckFraction(g,T) == 1 exactly (edges span [0,inf)).
@@ -76,27 +127,58 @@ struct RadGroups {
     return PlanckCumFraction(xhi) - PlanckCumFraction(xlo);
   }
 
-  //! Per-group opacity multiplier (device-callable). mult[0]=..=1 => gray-per-group.
-  KOKKOS_INLINE_FUNCTION Real KappaMult(const int g) const { return kappa_mult[g]; }
+  //! group g's band edges in x = h*nu/(k*T) at matter temperature Tk [K]. The upper edge is
+  //! capped at x_lo + nquad_hi so the fixed-panel Simpson keeps its resolution where the weight
+  //! lives (the integrand decays like e^-x, so a very wide band [x_lo, x_hi>>x_lo] would waste
+  //! all panels on the negligible tail and misestimate the ratio). The lost tail is ~e^-nquad_hi.
+  KOKKOS_INLINE_FUNCTION void BandX(const int g, const Real Tk, Real &a, Real &b) const {
+    a = h_over_k * nu_edge[g] / Tk;
+    const Real bphys = (g == n_group - 1) ? (a + nquad_hi) : h_over_k * nu_edge[g + 1] / Tk;
+    b = (bphys < a + nquad_hi) ? bphys : (a + nquad_hi);
+  }
 
-  //! Representative (log-center) frequency [Hz] of group g. The soft (g=0) group [0,nu1] is
-  //! represented by its upper edge; the hard (last) group [nu_{n-1},inf) by its lower edge;
-  //! interior groups by sqrt(nu_g * nu_{g+1}). Monotone increasing in g.
-  Real RepFreqHz(const int g) const {
-    if (n_group == 1) return nu_edge[1];
-    if (g == 0) return nu_edge[1];
-    if (g == n_group - 1) return nu_edge[g];
-    return std::sqrt(nu_edge[g] * nu_edge[g + 1]);
+  //! PLANCK-mean opacity multiplier for group g at matter temperature Tk [K]:
+  //!   kappa_P,g / kappa_gray = [ Int_g x^{3+beta}/(e^x-1) dx / Int_g x^3/(e^x-1) dx ] / cP_full.
+  //! Sum-weighted by the group Planck fractions this reproduces the gray Planck emission exactly.
+  KOKKOS_INLINE_FUNCTION Real PlanckBandMult(const int g, const Real Tk) const {
+    if (n_group == 1 || beta == 0.0) return 1.0;
+    Real a, b;
+    BandX(g, Tk, a, b);
+    const Real num = PlanckMoment(3.0 + beta, a, b, qpts);
+    const Real den = PlanckMoment(3.0, a, b, qpts);
+    return (num / (den + 1.0e-300)) / cP_full;
+  }
+
+  //! ROSSELAND-mean opacity multiplier for group g at matter temperature Tk [K]:
+  //!   kappa_R,g / kappa_gray = [ Int_g x^4 w dx / Int_g x^{4-beta} w dx ] / cR_full,
+  //! w = e^x/(e^x-1)^2 (the harmonic/Rosseland average of kappa_nu ~ nu^beta over the band).
+  KOKKOS_INLINE_FUNCTION Real RossBandMult(const int g, const Real Tk) const {
+    if (n_group == 1 || beta == 0.0) return 1.0;
+    Real a, b;
+    BandX(g, Tk, a, b);
+    const Real num = RossMoment(4.0, a, b, qpts);
+    const Real den = RossMoment(4.0 - beta, a, b, qpts);
+    return (num / (den + 1.0e-300)) / cR_full;
   }
 };
 
 //----------------------------------------------------------------------------------------
-//! Fill the per-group opacity multipliers for a monochromatic power law kappa_nu =
-//! kappa_gray*(nu/nu_ref)^p. p=0 leaves every multiplier at 1 (gray-per-group => exact
-//! equivalence to the gray coupling). Host-side; called once at package init.
-inline void FillKappaMult(RadGroups &g, const Real p, const Real nu_ref_hz) {
-  for (int i = 0; i < g.n_group; ++i)
-    g.kappa_mult[i] = std::pow(g.RepFreqHz(i) / nu_ref_hz, p);
+//! Configure the monochromatic-dust opacity model kappa_nu ~ nu^beta on the group structure:
+//! store beta and the full-spectrum normalizations so the band means reduce to kappa_gray when
+//! summed over all frequencies (=> beta=0 is exactly gray-per-group). Host-side, once at init.
+inline void FillGroupOpacity(RadGroups &g, const Real beta) {
+  g.beta = beta;
+  if (beta == 0.0) {
+    g.cP_full = 1.0;
+    g.cR_full = 1.0;
+    return;
+  }
+  // full-band [~0, X] moments (X large enough that the e^-x tail is negligible).
+  const Real X = 80.0;
+  g.cP_full = PlanckMoment(3.0 + beta, 1.0e-8, X, 4000) /
+              PlanckMoment(3.0, 1.0e-8, X, 4000);
+  g.cR_full = RossMoment(4.0, 1.0e-8, X, 4000) /
+              RossMoment(4.0 - beta, 1.0e-8, X, 4000);
 }
 
 //----------------------------------------------------------------------------------------
