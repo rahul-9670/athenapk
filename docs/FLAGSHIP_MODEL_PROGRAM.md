@@ -397,6 +397,19 @@ between the two finest + resolution-reach ("how far we can push"). Harness logic
 campaigns to a matched 1e-13 first-core epoch), gated on GPU availability + user go — deferred with
 the ensemble/UQ (Phase-3 plan: validate + know limits first, ensemble last).
 
+**IC ensemble + UQ machinery DONE (2026-07-26):** `runs/ensemble/` — `design.py` (Latin-hypercube
+over mass/rotation/magnetization/turbulence/CR/metallicity × turbulence-seed realizations,
+templating a tabulated-multigroup deck per point), `submit_point.sh` + `launch_ensemble.sh`
+(self-chaining GPU member per point, matched-epoch stop), `uq.py` (flux-retention mu_core as a
+predictive DISTRIBUTION at matched rho_max + IC-variance seed sub-class + Spearman sensitivity
+ranking → which knob drives the spread). Validated: design templating verified value-by-value +
+76–91% LHS coverage; uq logic unit-tested on a synthetic ensemble (Spearman exact ±1.000, injected
+dominant parameter B0z ranked #1). The uncertainty-class map (README) routes
+discretization→convergence ladder, IC→ensemble, RSLA/microphysics→targeted sweeps. Known gaps:
+field-alignment angle + external pressure need a pgen knob (documented). **Running the ensemble is
+the remaining COMPUTE** — the LAST code-development piece of the flagship; per the user's plan the
+ensemble runs last, then prod_v9 resumes once the flagship is fully done.
+
 ## Phase 8 — Protostar & observational connection (audit G, L)
 
 Continue through second-core accretion to a physically-defined protostellar surface (couple a
