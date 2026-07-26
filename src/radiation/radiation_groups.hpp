@@ -17,6 +17,9 @@
 #define RADIATION_RADIATION_GROUPS_HPP_
 
 #include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -257,6 +260,53 @@ inline GroupOpacityTable BuildGroupOpacityTable(const DustOpacityModel &m, const
       hR(ig, it) = mR[ig];
     }
   }
+  Kokkos::deep_copy(tab.wP_, hP);
+  Kokkos::deep_copy(tab.wR_, hR);
+  return tab;
+}
+
+//! Build the per-group multiplier table by reading the TABULATED opacity file (produced by
+//! gen_opacity_table.py). Binary layout: int64 [ng,nr,nT]; double [lr0,dlr,lT0,dlT]; float64
+//! gray kP[nr,nT], kR, ks (skipped here); then multipliers mP[ng,nT], mR[ng,nT] (T-only,
+//! rho-independent). This REPLACES the analytic DustOpacityModel band means with the tabulated
+//! frequency-resolved values. n_group must match the file's ng.
+inline GroupOpacityTable BuildGroupOpacityTableFromFile(const std::string &path,
+                                                        const int n_group) {
+  GroupOpacityTable tab;
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("GroupOpacityTable: cannot open " + path);
+  std::int64_t hdr[3];
+  f.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
+  const int ng = static_cast<int>(hdr[0]);
+  const int nr = static_cast<int>(hdr[1]);
+  const int nT = static_cast<int>(hdr[2]);
+  if (ng != n_group)
+    throw std::runtime_error("GroupOpacityTable: file n_group mismatch (" +
+                             std::to_string(ng) + " != " + std::to_string(n_group) + ")");
+  double g[4];
+  f.read(reinterpret_cast<char *>(g), sizeof(g));
+  tab.ng_ = ng;
+  tab.nT_ = nT;
+  tab.lT0_ = g[2];
+  tab.dlT_ = g[3];
+  if (ng == 1) return tab; // gray => inactive (Lookup returns 1)
+  // skip the 3 gray arrays kP,kR,ks (each nr*nT doubles)
+  f.seekg(static_cast<std::streamoff>(3) * nr * nT * sizeof(double), std::ios::cur);
+  tab.active_ = true;
+  tab.wP_ = ParArray2D<Real>("rad_wP", ng, nT);
+  tab.wR_ = ParArray2D<Real>("rad_wR", ng, nT);
+  auto hP = Kokkos::create_mirror_view(tab.wP_);
+  auto hR = Kokkos::create_mirror_view(tab.wR_);
+  std::vector<double> buf(static_cast<size_t>(ng) * nT);
+  auto read_mult = [&](decltype(hP) &h) {
+    f.read(reinterpret_cast<char *>(buf.data()),
+           static_cast<std::streamsize>(buf.size() * sizeof(double)));
+    for (int ig = 0; ig < ng; ++ig)
+      for (int it = 0; it < nT; ++it) h(ig, it) = static_cast<Real>(buf[ig * nT + it]);
+  };
+  read_mult(hP); // mP
+  read_mult(hR); // mR
+  if (!f) throw std::runtime_error("GroupOpacityTable: truncated file " + path);
   Kokkos::deep_copy(tab.wP_, hP);
   Kokkos::deep_copy(tab.wR_, hR);
   return tab;

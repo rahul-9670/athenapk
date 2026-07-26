@@ -108,11 +108,15 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   //             converted to code units internally (this is what traps the FHC).
   OpacityParams op;
   const std::string opmodel = pin->GetOrAddString(bn, "opacity_model", "constant");
-  PARTHENON_REQUIRE(opmodel == "constant" || opmodel == "dust" || opmodel == "belllin",
-                    "radiation/opacity_model must be 'constant', 'dust', or 'belllin'.");
-  op.model = (opmodel == "belllin")
-                 ? OpacityModel::belllin
-                 : (opmodel == "dust") ? OpacityModel::dust : OpacityModel::constant;
+  PARTHENON_REQUIRE(opmodel == "constant" || opmodel == "dust" || opmodel == "belllin" ||
+                        opmodel == "tabulated",
+                    "radiation/opacity_model must be 'constant', 'dust', 'belllin', or "
+                    "'tabulated'.");
+  op.model = (opmodel == "tabulated")
+                 ? OpacityModel::tabulated
+                 : (opmodel == "belllin")
+                       ? OpacityModel::belllin
+                       : (opmodel == "dust") ? OpacityModel::dust : OpacityModel::constant;
   op.kappa_a0 = pin->GetOrAddReal(bn, "kappa_a_code", 0.0);
   op.kappa_s0 = pin->GetOrAddReal(bn, "kappa_s_code", 0.0);
   op.dust_k0_cgs = pin->GetOrAddReal(bn, "dust_kappa0_cgs", 2.0e-4);
@@ -130,6 +134,13 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // low-rho/high-T kappa discontinuity). Only meaningful for opacity_model=belllin.
   op.bell_lin_fix_regime_skip =
       pin->GetOrAddBoolean(bn, "bell_lin_fix_regime_skip", false);
+  // Tabulated model: load the offline frequency-resolved gray magnitude table (true Planck +
+  // Rosseland means; self-consistent, replacing the planck_ross_ratio fudge). The per-group
+  // multipliers from the SAME file feed GroupOpacityTable below.
+  const std::string opac_table_file = pin->GetOrAddString(
+      bn, "opacity_table_file",
+      "/beegfs/u/bbg6470/athenapk/src/radiation/opacity_table.bin");
+  if (op.model == OpacityModel::tabulated) op.table.Load(opac_table_file, rho_unit, T_unit);
   pkg->AddParam("opacity", op);
   // Back-compat scalar params (constant model still reads these directly).
   pkg->AddParam("kappa_a", op.kappa_a0);
@@ -177,7 +188,14 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   const int op_nT = pin->GetOrAddInteger(bn, "opacity_table_nT", 256);
   const Real op_Tmin = pin->GetOrAddReal(bn, "opacity_table_Tmin_K", 3.0);
   const Real op_Tmax = pin->GetOrAddReal(bn, "opacity_table_Tmax_K", 1.0e6);
-  pkg->AddParam("optable", BuildGroupOpacityTable(dmodel, groups, op_Tmin, op_Tmax, op_nT));
+  // Tabulated model: per-group multipliers come from the SAME frequency-resolved file (real
+  // <psi>_band/<psi>_full ratios) instead of the analytic DustOpacityModel band means. Gray
+  // (n_group=1) needs only the gray magnitude table (loaded above) -> inactive multiplier table,
+  // so DON'T read the file's per-group block (and don't require the file's ng to match 1).
+  if (op.model == OpacityModel::tabulated && n_group > 1)
+    pkg->AddParam("optable", BuildGroupOpacityTableFromFile(opac_table_file, n_group));
+  else
+    pkg->AddParam("optable", BuildGroupOpacityTable(dmodel, groups, op_Tmin, op_Tmax, op_nT));
 
   // --- Transport controls (increment 2b) -------------------------------------
   pkg->AddParam("cfl", pin->GetOrAddReal(bn, "cfl", 0.4));       // radiation CFL number

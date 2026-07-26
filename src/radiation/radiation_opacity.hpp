@@ -15,14 +15,22 @@
 #define RADIATION_RADIATION_OPACITY_HPP_
 
 #include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
 
 #include <Kokkos_Core.hpp>
 
-#include <basic_types.hpp> // parthenon::Real
+#include <basic_types.hpp>      // parthenon::Real
+#include <parthenon_arrays.hpp> // parthenon::ParArray2D (tabulated opacity, device)
 
 #include "radiation_closure.hpp" // parthenon::Real alias, RadFuzz
 
 namespace Radiation {
+
+using parthenon::ParArray2D;
 
 // CGS physical constants used only for the one-time code-unit calibration (host side).
 namespace cgs {
@@ -32,7 +40,82 @@ constexpr Real m_H = 1.6726219e-24;    // hydrogen mass [g]
 constexpr Real c_light = 2.99792458e10; // speed of light [cm/s]
 } // namespace cgs
 
-enum class OpacityModel { constant, dust, belllin };
+enum class OpacityModel { constant, dust, belllin, tabulated };
+
+//----------------------------------------------------------------------------------------
+//! Tabulated GRAY opacity magnitude (code units) on a (log10 rho_cgs, log10 T_K) grid, produced
+//! offline by gen_opacity_table.py: true Planck mean kappa_P, Rosseland mean kappa_R, and
+//! scattering kappa_s. State-of-the-art: the frequency-resolved dust+gas physics lives in the
+//! generator (swappable for a real Semenov/DSHARP monochromatic dataset); the device only
+//! bilinear-interpolates. Small (Kokkos View handles + scalars) => copied BY VALUE into kernels.
+//! The per-group MULTIPLIERS (kappa_{P,R},g/kappa_gray, rho-independent => T-only) from the SAME
+//! file feed GroupOpacityTable (radiation_groups.hpp).
+struct OpacityTable {
+  ParArray2D<Real> kP_, kR_, ks_; // [nr][nT], code units
+  Real lr0_ = 0.0, dlr_ = 1.0, lT0_ = 0.0, dlT_ = 1.0; // log10(rho_cgs), log10(T_K) axes
+  Real rho_unit = 1.0, T_unit = 1.0; // code->cgs for the lookup axes
+  int ng_ = 1, nr_ = 0, nT_ = 0;
+  bool loaded_ = false;
+
+  KOKKOS_INLINE_FUNCTION
+  Real bilin(const ParArray2D<Real> &A, const Real lr, const Real lT) const {
+    Real fi = (lr - lr0_) / dlr_;
+    int i = static_cast<int>(fi);
+    if (i < 0) i = 0;
+    if (i > nr_ - 2) i = nr_ - 2;
+    Real ti = fi - i;
+    ti = (ti < 0.0) ? 0.0 : ((ti > 1.0) ? 1.0 : ti);
+    Real fj = (lT - lT0_) / dlT_;
+    int j = static_cast<int>(fj);
+    if (j < 0) j = 0;
+    if (j > nT_ - 2) j = nT_ - 2;
+    Real tj = fj - j;
+    tj = (tj < 0.0) ? 0.0 : ((tj > 1.0) ? 1.0 : tj);
+    return (1.0 - ti) * (1.0 - tj) * A(i, j) + ti * (1.0 - tj) * A(i + 1, j) +
+           (1.0 - ti) * tj * A(i, j + 1) + ti * tj * A(i + 1, j + 1);
+  }
+  KOKKOS_INLINE_FUNCTION Real KappaP(const Real rho_code, const Real T_code) const {
+    return bilin(kP_, std::log10(rho_code * rho_unit), std::log10(T_code * T_unit));
+  }
+  KOKKOS_INLINE_FUNCTION Real KappaR(const Real rho_code, const Real T_code) const {
+    return bilin(kR_, std::log10(rho_code * rho_unit), std::log10(T_code * T_unit));
+  }
+  KOKKOS_INLINE_FUNCTION Real KappaS(const Real rho_code, const Real T_code) const {
+    return bilin(ks_, std::log10(rho_code * rho_unit), std::log10(T_code * T_unit));
+  }
+
+  //! Load the gray magnitude tables (host). Binary layout (gen_opacity_table.py): int64
+  //! [ng,nr,nT]; double [lr0,dlr,lT0,dlT]; float64 kP[nr,nT], kR, ks, then mP[ng,nT], mR
+  //! (the multipliers are read separately by GroupOpacityTable). ru,tu = rho_unit,T_unit.
+  void Load(const std::string &path, const Real ru, const Real tu) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("OpacityTable: cannot open " + path);
+    std::int64_t hdr[3];
+    f.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
+    ng_ = static_cast<int>(hdr[0]);
+    nr_ = static_cast<int>(hdr[1]);
+    nT_ = static_cast<int>(hdr[2]);
+    double g[4];
+    f.read(reinterpret_cast<char *>(g), sizeof(g));
+    lr0_ = g[0]; dlr_ = g[1]; lT0_ = g[2]; dlT_ = g[3];
+    rho_unit = ru; T_unit = tu;
+    auto load2d = [&](ParArray2D<Real> &view, const char *name) {
+      view = ParArray2D<Real>(name, nr_, nT_);
+      auto h = Kokkos::create_mirror_view(view);
+      std::vector<double> buf(static_cast<size_t>(nr_) * nT_);
+      f.read(reinterpret_cast<char *>(buf.data()),
+             static_cast<std::streamsize>(buf.size() * sizeof(double)));
+      for (int i = 0; i < nr_; ++i)
+        for (int j = 0; j < nT_; ++j) h(i, j) = static_cast<Real>(buf[i * nT_ + j]);
+      Kokkos::deep_copy(view, h);
+    };
+    load2d(kP_, "opac_kP");
+    load2d(kR_, "opac_kR");
+    load2d(ks_, "opac_ks");
+    if (!f) throw std::runtime_error("OpacityTable: truncated file " + path);
+    loaded_ = true;
+  }
+};
 
 //----------------------------------------------------------------------------------------
 //! Device-side opacity parameters (all in CODE units / conversion factors). Captured by
@@ -61,6 +144,11 @@ struct OpacityParams {
   // collapse track; the two differ only in the off-track low-rho/high-T corner). Opt in via
   // <radiation> bell_lin_fix_regime_skip = true.
   bool bell_lin_fix_regime_skip = false;
+  // model == tabulated: gray kappa_P/kappa_R/kappa_s come from this device table (frequency-
+  // resolved dust+gas physics precomputed offline). Inactive for the other models (View handles
+  // default-constructed, never dereferenced). This gives a SELF-CONSISTENT Planck mean (not the
+  // planck_ross_ratio fudge) and a real Rosseland mean.
+  OpacityTable table;
 };
 
 //----------------------------------------------------------------------------------------
@@ -120,6 +208,7 @@ Real BellLinKappaFixed(const Real rho, const Real T) {
 KOKKOS_INLINE_FUNCTION
 Real RosselandOpacity(const OpacityParams &op, const Real rho_code, const Real T_code) {
   if (op.model == OpacityModel::constant) return op.kappa_a0;
+  if (op.model == OpacityModel::tabulated) return op.table.KappaR(rho_code, T_code);
   const Real T_phys = op.T_unit * T_code;
   if (op.model == OpacityModel::belllin) {
     const Real rho_phys = op.rho_unit * rho_code;
@@ -140,6 +229,8 @@ Real RosselandOpacity(const OpacityParams &op, const Real rho_code, const Real T
 //! OpacityParams::planck_ross_ratio.
 KOKKOS_INLINE_FUNCTION
 Real PlanckOpacity(const OpacityParams &op, const Real rho_code, const Real T_code) {
+  // Tabulated: TRUE Planck mean (self-consistent, not planck_ross_ratio * kappa_R).
+  if (op.model == OpacityModel::tabulated) return op.table.KappaP(rho_code, T_code);
   return op.planck_ross_ratio * RosselandOpacity(op, rho_code, T_code);
 }
 
@@ -147,6 +238,7 @@ Real PlanckOpacity(const OpacityParams &op, const Real rho_code, const Real T_co
 //! Gray SCATTERING opacity in CODE units (per unit mass). Constant for both models.
 KOKKOS_INLINE_FUNCTION
 Real ScatteringOpacity(const OpacityParams &op, const Real rho_code, const Real T_code) {
+  if (op.model == OpacityModel::tabulated) return op.table.KappaS(rho_code, T_code);
   return (op.model == OpacityModel::constant) ? op.kappa_s0 : op.kappa_s_dust;
 }
 
