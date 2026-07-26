@@ -1422,6 +1422,18 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     PARTHENON_REQUIRE(njeans > 0.,
                       "Make sure to set refinement/njeans > 0 (typically 8-16).");
     pkg->AddParam<Real>("refinement/njeans", njeans);
+  } else if (refine_str == "jeans_nonideal") {
+    // Flagship Phase 7 physics-based AMR: Jeans + current-sheet resolution (opt-in).
+    pkg->CheckRefinementBlock = refinement::nonideal::JeansNonideal;
+    const auto njeans = pin->GetOrAddReal("refinement", "njeans", 0.0);
+    PARTHENON_REQUIRE(njeans > 0.,
+                      "Make sure to set refinement/njeans > 0 (typically 8-16).");
+    // cells per current-sheet field-reversal scale L_B=|B|/|curlB| below which we refine.
+    const auto curr_nsheet = pin->GetOrAddReal("refinement", "curr_nsheet", 4.0);
+    PARTHENON_REQUIRE(curr_nsheet > 0.,
+                      "Make sure to set refinement/curr_nsheet > 0 (typically 4-8).");
+    pkg->AddParam<Real>("refinement/njeans", njeans);
+    pkg->AddParam<Real>("refinement/curr_nsheet", curr_nsheet);
   } else if (refine_str == "user") {
     pkg->CheckRefinementBlock = Hydro::ProblemCheckRefinementBlock;
   }

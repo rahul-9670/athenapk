@@ -29,6 +29,7 @@ add_executable(
         refinement/gradient.cpp
         refinement/other.cpp
         refinement/jeans.cpp
+        refinement/nonideal.cpp
         tracers/tracers.cpp
         tracers/tracers.hpp
         sinks/sinks.cpp

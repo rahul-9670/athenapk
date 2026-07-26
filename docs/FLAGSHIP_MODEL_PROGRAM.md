@@ -359,6 +359,16 @@ traceless-Q shell-average → 0. ALL PASS. (Formula mirror of `multipole.hpp`; t
 heavy parthenon deps so a host-g++ shim isn't worth it.) The rest of Phase 7 (torque diagnostics,
 physics-based AMR, IC ensembles, UQ classes, cross-code) is new capability → user direction.
 
+**Physics-based AMR DONE (2026-07-26, opt-in):** `refinement/nonideal.cpp` adds
+`type = jeans_nonideal` — Jeans PLUS current-sheet resolution (refine where the field-reversal
+scale L_B=|B|/|curl B| is under-resolved by < `curr_nsheet` cells, so the thin current layers that
+set the reconnection/flux-loss are always resolved). Default `type=jeans` untouched (production
+bit-identical). Validated on a 32³ MHD collapse: jeans stays 64 blocks; jeans_nonideal grows
+64→127→155→169 (increments DECELERATE 63→28→14 ⇒ converges to a stable refined state, targeted on
+current sheets, NOT runaway — the OOM risk is controlled). Caveat for production numlevel=20: a
+pervasively-turbulent field could refine aggressively; monitor block counts and tune `curr_nsheet`.
+The remaining Phase-7 IC-ensemble / UQ / cross-code pieces are the science program below.
+
 **Torque / magnetic-braking diagnostic DONE (2026-07-26):** `runs/magnetic_braking.py` —
 gradient-free (AMR-safe) rotational-support v_phi/v_Kep + convention-free B_phi/B_pol (braking
 activity) shell profiles. On the deep prod_v9 snapshot: envelope sub-Keplerian (v_phi/v_Kep~0.4 at

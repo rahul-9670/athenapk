@@ -24,6 +24,9 @@ parthenon::AmrTag MaxDensity(MeshBlockData<Real> *rc);
 namespace jeans {
 parthenon::AmrTag Jeans(MeshBlockData<Real> *rc);
 }
+namespace nonideal {
+parthenon::AmrTag JeansNonideal(MeshBlockData<Real> *rc);
+}
 } // namespace refinement
 
 #endif // REFINEMENT_HPP_
