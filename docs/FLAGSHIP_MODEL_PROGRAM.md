@@ -359,6 +359,14 @@ traceless-Q shell-average → 0. ALL PASS. (Formula mirror of `multipole.hpp`; t
 heavy parthenon deps so a host-g++ shim isn't worth it.) The rest of Phase 7 (torque diagnostics,
 physics-based AMR, IC ensembles, UQ classes, cross-code) is new capability → user direction.
 
+**Torque / magnetic-braking diagnostic DONE (2026-07-26):** `runs/magnetic_braking.py` —
+gradient-free (AMR-safe) rotational-support v_phi/v_Kep + convention-free B_phi/B_pol (braking
+activity) shell profiles. On the deep prod_v9 snapshot: envelope sub-Keplerian (v_phi/v_Kep~0.4 at
+1000 AU, infall-dominated), toroidal field wound up in the core (|B_phi/B_pol|~0.3 => braking
+active). (Two physics bugs caught by falsification: Eulerian-vs-Lagrangian AM normalization, and
+an M_enc->0 small-r artifact — inner <100 AU flagged as needing a proper disk-finder.) The
+remaining Phase-7 pieces (physics-based AMR, IC ensembles, UQ classes, cross-code) below.
+
 Stage-centered gravity with validated isolated/Green-function BCs (Phase 0's #2 is the first
 step); torque-budget diagnostics; physics-based AMR (Jeans + pressure scale height + non-ideal
 lengths + current sheets + disk scale height). Replace the single BE sphere with a controlled
