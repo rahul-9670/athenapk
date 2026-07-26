@@ -23,6 +23,7 @@
 #include "../main.hpp" // IDN, IM1..IM3, IEN, NHYDRO, IB1..IB3 (cons component indices)
 #include "radiation.hpp"
 #include "radiation_closure.hpp"
+#include "radiation_groups.hpp"
 #include "radiation_opacity.hpp"
 #include "../dust/dust.hpp" // WS-4 DustFactor / DustModel (opacity consumer)
 
@@ -92,14 +93,20 @@ TaskStatus CalculateRadFluxes(MeshData<Real> *md) {
                     "Increment 2b transport supports closure=M1 only.");
   const Real chat = pkg->Param<Real>("chat");
   const bool plm = pkg->Param<bool>("rad_recon_plm"); // WS-3b: dc (false) or plm (true)
+  const int n_group = pkg->Param<int>("n_group");
 
-  static const std::vector<std::string> names{"rad.Er", "rad.Fr1", "rad.Fr2", "rad.Fr3"};
+  // Multigroup: each group's (Er_g,Fr_g) is an INDEPENDENT M1 system (same chat, same
+  // frequency-independent closure); they couple only through the matter temperature in
+  // MatterCoupling. Loop the identical HLL sweep per group. n_group=1 runs it once over the
+  // gray field names -> bit-identical to the pre-multigroup transport.
+  for (int g = 0; g < n_group; ++g) {
+  const std::vector<std::string> names = GroupFieldNames(g);
   parthenon::PackIndexMap imap;
   auto pack = md->PackVariablesAndFluxes(names, imap);
-  const int iE = imap["rad.Er"].first;
-  const int iX = imap["rad.Fr1"].first;
-  const int iY = imap["rad.Fr2"].first;
-  const int iZ = imap["rad.Fr3"].first;
+  const int iE = imap[names[0]].first;
+  const int iX = imap[names[1]].first;
+  const int iY = imap[names[2]].first;
+  const int iZ = imap[names[3]].first;
 
   auto hll = KOKKOS_LAMBDA(const int dir, const int b, const int k, const int j,
                            const int i, const int dk, const int dj, const int di) {
@@ -159,6 +166,7 @@ TaskStatus CalculateRadFluxes(MeshData<Real> *md) {
           hll(3, b, k, j, i, 1, 0, 0);
         });
   }
+  } // group loop
   return TaskStatus::complete;
 }
 
@@ -174,14 +182,16 @@ TaskStatus ApplyRadUpdate(MeshData<Real> *md, const Real dt) {
   auto pkg = pmb->pmy_mesh->packages.Get("radiation");
   const Real chat = pkg->Param<Real>("chat");
   const Real efloor = pkg->Param<Real>("efloor");
+  const int n_group = pkg->Param<int>("n_group");
 
-  static const std::vector<std::string> names{"rad.Er", "rad.Fr1", "rad.Fr2", "rad.Fr3"};
+  for (int g = 0; g < n_group; ++g) {
+  const std::vector<std::string> names = GroupFieldNames(g);
   parthenon::PackIndexMap imap;
   auto pack = md->PackVariablesAndFluxes(names, imap);
-  const int iE = imap["rad.Er"].first;
-  const int iX = imap["rad.Fr1"].first;
-  const int iY = imap["rad.Fr2"].first;
-  const int iZ = imap["rad.Fr3"].first;
+  const int iE = imap[names[0]].first;
+  const int iX = imap[names[1]].first;
+  const int iY = imap[names[2]].first;
+  const int iZ = imap[names[3]].first;
 
   parthenon::par_for(
       DEFAULT_LOOP_PATTERN, "Rad::Update", parthenon::DevExecSpace(), 0,
@@ -210,6 +220,231 @@ TaskStatus ApplyRadUpdate(MeshData<Real> *md, const Real dt) {
         pack(b, iY, k, j, i) = Fy;
         pack(b, iZ, k, j, i) = Fz;
       });
+  } // group loop
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! Gas energy-balance residual R(T) for the multigroup implicit coupling (groups eliminated
+//! analytically): R(T) = [e(T)-e0] - (c/chat) sum_g a_g (E_g^0 - B_g(T))/(1+a_g), with
+//! B_g = arad T^4 PlanckFraction(g,T), a_g = chat dt rho kappa_P,g. Free function (not a
+//! nested lambda) so it is unambiguously device-safe under nvcc. Root -> the coupled (T,E_g).
+KOKKOS_INLINE_FUNCTION
+Real MGResidual(const Real Tt, const Real rho, const Real kdust, const Real arad,
+                const Real chat, const Real c, const Real dt, const Real gm1,
+                const Real T_unit, const bool use_h2, const EOSTable::EosTable &eos_tab,
+                const OpacityParams &op, const RadGroups &groups, const int n_group,
+                const Real *Eg0, const Real e0_ref) {
+  const Real kP = PlanckOpacity(op, rho, Tt) * kdust; // gray Planck opacity at Tt
+  const Real e = use_h2 ? eos_tab.EintFromRhoTk(rho, Tt * T_unit) : rho * Tt / gm1;
+  Real S = 0.0;
+  const Real T4 = Tt * Tt * Tt * Tt;
+  for (int g = 0; g < n_group; ++g) {
+    const Real Bg = arad * T4 * groups.PlanckFraction(g, Tt * T_unit);
+    const Real ag = chat * dt * rho * kP * groups.KappaMult(g);
+    S += ag * (Eg0[g] - Bg) / (1.0 + ag);
+  }
+  return (e - e0_ref) - c / chat * S;
+}
+
+//----------------------------------------------------------------------------------------
+//! Implicit MULTIGROUP matter coupling (n_group>1). One matter temperature T couples to all
+//! groups: group g emits B_g = arad*T^4*PlanckFraction(g,T) and absorbs at a_g = chat*dt*rho*
+//! kappa_P,g. The (n_group) group-energy equations are linear in E_g given T
+//!     E_g^new = (E_g^0 + a_g B_g(T)) / (1 + a_g),
+//! so E_g^new - B_g = (E_g^0 - B_g)/(1+a_g), and the gas energy balance closes on a SINGLE
+//! nonlinear equation in T (Newton):
+//!     R(T) = [e(T) - e0] - (c/chat) * sum_g a_g (E_g^0 - B_g(T))/(1+a_g) = 0 .
+//! With a nu-independent opacity (KappaMult=1) and sum_g B_g = arad*T^4, this reduces EXACTLY
+//! to the gray solve (same T, same sum_g E_g). Groups couple ONLY through T. Flux attenuation
+//! + radiation-force momentum exchange are applied per group (Rosseland mean + scattering),
+//! and the kinetic radiation-energy exchange is removed pro-rata across groups.
+TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
+  auto pmb = md->GetBlockData(0)->GetBlockPointer();
+  IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
+  IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
+
+  auto pkg = pmb->pmy_mesh->packages.Get("radiation");
+  const Real chat = pkg->Param<Real>("chat");
+  const Real c = pkg->Param<Real>("c");
+  const Real arad = pkg->Param<Real>("arad");
+  const OpacityParams op = pkg->Param<OpacityParams>("opacity");
+  const Real gam = pkg->Param<Real>("gamma");
+  const Real gm1 = gam - 1.0;
+  const Real tfloor = pkg->Param<Real>("tfloor");
+  const Real efloor = pkg->Param<Real>("efloor");
+  const int inner_max = pkg->Param<int>("inner_iteration_max");
+  const Real inner_tol = pkg->Param<Real>("inner_iteration_tol");
+  const Real Bfloor = arad * tfloor * tfloor * tfloor * tfloor;
+  const bool use_h2 = pkg->Param<bool>("use_h2diss");
+  const auto eos_tab = pkg->Param<EOSTable::EosTable>("eos_tab");
+  const Real T_unit = pkg->Param<Real>("T_unit");
+  const RadGroups groups = pkg->Param<RadGroups>("groups");
+  const int n_group = groups.n_group;
+
+  // Pack gas cons + ALL groups' moments.
+  std::vector<std::string> names{"cons"};
+  for (const auto &nm : AllRadFieldNames(n_group)) names.push_back(nm);
+  parthenon::PackIndexMap imap;
+  auto pack = md->PackVariables(names, imap);
+  const int ic = imap["cons"].first;
+  const int nhydro = pmb->pmy_mesh->packages.Get("Hydro")->Param<int>("nhydro");
+  const bool mhd = (nhydro > NHYDRO);
+  // Per-group component indices (Kokkos::Array is captured by value into the device kernel).
+  Kokkos::Array<int, MAX_GROUP> iEg, iXg, iYg, iZg;
+  for (int g = 0; g < n_group; ++g) {
+    const auto gn = GroupFieldNames(g);
+    iEg[g] = imap[gn[0]].first;
+    iXg[g] = imap[gn[1]].first;
+    iYg[g] = imap[gn[2]].first;
+    iZg[g] = imap[gn[3]].first;
+  }
+
+  // WS-4 dust consumer (same as the gray path).
+  auto &pkgs = pmb->pmy_mesh->packages;
+  const bool dust_on = pkgs.AllPackages().count("dust") > 0 &&
+                       pkgs.Get("dust")->Param<bool>("evolve");
+  int dust_sidx = 0;
+  Real dust_fref = 0.01, dust_aref = 1.0e-5;
+  if (dust_on) {
+    auto dpkg = pkgs.Get("dust");
+    dust_sidx = dpkg->Param<int>("scalar_index");
+    const Dust::DustModel dm = dpkg->Param<Dust::DustModel>("model");
+    dust_fref = dm.f_dg_ref;
+    dust_aref = dm.a_ref;
+  }
+  const int idust = ic + nhydro + dust_sidx;
+
+  int nfail = 0;
+  parthenon::par_reduce(
+      parthenon::loop_pattern_mdrange_tag, "Rad::MatterCouplingMG",
+      parthenon::DevExecSpace(), 0, pack.GetDim(5) - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, int &lnfail) {
+        const Real rho = pack(b, ic + IDN, k, j, i);
+        const Real m1 = pack(b, ic + IM1, k, j, i);
+        const Real m2 = pack(b, ic + IM2, k, j, i);
+        const Real m3 = pack(b, ic + IM3, k, j, i);
+        Real kdust = 1.0;
+        if (dust_on) {
+          const Real irho = 1.0 / rho;
+          kdust = Dust::DustFactor(pack(b, idust, k, j, i) * irho,
+                                   pack(b, idust + 1, k, j, i) * irho, dust_fref, dust_aref);
+        }
+        const Real ke = 0.5 * (m1 * m1 + m2 * m2 + m3 * m3) / rho;
+        Real me = 0.0;
+        if (mhd) {
+          const Real b1 = pack(b, ic + IB1, k, j, i);
+          const Real b2 = pack(b, ic + IB2, k, j, i);
+          const Real b3 = pack(b, ic + IB3, k, j, i);
+          me = 0.5 * (b1 * b1 + b2 * b2 + b3 * b3);
+        }
+        Real e0 = pack(b, ic + IEN, k, j, i) - ke - me;
+        Real T = use_h2 ? ((e0 > 0.0) ? eos_tab.TemperatureK(rho, e0) / T_unit : tfloor)
+                        : gm1 * e0 / rho;
+        T = std::max(T, tfloor);
+        e0 = use_h2 ? eos_tab.EintFromRhoTk(rho, T * T_unit) : rho * T / gm1;
+        const Real e0_ref = e0;
+
+        // Read the per-group incident moments.
+        Real Eg0[MAX_GROUP], Fxg0[MAX_GROUP], Fyg0[MAX_GROUP], Fzg0[MAX_GROUP];
+        Real Esum0 = 0.0;
+        for (int g = 0; g < n_group; ++g) {
+          Eg0[g] = pack(b, iEg[g], k, j, i);
+          Fxg0[g] = pack(b, iXg[g], k, j, i);
+          Fyg0[g] = pack(b, iYg[g], k, j, i);
+          Fzg0[g] = pack(b, iZg[g], k, j, i);
+          Esum0 += Eg0[g];
+        }
+        const Real etot = e0_ref + c / chat * Esum0 + RadFuzz();
+
+        // Newton on T with a numerical derivative (robust to the tabulated EOS + Planck
+        // fractions). MGResidual eliminates the groups analytically. Clamp T >= tfloor.
+        bool conv = false;
+        for (int it = 0; it < inner_max; ++it) {
+          const Real R0 =
+              MGResidual(T, rho, kdust, arad, chat, c, dt, gm1, T_unit, use_h2, eos_tab, op,
+                         groups, n_group, Eg0, e0_ref);
+          if (std::abs(R0) / etot <= inner_tol) {
+            conv = true;
+            break;
+          }
+          const Real dT = 1.0e-4 * T + 1.0e-12;
+          const Real Rp =
+              (MGResidual(T + dT, rho, kdust, arad, chat, c, dt, gm1, T_unit, use_h2, eos_tab,
+                          op, groups, n_group, Eg0, e0_ref) -
+               R0) /
+              dT;
+          Real Tn = T - R0 / (Rp + RadFuzz());
+          if (!(Tn > tfloor)) Tn = 0.5 * (T + tfloor); // guard NaN/undershoot
+          T = Tn;
+        }
+        if (!conv) lnfail += 1;
+
+        // Converged T -> per-group implicit energies + gas thermal change.
+        const Real kP = PlanckOpacity(op, rho, T) * kdust;
+        const Real T4 = T * T * T * T;
+        Real Egn[MAX_GROUP];
+        Real Esum_new = 0.0;
+        for (int g = 0; g < n_group; ++g) {
+          const Real Bg = arad * T4 * groups.PlanckFraction(g, T * T_unit);
+          const Real ag = chat * dt * rho * kP * groups.KappaMult(g);
+          Egn[g] = std::max((Eg0[g] + ag * Bg) / (1.0 + ag), efloor);
+          Esum_new += Egn[g];
+        }
+        const Real dEg = (use_h2 ? eos_tab.EintFromRhoTk(rho, T * T_unit) : rho * T / gm1) -
+                         e0_ref;
+
+        // Flux attenuation + radiation-force momentum exchange, summed over groups.
+        Real dFx[MAX_GROUP], dFy[MAX_GROUP], dFz[MAX_GROUP];
+        Real sdFx = 0.0, sdFy = 0.0, sdFz = 0.0;
+        const Real kR = RosselandOpacity(op, rho, T) * kdust;
+        const Real ks = ScatteringOpacity(op, rho, T);
+        for (int g = 0; g < n_group; ++g) {
+          const Real ag = chat * dt * rho * (kR * groups.KappaMult(g) + ks);
+          const Real fac = -ag / (1.0 + ag);
+          dFx[g] = fac * Fxg0[g];
+          dFy[g] = fac * Fyg0[g];
+          dFz[g] = fac * Fzg0[g];
+          sdFx += dFx[g];
+          sdFy += dFy[g];
+          sdFz += dFz[g];
+        }
+        const Real icc = 1.0 / (c * chat * rho);
+        const Real dvx = -icc * sdFx, dvy = -icc * sdFy, dvz = -icc * sdFz;
+        const Real vx = m1 / rho, vy = m2 / rho, vz = m3 / rho;
+        const Real vnx = vx + dvx, vny = vy + dvy, vnz = vz + dvz;
+        const Real dEk = 0.5 * rho * ((vnx * vnx - vx * vx) + (vny * vny - vy * vy) +
+                                      (vnz * vnz - vz * vz));
+
+        // Write back. Radiation energy: the emission/absorption part is in Egn; the kinetic
+        // radiation-work chat/c*dEk is removed pro-rata across groups (Sum removal exact up
+        // to per-group flooring). Then apply flux attenuation and gas momentum/energy.
+        const Real kin = chat / c * dEk;
+        const Real inv_Esum = 1.0 / (Esum_new + RadFuzz());
+        for (int g = 0; g < n_group; ++g) {
+          pack(b, iEg[g], k, j, i) = std::max(Egn[g] - kin * Egn[g] * inv_Esum, efloor);
+          pack(b, iXg[g], k, j, i) = Fxg0[g] + dFx[g];
+          pack(b, iYg[g], k, j, i) = Fyg0[g] + dFy[g];
+          pack(b, iZg[g], k, j, i) = Fzg0[g] + dFz[g];
+        }
+        pack(b, ic + IM1, k, j, i) = m1 + dvx * rho;
+        pack(b, ic + IM2, k, j, i) = m2 + dvy * rho;
+        pack(b, ic + IM3, k, j, i) = m3 + dvz * rho;
+        pack(b, ic + IEN, k, j, i) += dEg + dEk;
+      },
+      Kokkos::Sum<int>(nfail));
+
+  if (nfail > 0) {
+    static bool warned_mg = false;
+    if (!warned_mg) {
+      warned_mg = true;
+      std::cout << "### RADIATION WARNING: multigroup matter coupling did not converge in "
+                << nfail << " cell(s) this step (inner_iteration_max=" << inner_max
+                << ", tol=" << inner_tol << "); last iterate written. (warn-once)"
+                << std::endl;
+    }
+  }
   return TaskStatus::complete;
 }
 
@@ -233,6 +468,9 @@ TaskStatus MatterCoupling(MeshData<Real> *md, const Real dt) {
   IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
 
   auto pkg = pmb->pmy_mesh->packages.Get("radiation");
+  // Multigroup: dispatch to the group-coupled solve. n_group=1 falls through to the gray
+  // path below, byte-for-byte unchanged (production/prod_v9 is gray).
+  if (pkg->Param<int>("n_group") > 1) return MatterCouplingMultigroup(md, dt);
   const Real chat = pkg->Param<Real>("chat");
   const Real c = pkg->Param<Real>("c");
   const Real arad = pkg->Param<Real>("arad");
@@ -463,7 +701,9 @@ void AddRadiationTasks(TaskCollection &tc, Mesh *pmesh, const Real dt) {
   auto pkg = pmesh->packages.Get("radiation");
   const bool do_coupling = pkg->Param<bool>("matter_coupling");
 
-  const std::vector<std::string> rad_names{"rad.Er", "rad.Fr1", "rad.Fr2", "rad.Fr3"};
+  // Multigroup: the rad-only sub-container (flux correction + ghost exchange) must carry
+  // ALL groups' moments. For n_group=1 this is exactly the four gray names.
+  const std::vector<std::string> rad_names = AllRadFieldNames(pkg->Param<int>("n_group"));
   auto partitions = pmesh->GetDefaultBlockPartitions();
   const int num_partitions = partitions.size();
   TaskRegion &region = tc.AddRegion(num_partitions);

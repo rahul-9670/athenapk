@@ -17,6 +17,8 @@
 #define RADIATION_RADIATION_GROUPS_HPP_
 
 #include <cmath>
+#include <string>
+#include <vector>
 
 #include <Kokkos_Core.hpp>
 
@@ -60,6 +62,10 @@ struct RadGroups {
   // group frequency edges [Hz], size n_group+1; nu_edge[0]=0, nu_edge[n_group]=+inf (HUGE).
   Real nu_edge[MAX_GROUP + 1] = {0.0};
   Real h_over_k = 4.799243e-11; // h/k_B [s*K]  (Planck const / Boltzmann)
+  // Per-group opacity multiplier vs the gray opacity: kappa_{P/R},g = kappa_gray * mult[g],
+  // where mult[g] = (nu_rep[g]/nu_ref)^opacity_nu_index. Default 1.0 (nu-independent =>
+  // gray-per-group). Filled by FillKappaMult (host, at package init).
+  Real kappa_mult[MAX_GROUP] = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
 
   //! Equilibrium Planck energy fraction in group g at matter temperature T [K].
   //! sum_g PlanckFraction(g,T) == 1 exactly (edges span [0,inf)).
@@ -69,7 +75,49 @@ struct RadGroups {
     const Real xhi = (g == n_group - 1) ? 1.0e30 : h_over_k * nu_edge[g + 1] / T;
     return PlanckCumFraction(xhi) - PlanckCumFraction(xlo);
   }
+
+  //! Per-group opacity multiplier (device-callable). mult[0]=..=1 => gray-per-group.
+  KOKKOS_INLINE_FUNCTION Real KappaMult(const int g) const { return kappa_mult[g]; }
+
+  //! Representative (log-center) frequency [Hz] of group g. The soft (g=0) group [0,nu1] is
+  //! represented by its upper edge; the hard (last) group [nu_{n-1},inf) by its lower edge;
+  //! interior groups by sqrt(nu_g * nu_{g+1}). Monotone increasing in g.
+  Real RepFreqHz(const int g) const {
+    if (n_group == 1) return nu_edge[1];
+    if (g == 0) return nu_edge[1];
+    if (g == n_group - 1) return nu_edge[g];
+    return std::sqrt(nu_edge[g] * nu_edge[g + 1]);
+  }
 };
+
+//----------------------------------------------------------------------------------------
+//! Fill the per-group opacity multipliers for a monochromatic power law kappa_nu =
+//! kappa_gray*(nu/nu_ref)^p. p=0 leaves every multiplier at 1 (gray-per-group => exact
+//! equivalence to the gray coupling). Host-side; called once at package init.
+inline void FillKappaMult(RadGroups &g, const Real p, const Real nu_ref_hz) {
+  for (int i = 0; i < g.n_group; ++i)
+    g.kappa_mult[i] = std::pow(g.RepFreqHz(i) / nu_ref_hz, p);
+}
+
+//----------------------------------------------------------------------------------------
+//! HDF5/pack field names for group g's four M1 moments (Er, Fr1, Fr2, Fr3). Group 0 keeps
+//! the ORIGINAL gray names ("rad.Er", ...) so a gray (n_group=1) run's output/restart is
+//! byte-for-byte unchanged; groups g>0 get a "_gG" suffix. Order is always {Er,Fr1,Fr2,Fr3}.
+inline std::vector<std::string> GroupFieldNames(const int g) {
+  if (g == 0) return {"rad.Er", "rad.Fr1", "rad.Fr2", "rad.Fr3"};
+  const std::string s = "_g" + std::to_string(g);
+  return {"rad.Er" + s, "rad.Fr1" + s, "rad.Fr2" + s, "rad.Fr3" + s};
+}
+
+//! All radiation moment field names across n_group groups (group 0 first). For n_group=1
+//! this is exactly the four gray names, in the original order.
+inline std::vector<std::string> AllRadFieldNames(const int n_group) {
+  std::vector<std::string> v;
+  v.reserve(4 * n_group);
+  for (int g = 0; g < n_group; ++g)
+    for (const auto &nm : GroupFieldNames(g)) v.push_back(nm);
+  return v;
+}
 
 //----------------------------------------------------------------------------------------
 //! Build a default (gray) or log-spaced multigroup structure. n_group=1 -> gray (bit-identical).

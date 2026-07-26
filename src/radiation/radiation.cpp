@@ -19,6 +19,7 @@
 #include "../units/physical_units.hpp" // flagship Phase 1: one unit system (audit #4)
 #include "radiation.hpp"
 #include "radiation_closure.hpp"
+#include "radiation_groups.hpp"
 #include "radiation_opacity.hpp"
 
 namespace Radiation {
@@ -140,6 +141,30 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                     "radiation/closure must be M1 or P1 (got: " + closure + ").");
   pkg->AddParam("closure", closure);
 
+  // --- Multigroup frequency structure (Phase 4) ------------------------------
+  // n_group=1 (default) => a single group spanning [0,inf) == the gray path, bit-identical.
+  // n_group>1 partitions the spectrum into log-spaced groups [nu_min,nu_max] Hz (edges 0 and
+  // +inf on the ends so no energy is lost); each group carries its own (Er_g,Fr_g) M1 system,
+  // the closure is frequency-independent (reused per group), and the groups couple ONLY
+  // through the matter temperature in MatterCoupling. Monochromatic opacity nu-dependence
+  // kappa_nu ~ (nu/nu_ref)^opacity_nu_index (index 0 => gray-per-group).
+  const int n_group = pin->GetOrAddInteger(bn, "n_group", 1);
+  PARTHENON_REQUIRE(n_group >= 1 && n_group <= MAX_GROUP,
+                    "radiation/n_group must be in [1, MAX_GROUP=8].");
+  const Real nu_min_hz = pin->GetOrAddReal(bn, "nu_min_hz", 1.0e12); // ~40 K blackbody peak
+  const Real nu_max_hz = pin->GetOrAddReal(bn, "nu_max_hz", 1.0e15); // ~far-UV
+  RadGroups groups = BuildRadGroups(n_group, nu_min_hz, nu_max_hz);
+  // Monochromatic opacity power-law index p in kappa_nu = kappa_gray*(nu/nu_ref)^p, used to
+  // form the per-group Planck/Rosseland means (MG-3). p=0 => every group mean == the gray
+  // opacity => multigroup reduces EXACTLY to n_group copies of gray (equivalence gate).
+  const Real opacity_nu_index = pin->GetOrAddReal(bn, "opacity_nu_index", 0.0);
+  const Real nu_ref_hz = pin->GetOrAddReal(bn, "nu_ref_hz", nu_min_hz);
+  FillKappaMult(groups, opacity_nu_index, nu_ref_hz);
+  pkg->AddParam("groups", groups);
+  pkg->AddParam("n_group", n_group);
+  pkg->AddParam("opacity_nu_index", opacity_nu_index);
+  pkg->AddParam("nu_ref_hz", nu_ref_hz);
+
   // --- Transport controls (increment 2b) -------------------------------------
   pkg->AddParam("cfl", pin->GetOrAddReal(bn, "cfl", 0.4));       // radiation CFL number
   pkg->AddParam("efloor", pin->GetOrAddReal(bn, "efloor", 1.0e-15)); // Er floor
@@ -205,6 +230,11 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   pkg->AddField<rad::Fr1>(m);
   pkg->AddField<rad::Fr2>(m);
   pkg->AddField<rad::Fr3>(m);
+  // Multigroup: register the extra groups' moments by string name (same Metadata as the
+  // gray fields). Group 0 is the four fields above (original names) so n_group=1 adds
+  // nothing here -> registration is byte-for-byte the gray layout.
+  for (int g = 1; g < n_group; ++g)
+    for (const auto &nm : GroupFieldNames(g)) pkg->AddField(nm, m);
 
   return pkg;
 }

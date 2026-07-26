@@ -9,10 +9,12 @@
 
 #include <cmath>
 #include <string>
+#include <vector>
 
 #include <parthenon/package.hpp>
 
 #include "../main.hpp"
+#include "../radiation/radiation_groups.hpp" // GroupFieldNames (multigroup seeding)
 #include "pgen.hpp"
 
 namespace rad_pulse {
@@ -37,13 +39,26 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
 
   auto rad_pkg = pmb->packages.Get("radiation");
   const Real chat = rad_pkg->Param<Real>("chat");
+  // Multigroup seeding: split the pulse EQUALLY across the n_group groups (each group gets
+  // 1/n_group of E and F, i.e. the SAME reduced flux). Then sum_g E_g,0 = E (the gray IC),
+  // and because every group has identical reduced flux the M1 closure is identical per group,
+  // so under free-streaming each group evolves as (1/n_group)*gray and the group SUM tracks
+  // the gray run cell-for-cell -- the multigroup==gray equivalence gate. n_group=1 => share=1
+  // => group 0 carries the full pulse (bit-identical to the pre-multigroup pgen).
+  const int n_group = rad_pkg->Param<int>("n_group");
+  const Real share = 1.0 / static_cast<Real>(n_group);
 
   auto &data = pmb->meshblock_data.Get();
   auto u = data->Get("cons").data.GetHostMirrorAndCopy();
-  auto Er = data->Get("rad.Er").data.GetHostMirrorAndCopy();
-  auto Fx = data->Get("rad.Fr1").data.GetHostMirrorAndCopy();
-  auto Fy = data->Get("rad.Fr2").data.GetHostMirrorAndCopy();
-  auto Fz = data->Get("rad.Fr3").data.GetHostMirrorAndCopy();
+  // Per-group host mirrors of (Er, Fr1, Fr2, Fr3).
+  std::vector<decltype(data->Get("rad.Er").data.GetHostMirrorAndCopy())> gEr, gFx, gFy, gFz;
+  for (int g = 0; g < n_group; ++g) {
+    const auto nm = Radiation::GroupFieldNames(g);
+    gEr.push_back(data->Get(nm[0]).data.GetHostMirrorAndCopy());
+    gFx.push_back(data->Get(nm[1]).data.GetHostMirrorAndCopy());
+    gFy.push_back(data->Get(nm[2]).data.GetHostMirrorAndCopy());
+    gFz.push_back(data->Get(nm[3]).data.GetHostMirrorAndCopy());
+  }
 
   parthenon::IndexRange ib = pmb->cellbounds.GetBoundsI(parthenon::IndexDomain::entire);
   parthenon::IndexRange jb = pmb->cellbounds.GetBoundsJ(parthenon::IndexDomain::entire);
@@ -66,21 +81,26 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
           u(IB3, k, j, i) = 0.0;
           u(IPS, k, j, i) = 0.0;
         }
-        // radiation pulse + beam
+        // radiation pulse + beam, split equally across groups
         const Real arg = (x1 - x0) / width;
-        const Real E = E0 + Eamp * std::exp(-0.5 * arg * arg);
-        Er(0, k, j, i) = E;
-        Fx(0, k, j, i) = fred * chat * E; // reduced flux fred in +x1
-        Fy(0, k, j, i) = 0.0;
-        Fz(0, k, j, i) = 0.0;
+        const Real E = share * (E0 + Eamp * std::exp(-0.5 * arg * arg));
+        for (int g = 0; g < n_group; ++g) {
+          gEr[g](0, k, j, i) = E;
+          gFx[g](0, k, j, i) = fred * chat * E; // reduced flux fred in +x1
+          gFy[g](0, k, j, i) = 0.0;
+          gFz[g](0, k, j, i) = 0.0;
+        }
       }
     }
   }
   data->Get("cons").data.DeepCopy(u);
-  data->Get("rad.Er").data.DeepCopy(Er);
-  data->Get("rad.Fr1").data.DeepCopy(Fx);
-  data->Get("rad.Fr2").data.DeepCopy(Fy);
-  data->Get("rad.Fr3").data.DeepCopy(Fz);
+  for (int g = 0; g < n_group; ++g) {
+    const auto nm = Radiation::GroupFieldNames(g);
+    data->Get(nm[0]).data.DeepCopy(gEr[g]);
+    data->Get(nm[1]).data.DeepCopy(gFx[g]);
+    data->Get(nm[2]).data.DeepCopy(gFy[g]);
+    data->Get(nm[3]).data.DeepCopy(gFz[g]);
+  }
 }
 
 } // namespace rad_pulse
