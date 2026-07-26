@@ -76,6 +76,14 @@ int main(int argc, char *argv[]) {
     pman.app_input->ProblemGenerator = poisson_test::ProblemGenerator;
   } else if (problem == "rad_pulse") {
     pman.app_input->ProblemGenerator = rad_pulse::ProblemGenerator;
+  } else if (problem == "rad_shadow") {
+    pman.app_input->InitUserMeshData = rad_shadow::InitUserMeshData;
+    pman.app_input->ProblemGenerator = rad_shadow::ProblemGenerator;
+    pman.app_input->RegisterBoundaryCondition(parthenon::BoundaryFace::inner_x1,
+                                              "rad_shadow_beam_x1",
+                                              rad_shadow::InflowBeamX1);
+  } else if (problem == "rad_shock") {
+    pman.app_input->ProblemGenerator = rad_shock::ProblemGenerator;
   } else if (problem == "cpaw") {
     pman.app_input->InitUserMeshData = cpaw::InitUserMeshData;
     pman.app_input->ProblemGenerator = cpaw::ProblemGenerator;

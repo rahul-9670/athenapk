@@ -45,6 +45,18 @@ using namespace parthenon::driver::prelude;
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
 } // namespace rad_pulse
 
+namespace rad_shadow {
+using namespace parthenon::driver::prelude;
+void InitUserMeshData(Mesh *mesh, parthenon::ParameterInput *pin);
+void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+void InflowBeamX1(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse);
+} // namespace rad_shadow
+
+namespace rad_shock {
+using namespace parthenon::driver::prelude;
+void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+} // namespace rad_shock
+
 namespace cpaw {
 using namespace parthenon::driver::prelude;
 

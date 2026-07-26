@@ -32,4 +32,6 @@ target_sources(athenaPK PRIVATE
     collapse_be.cpp
     poisson_test.cpp
     rad_pulse.cpp
+    rad_shadow.cpp
+    rad_shock.cpp
     )
