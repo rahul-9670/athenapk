@@ -72,6 +72,108 @@ Real BEProfile(Real r) {
 // No rotation-vs-ambient distinction — inside sphere has solid-body rotation,
 // outside has zero velocity and ambient density = rho(rc).
 // ---------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------
+//! Register the collapse_be package Params, plus the cgs unit sidecar.
+//!
+//! WP-13 (2026-08-02) -- WHY THIS IS NOT IN ProblemGenerator ANY MORE.
+//!
+//! Parthenon does NOT call ProblemGenerator on a restart: the state comes from the file, so
+//! the pgen never runs. Anything registered only inside it therefore VANISHES on resume.
+//! `collapse_be_rhocrit` used to be registered there, and `hydro_driver.cpp` gates the whole
+//! ApplyBarotropicCooling task on that key existing -- so after every restart the task was
+//! silently dropped from the graph, with no error and no warning. Measured consequence on a
+//! 32^3 glmmhd + tabulated-EOS + RT deck: the first post-restart step lost the outside-sphere
+//! momentum BC, the radiation matter coupling failed in all 262144 cells, dt doubled every
+//! step and the whole field hit the density floor (mass 5.17e4 -> 0.1406). Note the barotropic
+//! e_th overwrite itself is NOT the casualty when radiation is active (rad_owns_energy skips
+//! it anyway) -- the casualty is the outside-sphere momentum BC, which applies in both branches.
+//!
+//! ProblemInitPackageData runs during Hydro::Initialize, which executes on BOTH a fresh start
+//! and a restart, so registering here is restart-safe. Keep it that way: do not move Param
+//! registration back into ProblemGenerator.
+//!
+//! Idempotent -- guarded on the key, so the (now redundant) ProblemGenerator call is a no-op.
+void RegisterCollapseBeParams(parthenon::ParameterInput *pin,
+                              parthenon::StateDescriptor *hydro_pkg) {
+  if (hydro_pkg->AllParams().hasKey("collapse_be_rhocrit")) return;
+
+  const Real gam = pin->GetReal("hydro", "gamma");
+  const Real mass_msun = pin->GetReal("problem/collapse_be", "mass");
+  const Real temp_K = pin->GetReal("problem/collapse_be", "temperature");
+  const Real f = pin->GetReal("problem/collapse_be", "f");
+  const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit");
+
+  // The ONE shared BE derivation (flagship Phase 1 Option A) -- identical to the values
+  // ProblemGenerator computes, so moving the registration here changes no number.
+  const auto be = PhysUnits::DeriveBENormalization(mass_msun, temp_K, f);
+  const Real m0 = be.m0, v0 = be.v0, rho0 = be.rho0, t0 = be.t0, l0 = be.l0;
+  const Real rhocrit_code = rhocrit_cgs / rho0;
+  const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
+
+  hydro_pkg->AddParam("collapse_be_rhocrit", rhocrit_code);
+  hydro_pkg->AddParam("collapse_be_mhd", mhd);
+  hydro_pkg->AddParam("collapse_be_rc", rc_code);
+  hydro_pkg->AddParam("collapse_be_gamma", gam);
+
+  // Consistency guard (flagship Phase 1): the authoritative unit system the microphysics
+  // packages consume (chemistry/radiation/non-ideal) must reproduce this BE normalization
+  // exactly. Both now route through DeriveBENormalization, so this is a regression sentinel
+  // -- it fires only if that sharing is broken or a <units> override slips in.
+  const auto U = PhysUnits::BuildPhysicalUnits(pin);
+  const Real utol = 1.0e-10;
+  PARTHENON_REQUIRE(std::abs(U.rho_unit - rho0) <= utol * rho0 &&
+                        std::abs(U.v_unit - v0) <= utol * v0 &&
+                        std::abs(U.length_unit - l0) <= utol * l0,
+                    "collapse_be: PhysicalUnits base scales disagree with the BE IC "
+                    "normalization -- microphysics units would desync from the dynamics.");
+
+  // === Unit conversion factors to cgs ===
+  // Multiply a code-unit value by these to obtain cgs.
+  const Real code_length_cgs = l0;
+  const Real code_time_cgs = t0;
+  const Real code_mass_cgs = m0;
+  const Real code_density_cgs = rho0;
+  const Real code_velocity_cgs = l0 / t0;
+  const Real code_energy_cgs = m0 * (l0 / t0) * (l0 / t0);
+  // Audit fix #3 / flagship Phase 1: the Heaviside-Lorentz magnetic unit
+  // B_cgs = sqrt(4*pi*rho0)*v0 (P_mag = B^2/2) is taken from the ONE definition in units.hpp
+  // (Units::CodeMagneticCgs), the same formula PhysicalUnits uses -- so this sidecar cannot
+  // drift from the code's internal B convention. The BE derivation gives mass_unit =
+  // rho0*l0^3 exactly, so CodeMagneticCgs(m0,l0,t0) == sqrt(4*pi*rho0)*v0.
+  // (Previously the sqrt(4*pi) was dropped, under-reporting physical B by ~3.545.)
+  const Real code_bfield_cgs =
+      Units::CodeMagneticCgs(code_mass_cgs, code_length_cgs, code_time_cgs);
+
+  hydro_pkg->AddParam("units/code_length_cgs", code_length_cgs);
+  hydro_pkg->AddParam("units/code_time_cgs", code_time_cgs);
+  hydro_pkg->AddParam("units/code_mass_cgs", code_mass_cgs);
+  hydro_pkg->AddParam("units/code_density_cgs", code_density_cgs);
+  hydro_pkg->AddParam("units/code_velocity_cgs", code_velocity_cgs);
+  hydro_pkg->AddParam("units/code_energy_cgs", code_energy_cgs);
+  hydro_pkg->AddParam("units/code_bfield_cgs", code_bfield_cgs);
+
+  // Sidecar JSON dump (rank 0 only; once per run).
+  if (parthenon::Globals::my_rank == 0) {
+    std::ofstream js("units.json");
+    js.precision(12);
+    js << "{\n"
+       << "  \"code_length_cgs\":   " << code_length_cgs << ",\n"
+       << "  \"code_time_cgs\":     " << code_time_cgs << ",\n"
+       << "  \"code_mass_cgs\":     " << code_mass_cgs << ",\n"
+       << "  \"code_density_cgs\":  " << code_density_cgs << ",\n"
+       << "  \"code_velocity_cgs\": " << code_velocity_cgs << ",\n"
+       << "  \"code_energy_cgs\":   " << code_energy_cgs << ",\n"
+       << "  \"code_bfield_cgs\":   " << code_bfield_cgs << "\n"
+       << "}\n";
+  }
+}
+
+//! Package-init hook. Runs on BOTH a fresh start and a restart (unlike ProblemGenerator).
+void ProblemInitPackageData(parthenon::ParameterInput *pin,
+                            parthenon::StateDescriptor *hydro_pkg) {
+  RegisterCollapseBeParams(pin, hydro_pkg);
+}
+
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   // For the tabulated protostellar EOS, cold molecular H2 (10 K, rotation frozen) is
   // monatomic-like: e_int = 1.5 p (gamma=5/3), not p/(gamma-1). Seeding the ideal value
@@ -113,64 +215,13 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   auto hydro_pkg = pmb->packages.Get("Hydro");
   const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
   const Real B0z = mhd ? pin->GetOrAddReal("problem/collapse_be", "B0z", 0.0) : 0.0;
-  if (!hydro_pkg->AllParams().hasKey("collapse_be_rhocrit")) {
-    hydro_pkg->AddParam("collapse_be_rhocrit", rhocrit_code);
-    hydro_pkg->AddParam("collapse_be_mhd", mhd);
-    hydro_pkg->AddParam("collapse_be_rc", rc_code);
-    hydro_pkg->AddParam("collapse_be_gamma", gam);
-
-    // Consistency guard (flagship Phase 1): the authoritative unit system the microphysics
-    // packages consume (chemistry/radiation/non-ideal) must reproduce this BE normalization
-    // exactly. Both now route through DeriveBENormalization, so this is a regression sentinel
-    // -- it fires only if that sharing is broken or a <units> override slips in.
-    const auto U = PhysUnits::BuildPhysicalUnits(pin);
-    const Real utol = 1.0e-10;
-    PARTHENON_REQUIRE(std::abs(U.rho_unit - rho0) <= utol * rho0 &&
-                          std::abs(U.v_unit - v0) <= utol * v0 &&
-                          std::abs(U.length_unit - l0) <= utol * l0,
-                      "collapse_be: PhysicalUnits base scales disagree with the BE IC "
-                      "normalization -- microphysics units would desync from the dynamics.");
-
-    // === Unit conversion factors to cgs ===
-    // Multiply a code-unit value by these to obtain cgs.
-    const Real code_length_cgs   = l0;
-    const Real code_time_cgs     = t0;
-    const Real code_mass_cgs     = m0;
-    const Real code_density_cgs  = rho0;
-    const Real code_velocity_cgs = l0 / t0;
-    const Real code_energy_cgs   = m0 * (l0/t0) * (l0/t0);
-    // Audit fix #3 / flagship Phase 1: the Heaviside-Lorentz magnetic unit
-    // B_cgs = sqrt(4*pi*rho0)*v0 (P_mag = B^2/2) is now taken from the ONE definition in
-    // units.hpp (Units::CodeMagneticCgs), the same formula PhysicalUnits uses -- so this
-    // sidecar cannot drift from the code's internal B convention. The BE derivation gives
-    // mass_unit = rho0*l0^3 exactly, so CodeMagneticCgs(m0,l0,t0) == sqrt(4*pi*rho0)*v0.
-    // (Previously the sqrt(4*pi) was dropped, under-reporting physical B by ~3.545.)
-    const Real code_bfield_cgs   = Units::CodeMagneticCgs(code_mass_cgs, code_length_cgs,
-                                                          code_time_cgs);
-
-    hydro_pkg->AddParam("units/code_length_cgs",   code_length_cgs);
-    hydro_pkg->AddParam("units/code_time_cgs",     code_time_cgs);
-    hydro_pkg->AddParam("units/code_mass_cgs",     code_mass_cgs);
-    hydro_pkg->AddParam("units/code_density_cgs",  code_density_cgs);
-    hydro_pkg->AddParam("units/code_velocity_cgs", code_velocity_cgs);
-    hydro_pkg->AddParam("units/code_energy_cgs",   code_energy_cgs);
-    hydro_pkg->AddParam("units/code_bfield_cgs",   code_bfield_cgs);
-
-    // Sidecar JSON dump (rank 0 only; once per run).
-    if (parthenon::Globals::my_rank == 0) {
-      std::ofstream js("units.json");
-      js.precision(12);
-      js << "{\n"
-         << "  \"code_length_cgs\":   " << code_length_cgs   << ",\n"
-         << "  \"code_time_cgs\":     " << code_time_cgs     << ",\n"
-         << "  \"code_mass_cgs\":     " << code_mass_cgs     << ",\n"
-         << "  \"code_density_cgs\":  " << code_density_cgs  << ",\n"
-         << "  \"code_velocity_cgs\": " << code_velocity_cgs << ",\n"
-         << "  \"code_energy_cgs\":   " << code_energy_cgs   << ",\n"
-         << "  \"code_bfield_cgs\":   " << code_bfield_cgs   << "\n"
-         << "}\n";
-    }
-  }
+  // NOTE(WP-13, 2026-08-02): the registration below now lives in RegisterCollapseBeParams(),
+  // which ProblemInitPackageData calls during package Initialize -- a hook that runs on BOTH
+  // a fresh start AND a restart. This call is therefore a no-op in normal operation (the key
+  // already exists) and is kept only as a belt-and-braces fallback. It must NOT be the sole
+  // registration site: ProblemGenerator is not called on restart, so anything registered only
+  // here silently vanishes on resume -- which is exactly the bug WP-13 found.
+  RegisterCollapseBeParams(pin, hydro_pkg.get());
 
   // Log (rank 0 only)
   if (parthenon::Globals::my_rank == 0 && pmb->gid == 0) {
@@ -217,6 +268,21 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   // scalar_density component sits just past the hydro vars in the cons pack.
   const int nscalars_ic = pin->GetOrAddInteger("hydro", "nscalars", 0);
   const int iscal0 = mhd ? (IPS + 1) : NHYDRO;
+
+  // Dust ICs (WS-4). The species loops below zero EVERY scalar past the chemistry
+  // block, which silently left f_dg = a_c = 0: the dust package then "evolved" an
+  // empty grain population, and the `diffusion/dust_coupling` ionization feedback
+  // read zeros and no-op'd (measured 2026-07-30 on an FHC run: prim[14]/prim[15]
+  // identically 0.0 with <dust> evolve=true). Seed the reference MRN state so the
+  // dust scalars start from the same grains the ionization model assumes, keeping
+  // <dust> evolve=true consistent with the a_ref_cm/f_dg_ref the package uses.
+  // The dust package REQUIREs nscalars >= scalar_index+2 when evolve=true; the
+  // index guard below keeps this a no-op for any other configuration.
+  const bool dust_ic_on = pin->GetOrAddBoolean("dust", "evolve", false);
+  const int dust_si = pin->GetOrAddInteger("dust", "scalar_index", 0);
+  const Real dust_fdg_ic = pin->GetOrAddReal("dust", "f_dg_ref", 0.01);
+  const Real dust_ac_ic = pin->GetOrAddReal("dust", "a_ref_cm", 1.0e-5);
+  const bool seed_dust = dust_ic_on && (dust_si + 1 < nscalars_ic);
 
   for (int k = kb.s; k <= kb.e; ++k) {
     Real z = coords.Xc<3>(k);
@@ -278,6 +344,12 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
           u(iscal0 + 1, k, j, i) = 0.0; // x_H2 = 0
           for (int s = 2; s < nscalars_ic; ++s) u(iscal0 + s, k, j, i) = 0.0;
         }
+        // Dust pair, written AFTER the species zero-fill above (which would
+        // otherwise clear it): scalar_density = rho * f_dg, rho * a_c [cm].
+        if (seed_dust) {
+          u(iscal0 + dust_si + 0, k, j, i) = rho * dust_fdg_ic;
+          u(iscal0 + dust_si + 1, k, j, i) = rho * dust_ac_ic;
+        }
       }
     }
   }
@@ -296,6 +368,30 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
     const int   nmodes  = pin->GetOrAddInteger("problem/collapse_be", "turb_nmodes", 64);
     const Real  zeta    = pin->GetOrAddReal("problem/collapse_be", "turb_zeta", 0.5);
     const Real  alpha_s = pin->GetOrAddReal("problem/collapse_be", "turb_alpha", 2.0);
+    // WP-20 (2026-07-31): which spectral convention `turb_alpha` carries is decided
+    // ENTIRELY by how |k| is sampled, because the shell-integrated spectrum is
+    //     E(k) dk = (dN/dk) * |v_k|^2 dk ,   with |v_k| = k^(-alpha/2) below.
+    //   "flat" (legacy default): |k| ~ U(k_min, k_max) => dN/dk = const
+    //        => E(k) ~ k^(-alpha), i.e. alpha is the 1D SHELL-INTEGRATED slope.
+    //           Kolmogorov = 5/3; Burgers = 2 = this pgen's turb_alpha default (consistent).
+    //   "k2": |k| sampled uniformly over the 3D k-space VOLUME, dN/dk ~ k^2, by inverse
+    //        transform of that density (see below)
+    //        => E(k) ~ k^2 * k^(-alpha) = k^(2-alpha), i.e. alpha is the 3D PSD slope.
+    //           Kolmogorov = 11/3 = 3.667.
+    // The production decks carried turb_alpha=3.667 (the 3D-PSD number) against the "flat"
+    // sampler, which actually produced E(k) ~ k^(-11/3) -- far steeper than Kolmogorov:
+    // 84.6% of the turbulent energy sat in k=1-2 (vs 49.3% for true Kolmogorov), and the
+    // k=8 mode was 1/45 of the k=1 amplitude. "k2" is the standard construction and pairs
+    // correctly with 3.667. It also fixes a second defect of "flat": with nmodes=128 over
+    // k in [1,8] the flat sampler puts only ~18 modes at k<=2 yet those carry ~85% of the
+    // energy, so the high-k end is starved and the realization rests on a couple of dozen
+    // random numbers. DEFAULT IS "flat" so every pre-existing deck reproduces bit-for-bit;
+    // opt in with `turb_ksample = k2`.
+    const std::string ksample = pin->GetOrAddString(
+        "problem/collapse_be", "turb_ksample", std::string("flat"));
+    PARTHENON_REQUIRE(ksample == "flat" || ksample == "k2",
+                      "problem/collapse_be/turb_ksample must be 'flat' or 'k2'.");
+    const bool ksample_k2 = (ksample == "k2");
     const std::string region = pin->GetOrAddString(
         "problem/collapse_be", "turb_region", std::string("sphere"));
     const uint32_t seed = static_cast<uint32_t>(
@@ -313,13 +409,22 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
     std::uniform_real_distribution<Real> uang(0.0, 2.0 * M_PI);
     std::uniform_real_distribution<Real> ukmag(static_cast<Real>(k_min),
                                                static_cast<Real>(k_max));
+    // k^2-weighted path (turb_ksample=k2). Inverse transform of p(k) ∝ k^2 on
+    // [k_min,k_max]: F(k) = (k^3-k_min^3)/(k_max^3-k_min^3), so k = cbrt(k_min^3 +
+    // u*(k_max^3-k_min^3)) with u~U(0,1). Consumes EXACTLY ONE variate per mode, the
+    // same as the flat path, so the rest of the RNG stream (directions, phases) is
+    // drawn in the identical order and the "flat" branch is bit-identical to legacy.
+    std::uniform_real_distribution<Real> uunit(0.0, 1.0);
+    const Real k3lo = std::pow(static_cast<Real>(k_min), 3);
+    const Real k3hi = std::pow(static_cast<Real>(k_max), 3);
 
     std::vector<std::array<Real,3>> k_vec(nmodes), phase(nmodes),
                                      eps_sol(nmodes), eps_comp(nmodes);
     std::vector<Real> t_amp(nmodes);
 
     for (int m = 0; m < nmodes; ++m) {
-      const Real kmag = ukmag(mrng);
+      const Real kmag = ksample_k2 ? std::cbrt(k3lo + uunit(mrng) * (k3hi - k3lo))
+                                   : ukmag(mrng);
       const Real cos_t = ucos(mrng);
       const Real sin_t = std::sqrt(std::max(0.0, 1.0 - cos_t * cos_t));
       const Real phi_k = uang(mrng);
@@ -458,7 +563,17 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
                 << "Target Mach (RMS)   : " << turb_mach << "\n"
                 << "Modes               : " << nmodes
                 << "  k in [" << k_min << ", " << k_max << "]"
-                << "  zeta=" << zeta << "  alpha=" << alpha_s << "\n"
+                << "  zeta=" << zeta << " (solenoidal energy fraction)"
+                << "  alpha=" << alpha_s << "\n"
+                // WP-20: state the resulting spectrum explicitly. turb_alpha means
+                // different things under the two samplers and the difference is large.
+                << "k sampling          : " << ksample
+                << (ksample_k2 ? "  (dN/dk ~ k^2; alpha is the 3D PSD slope)"
+                               : "  (dN/dk = const; alpha is the 1D shell slope)")
+                << "\n"
+                << "=> E(k) ~ k^-"
+                << (ksample_k2 ? alpha_s - 2.0 : alpha_s)
+                << "   [Kolmogorov = k^-1.667]\n"
                 << "Analytic vrms       : " << vrms_analytic << " (code v)\n"
                 << "Scale factor        : " << scale << "\n"
                 << "Mean subtracted     : (" << vmean[0] * scale << ", "

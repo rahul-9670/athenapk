@@ -32,10 +32,29 @@ class AdiabaticGLMMHDEOS : public EquationOfState {
   AdiabaticGLMMHDEOS(Real pressure_floor, Real density_floor, Real internal_e_floor,
                      Real velocity_ceiling, Real internal_e_ceiling, Real gamma,
                      bool use_h2diss = false,
-                     EOSTable::EosTable eos_tab = EOSTable::EosTable())
+                     EOSTable::EosTable eos_tab = EOSTable::EosTable(),
+                     Real boris_ca_max = 0.0, bool ct_glm_inert = false)
       : EquationOfState(pressure_floor, density_floor, internal_e_floor, velocity_ceiling,
                         internal_e_ceiling),
-        gamma_{gamma}, use_h2diss_{use_h2diss}, eos_tab_{eos_tab} {}
+        gamma_{gamma}, use_h2diss_{use_h2diss}, eos_tab_{eos_tab},
+        boris_inv_ca2_{boris_ca_max > 0.0 ? 1.0 / (boris_ca_max * boris_ca_max) : 0.0},
+        ct_glm_inert_{ct_glm_inert} {}
+
+  // --- Boris / semi-relativistic Alfven-speed limiter ---------------------------------
+  // Optional cap c_b on the Alfven speed used in the FORCE (Maxwell stress) and SIGNAL
+  // speeds, to relax the timestep / tame the vA runaway in evacuated magnetized cells
+  // (e.g. the first-core magnetic wall). Disabled (bit-identical) when boris_inv_ca2_==0
+  // (boris_ca_max<=0). Formulation: replace B^2 -> B_eff^2 = B^2 / (1 + B^2/(rho c_b^2))
+  // everywhere B exerts force or sets a speed; then vA_eff^2 = B_eff^2/rho -> c_b^2 as
+  // B->inf, and -> real vA when vA<<c_b. The INDUCTION equation keeps the real B (Boris
+  // changes how B acts on the fluid, not how B evolves). boris_inv_ca2_ = 1/c_b^2.
+  KOKKOS_FORCEINLINE_FUNCTION
+  bool BorisOn() const { return boris_inv_ca2_ > 0.0; }
+  // Boris factor lambda = 1/(1 + vA^2/c_b^2), vA^2 = b2/rho. lambda in (0,1]; ==1 when off.
+  KOKKOS_FORCEINLINE_FUNCTION
+  Real BorisLambda(const Real d, const Real b2) const {
+    return boris_inv_ca2_ > 0.0 ? 1.0 / (1.0 + (b2 / d) * boris_inv_ca2_) : 1.0;
+  }
 
   void ConservedToPrimitive(MeshData<Real> *md) const override;
 
@@ -75,9 +94,14 @@ class AdiabaticGLMMHDEOS : public EquationOfState {
     // asq here is rho*c_s^2 (= gamma*p for an ideal gas); use the general Saha c_s^2 when
     // the H2-dissociation EOS is active.
     Real asq = use_h2diss_ ? d * eos_tab_.AsqFromRhoPres(d, p) : gamma_ * p;
-    Real ct2 = by * by + bz * bz;
-    Real qsq = bx * bx + ct2 + asq;
-    Real tmp = bx * bx + ct2 - asq;
+    // Boris limiter: replace B^2 -> lambda*B^2 in the magnetic (speed) terms so the fast
+    // speed used for BOTH the HLLD signal speeds and the CFL timestep is capped consistently
+    // with the Maxwell-stress scaling in the flux. lambda==1 (bit-identical) when disabled.
+    const Real lam = BorisLambda(d, bx * bx + by * by + bz * bz);
+    const Real bx2 = lam * bx * bx;
+    Real ct2 = lam * (by * by + bz * bz);
+    Real qsq = bx2 + ct2 + asq;
+    Real tmp = bx2 + ct2 - asq;
     return std::sqrt(0.5 * (qsq + std::sqrt(tmp * tmp + 4.0 * asq * ct2)) / d);
   }
   //
@@ -136,6 +160,21 @@ class AdiabaticGLMMHDEOS : public EquationOfState {
     w_Bx = u_b1;
     w_By = u_b2;
     w_Bz = u_b3;
+    // Constrained transport: the GLM/Dedner scalar is INERT and must be held at exactly
+    // zero. Under CT the face field is the primary magnetic variable and the cell-centered
+    // B is overwritten by its projection every substage, which DISCARDS the psi->B half of
+    // the Dedner cleaning loop. psi is still sourced by the Riemann solver
+    // (flxi[IPS] = c_h^2 * bxi) but never relieved, so it grows without bound -- measured
+    // |psi|_max = 4.8e2 on the CT flagship vs 1.9e0 on the matched GLM run (244x). That
+    // runaway then feeds straight back into every Riemann solve through the decoupled
+    // normal field bxi = 1/2(BL+BR) - (psiR-psiL)/(2 c_h) (glmmhd_hlld.hpp), corrupting the
+    // momentum and energy fluxes. Zeroing the CONSERVED psi here (not just the primitive)
+    // covers restarts and ghost cells: every cons->prim pass, i.e. before every flux
+    // evaluation, leaves psi == 0, so bxi reduces to the plain average and flxi[IPS] is
+    // re-zeroed each stage. GLM path (ct_glm_inert_ == false) is untouched/bit-identical.
+    if (ct_glm_inert_) {
+      u_psi = 0.0;
+    }
     w_psi = u_psi;
 
     Real e_k = 0.5 * di * (SQR(u_m1) + SQR(u_m2) + SQR(u_m3));
@@ -216,6 +255,8 @@ class AdiabaticGLMMHDEOS : public EquationOfState {
   Real gamma_; // ratio of specific heats
   bool use_h2diss_;            // enable tabulated protostellar EOS (second-core physics)
   EOSTable::EosTable eos_tab_; // interpolated table (View handles; device-copyable)
+  Real boris_inv_ca2_;        // 1/c_b^2 for the Boris Alfven-speed limiter (0 = disabled)
+  bool ct_glm_inert_;         // CT: hold the GLM scalar psi identically zero (see ConsToPrim)
 };
 
 #endif // EOS_ADIABATIC_GLMMHD_HPP_

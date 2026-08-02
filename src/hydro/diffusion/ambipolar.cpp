@@ -113,6 +113,11 @@ void AmbipolarDiffFluxIsoFixed(MeshData<Real> *md) {
   // ambipolar *energy* (Poynting) term in cons.flux(IEN) stays on the finite-volume energy
   // flux. GLM path (use_ct=false): deposits unchanged, bit-identical. Mirrors resistivity.cpp.
   const bool ct_induction = hydro_pkg->Param<bool>("use_ct");
+  // Under CT+RKL2 the diffusive energy flux is rebuilt from the CT edge EMF instead
+  // (CT_AddDiffusivePoynting), so that it uses the SAME stencil as the induction. The
+  // face-based deposit below is otherwise inconsistent with AmbiEdgeEMF_E*, and the
+  // difference lands in e = E - KE - ME. See ct.cpp.
+  const bool ct_energy = hydro_pkg->Param<bool>("ct_edge_poynting");
 
   auto const &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
 
@@ -192,7 +197,9 @@ void AmbipolarDiffFluxIsoFixed(MeshData<Real> *md) {
           cons.flux(X1DIR, IB2, k, j, i) += -e3;
           cons.flux(X1DIR, IB3, k, j, i) += e2;
         }
-        cons.flux(X1DIR, IEN, k, j, i) += e2 * b3 - e3 * b2;
+        if (!ct_energy) {
+          cons.flux(X1DIR, IEN, k, j, i) += e2 * b3 - e3 * b2;
+        }
       });
 
   if (ndim < 2) {
@@ -260,7 +267,9 @@ void AmbipolarDiffFluxIsoFixed(MeshData<Real> *md) {
           cons.flux(X2DIR, IB1, k, j, i) += e3;
           cons.flux(X2DIR, IB3, k, j, i) += -e1;
         }
-        cons.flux(X2DIR, IEN, k, j, i) += e3 * b1 - e1 * b3;
+        if (!ct_energy) {
+          cons.flux(X2DIR, IEN, k, j, i) += e3 * b1 - e1 * b3;
+        }
       });
 
   if (ndim < 3) {
@@ -324,6 +333,8 @@ void AmbipolarDiffFluxIsoFixed(MeshData<Real> *md) {
           cons.flux(X3DIR, IB1, k, j, i) += -e2;
           cons.flux(X3DIR, IB2, k, j, i) += e1;
         }
-        cons.flux(X3DIR, IEN, k, j, i) += e1 * b2 - e2 * b1;
+        if (!ct_energy) {
+          cons.flux(X3DIR, IEN, k, j, i) += e1 * b2 - e2 * b1;
+        }
       });
 }

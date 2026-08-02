@@ -115,6 +115,26 @@ struct IonizationModel {
   // Saha bisection has an absolute resolution floor that injects spurious electrons in cold
   // gas. Kept only to bit-reproduce pre-fix results. See the Phase-3 conductivity gate.
   bool legacy_charge_solver = false;
+
+  // --- WS-4 DUST COUPLING (flagship audit item 5) ---------------------------------------
+  // Per-cell multiplicative overrides of the STATIC MRN grain population, set from the
+  // evolved dust scalars (f_dg, a_c) of the dust package. Grains dominate recombination
+  // over most of the collapse, so the conductivities must see the grain population the
+  // simulation actually evolved -- not a frozen ISM MRN distribution. Physics: total dust
+  // mass scales with f_dg_scale and every bin radius with a_scale, so the per-bin number
+  // density goes as f_dg_scale/a_scale^3 and the total grain CROSS-SECTION (which sets the
+  // recombination rate, hence x_e, hence all three etas) goes as f_dg_scale/a_scale. Grain
+  // GROWTH therefore raises the diffusivities, as it must.
+  // 1.0 / 1.0 = the static MRN population => bit-identical to the uncoupled model
+  // (x*1.0 is exact in IEEE-754; no fast-math in the Release build).
+  // NOTE: these scale the CHARGE/CONDUCTIVITY grain population only. SetupGrainBins fills
+  // a_k host-side and is deliberately NOT scaled -- a_k stays the reference MRN grid.
+  Real f_dg_scale = 1.0;
+  Real a_scale = 1.0;
+
+  //! Effective dust-to-gas mass ratio and bin radius, including the per-cell dust coupling.
+  KOKKOS_INLINE_FUNCTION Real FDG() const { return f_dg * f_dg_scale; }
+  KOKKOS_INLINE_FUNCTION Real Ak(const int k) const { return a_k[k] * a_scale; }
 };
 
 //----------------------------------------------------------------------------------------
@@ -212,12 +232,12 @@ KOKKOS_INLINE_FUNCTION
 void SolveCharges(const IonizationModel &m, const Real n_n, const Real T, Real &n_e,
                   Real &n_i, Real Zk[N_BIN], Real ng[N_BIN]) {
   // grain number densities per bin (zero if sublimated)
-  const Real rho_d = m.f_dg * (n_n * m.mu_n * cgs::m_H);
+  const Real rho_d = m.FDG() * (n_n * m.mu_n * cgs::m_H);
   Real tau[N_BIN], ke0[N_BIN], ki0[N_BIN];
   const Real ve = VBar(T, cgs::m_e);
   const Real vi = VBar(T, m.m_ion * cgs::m_H);
   for (int k = 0; k < N_BIN; ++k) {
-    const Real a = m.a_k[k];
+    const Real a = m.Ak(k);
     const Real m_g = (4.0 / 3.0) * cgs::pi * a * a * a * m.rho_grain;
     ng[k] = (T >= m.T_subl) ? 0.0 : m.mw_k[k] * rho_d / m_g;
     tau[k] = a * cgs::k_B * T / (cgs::e_chg * cgs::e_chg); // reduced temperature
@@ -401,7 +421,7 @@ void Diffusivities(const IonizationModel &m, const Real rho_code, const Real T_c
   // charged grain bins (mean charge Z_k, mass m_gk)
   for (int k = 0; k < N_BIN; ++k) {
     if (ng[k] <= 0.0 || std::abs(Zk[k]) < 1e-30) continue;
-    const Real a = m.a_k[k];
+    const Real a = m.Ak(k);
     const Real m_gk = (4.0 / 3.0) * cgs::pi * a * a * a * m.rho_grain;
     const Real nu_g = (m_n / (m_gk + m_n)) * n_n * (cgs::pi * a * a * vn);
     const Real bg = beta(Zk[k], m_gk, nu_g);
@@ -445,12 +465,12 @@ KOKKOS_INLINE_FUNCTION
 void SolveGrainsFixedNe(const IonizationModel &m, const Real n_n, const Real T,
                         const Real n_e_chem, Real &n_e, Real &n_i, Real Zk[N_BIN],
                         Real ng[N_BIN]) {
-  const Real rho_d = m.f_dg * (n_n * m.mu_n * cgs::m_H);
+  const Real rho_d = m.FDG() * (n_n * m.mu_n * cgs::m_H);
   Real tau[N_BIN];
   const Real ve = VBar(T, cgs::m_e);
   const Real vi = VBar(T, m.m_ion * cgs::m_H);
   for (int k = 0; k < N_BIN; ++k) {
-    const Real a = m.a_k[k];
+    const Real a = m.Ak(k);
     const Real m_g = (4.0 / 3.0) * cgs::pi * a * a * a * m.rho_grain;
     ng[k] = (T >= m.T_subl) ? 0.0 : m.mw_k[k] * rho_d / m_g;
     tau[k] = a * cgs::k_B * T / (cgs::e_chg * cgs::e_chg);
@@ -536,7 +556,7 @@ void DiffusivitiesFromXe(const IonizationModel &m, const Real rho_code, const Re
   }
   for (int k = 0; k < N_BIN; ++k) {
     if (ng[k] <= 0.0 || std::abs(Zk[k]) < 1e-30) continue;
-    const Real a = m.a_k[k];
+    const Real a = m.Ak(k);
     const Real m_gk = (4.0 / 3.0) * cgs::pi * a * a * a * m.rho_grain;
     const Real nu_g = (m_n / (m_gk + m_n)) * n_n * (cgs::pi * a * a * vn);
     const Real bg = beta(Zk[k], m_gk, nu_g);

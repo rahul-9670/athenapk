@@ -70,6 +70,44 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
     const auto x1max = pin->GetReal("parthenon/mesh", "x1max");
     kpar = 2.0 * M_PI * nwave / (x1max - x1min);
   }
+  // iprob=51: ambipolar diffusion of a LOCALIZED Gaussian By wave-packet (not the global
+  // sinusoid of iprob=50 -- a periodic sin/cos has a geometric node/antinode structure in
+  // |By(x)| that confounds a "near bump vs far field" amplitude comparison with genuine
+  // diffusive decay) on a GUIDE FIELD that itself has a localized Gaussian "bump" in |B1|
+  // around x=0: B1(x) = Bx*(1 + (bump_ratio-1)*exp(-(x/bump_width)^2)),
+  // By(x,0) = amp*exp(-(x/wave_width)^2). Since AmbipolarCoeff::fixed has eta_A=Q_A*B^2,
+  // the guide-field bump creates a strongly spatially-varying eta_A (peak/floor ratio =
+  // bump_ratio^2) WITHOUT touching any diffusivity code -- purpose-built to isolate whether
+  // the CT edge-EMF's extra spatial averaging (arithmetic mean over 4 bounding faces, each
+  // itself a 2-cell eta average) under-resolves a diffusivity gradient that is sharp on the
+  // grid scale (bump_width ~ few dx) relative to the validated GLM flux-form path (which
+  // deposits each face's EMF directly, no edge-sharing average). bump_width >> dx is the
+  // smooth control case where both schemes should agree with each other. Since J3=dBy/dx is
+  // the ONLY nonzero current for a field varying purely in x (B3=0 always here), and
+  // dE3/dy=dE2/dz=0 identically, ambipolar diffusion analytically leaves B1(x) exactly
+  // frozen -- any drift of B1 away from its IC is a discrete-force-imbalance/PLM-truncation
+  // artifact seeding real MHD dynamics (compressive/magnetosonic), NOT part of the AD
+  // mechanism under test; t_fin must stay well inside the local ambipolar e-folding time yet
+  // well below the bump's sound-crossing time so B1 stays numerically static (checked
+  // per-run against the phdf output, not just analytically here).
+  // eint(x) is chosen for EXACT total-pressure (thermal + magnetic) equilibrium:
+  // P_th(x) + B1(x)^2/2 = bump_p0 + B0^2/2, i.e.
+  // eint(x) = (bump_p0 - (B1(x)^2 - B0^2)/2) / (gamma-1). bump_p0 (baseline thermal
+  // pressure, rho0=1) must be picked well above the peak magnetic pressure delta
+  // 0.5*(Bx*bump_ratio)^2 - 0.5*Bx^2 so eint(x) stays positive (checked below).
+  Real bump_ratio = 1.0, bump_width = 1.0, bump_p0 = 1.0, wave_width = 1.0;
+  if (iprob == 51) {
+    PARTHENON_REQUIRE_THROWS(mhd_enabled, "iprob=51 (ambipolar variable-eta) requires MHD.");
+    amp = pin->GetOrAddReal("problem/diffusion", "amp", amp);
+    bump_ratio = pin->GetOrAddReal("problem/diffusion", "bump_ratio", 10.0);
+    bump_width = pin->GetOrAddReal("problem/diffusion", "bump_width", 0.05);
+    bump_p0 = pin->GetOrAddReal("problem/diffusion", "bump_p0", 20.0);
+    wave_width = pin->GetOrAddReal("problem/diffusion", "wave_width", 3.0 * bump_width);
+    const Real pmag_delta = 0.5 * (SQR(Bx * bump_ratio) - SQR(Bx));
+    PARTHENON_REQUIRE_THROWS(bump_p0 > pmag_delta,
+                             "iprob=51: bump_p0 too small for total-pressure equilibrium "
+                             "(would give negative eint at the bump peak).");
+  }
 
   // Hall whistler / ion-cyclotron circularly polarized eigenmode test. A traveling wave
   // b+/b- (set with its matching velocity eigenvector) propagates at omega/k given by the
@@ -187,6 +225,16 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
           u(IB1, k, j, i) = Bx; // uniform guide field B0 along x
           u(IB2, k, j, i) = amp * std::sin(kpar * coords.Xc<1>(i));
           eint = 1.0 / (gamma * (gamma - 1.0)); // c_s = 1 everywhere
+          // Ambipolar diffusion with a spatially-varying guide field |B1(x)| (localized
+          // Gaussian bump at x=0) -- see comment above (variable-eta_A CT-vs-GLM probe).
+        } else if (iprob == 51) {
+          const Real xx = coords.Xc<1>(i);
+          const Real b1x = Bx * (1.0 + (bump_ratio - 1.0) * std::exp(-SQR(xx / bump_width)));
+          u(IB1, k, j, i) = b1x;
+          // Localized Gaussian wave packet (not a global sin/cos): see comment above.
+          u(IB2, k, j, i) = amp * std::exp(-SQR(xx / wave_width));
+          // Total-pressure-balanced eint(x): see comment above (iprob=51 setup).
+          eint = (bump_p0 - 0.5 * (SQR(b1x) - SQR(Bx))) / (gamma - 1.0);
           // Hall circularly polarized whistler / ion-cyclotron eigenmode
         } else if (iprob == 60) {
           const Real xx = coords.Xc<1>(i);
@@ -214,41 +262,59 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
       });
 
   // ---- Constrained Transport: initialize the face-centered field Bf ----
-  // Three diffusion tests are CT-wired, all with a field that varies only in x so the face
+  // Four diffusion tests are CT-wired, all with a field that varies only in x so the face
   // init is div-B-free by construction and the projection reproduces the cell-centered u:
   //   iprob=40 (Ohmic Gaussian):      B_y = G(x), B_x=B_z=0.
   //   iprob=50 (ambipolar eigenmode): B_x=B0 (uniform guide), B_y=amp*sin(k x), B_z=0.
+  //   iprob=51 (ambipolar, variable eta_A): B_x=B0*(1+(r-1)exp(-(x/w)^2)) (Gaussian guide-
+  //                                   field bump), B_y=amp*sin(k x), B_z=0.
   //   iprob=60 (Hall whistler):       B_x=B0, B_y=amp*cos(k x), B_z=h*amp*sin(k x). 3D box
   //                                   (2D CT freezes B_z=F3), so the whistler needs ndim=3.
   if (hydro_pkg->Param<bool>("use_ct")) {
     PARTHENON_REQUIRE_THROWS(
-        (iprob == 40) || (iprob == 50) || (iprob == 60),
+        (iprob == 40) || (iprob == 50) || (iprob == 51) || (iprob == 60),
         "Constrained Transport (divergence_control=ct) in the diffusion pgen is currently "
-        "only wired for iprob=40 (Ohmic Gaussian), 50 (ambipolar), 60 (Hall whistler).");
-    const bool is_ad = (iprob == 50);
+        "only wired for iprob=40 (Ohmic Gaussian), 50/51 (ambipolar), 60 (Hall whistler).");
+    const bool is_ad = (iprob == 50) || (iprob == 51);
+    const bool is_ad_bump = (iprob == 51);
     const bool is_hall = (iprob == 60);
     const bool has_guide = is_ad || is_hall;
     const Real gnorm =
         (is_ad || is_hall) ? 0.0 : amp / std::sqrt(4. * M_PI * diff_coeff * t0);
     const Real inv4dt = (is_ad || is_hall) ? 0.0 : 1.0 / (4. * diff_coeff * t0);
-    const Real B0 = Bx;   // guide field (iprob=50/60); 0 for iprob=40 by input
-    const Real kx = kpar; // wavenumber (iprob=50/60); 0 for iprob=40
+    const Real B0 = Bx;   // guide field (iprob=50/51/60); 0 for iprob=40 by input
+    const Real kx = kpar; // wavenumber (iprob=50/60); 0 for iprob=40/51
     const Real amp_l = amp;
     const Real hh = hall_h; // helicity (iprob=60)
+    const Real bratio = bump_ratio, bwidth = bump_width; // iprob=51 only
+    const Real wwidth = wave_width;                      // iprob=51 only
     auto desc = parthenon::MakePackDescriptor<Hydro::CT::Bf>(mbd.get());
     auto pack = desc.GetPack(mbd.get());
     const int bidx = 0;
     using TE = parthenon::TopologicalElement;
-    // F1 (x-face, B_x): guide field B0 for iprob=50/60, else 0.
+    // F1 (x-face, B_x): guide field B0 for iprob=50/60; Gaussian-bump profile evaluated AT
+    // the F1 face x-location for iprob=51; else 0.
     IndexRange fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F1);
     IndexRange fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F1);
     IndexRange fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F1);
     pmb->par_for(
         "diffusion CT F1", fkb.s, fkb.e, fjb.s, fjb.e, fib.s, fib.e,
         KOKKOS_LAMBDA(const int k, const int j, const int i) {
-          pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) = has_guide ? B0 : 0.0;
+          if (!has_guide) {
+            pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) = 0.0;
+            return;
+          }
+          if (is_ad_bump) {
+            const auto &c = pack.GetCoordinates(bidx);
+            const Real x = c.X<X1DIR, TE::F1>(k, j, i);
+            pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) =
+                B0 * (1.0 + (bratio - 1.0) * std::exp(-SQR(x / bwidth)));
+          } else {
+            pack(bidx, TE::F1, Hydro::CT::Bf(), k, j, i) = B0;
+          }
         });
-    // F2 (y-face, B_y): Gaussian(x) (40), amp*sin(k x) (50), amp*cos(k x) (60).
+    // F2 (y-face, B_y): Gaussian(x) (40), amp*sin(k x) (50), amp*cos(k x) (60), localized
+    // Gaussian wave packet amp*exp(-(x/wave_width)^2) (51).
     fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F2);
     fjb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior, TE::F2);
     fkb = pmb->cellbounds.GetBoundsK(IndexDomain::interior, TE::F2);
@@ -258,9 +324,10 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
           const auto &c = pack.GetCoordinates(bidx);
           const Real x = c.X<X1DIR, TE::F2>(k, j, i);
           pack(bidx, TE::F2, Hydro::CT::Bf(), k, j, i) =
-              is_hall ? amp_l * std::cos(kx * x)
-                      : (is_ad ? amp_l * std::sin(kx * x)
-                               : gnorm * std::exp(-x * x * inv4dt));
+              is_ad_bump ? amp_l * std::exp(-SQR(x / wwidth))
+                         : (is_hall ? amp_l * std::cos(kx * x)
+                                    : (is_ad ? amp_l * std::sin(kx * x)
+                                             : gnorm * std::exp(-x * x * inv4dt)));
         });
     // F3 (z-face, B_z): h*amp*sin(k x) for iprob=60, else 0.
     fib = pmb->cellbounds.GetBoundsI(IndexDomain::interior, TE::F3);

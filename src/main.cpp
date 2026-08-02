@@ -72,6 +72,11 @@ int main(int argc, char *argv[]) {
     pman.app_input->ProblemGenerator = polytrope::ProblemGenerator;
   } else if (problem == "collapse_be") {
     pman.app_input->ProblemGenerator = collapse_be::ProblemGenerator;
+    // WP-13: restart-safe Param registration. ProblemGenerator is NOT called on restart, so
+    // this hook (run from Hydro::Initialize on both fresh start and resume) is what keeps
+    // collapse_be_rhocrit alive -- and with it the ApplyBarotropicCooling task, which carries
+    // the outside-sphere momentum BC. Without it every restart silently dropped that task.
+    Hydro::ProblemInitPackageData = collapse_be::ProblemInitPackageData;
   } else if (problem == "poisson_test") {
     pman.app_input->ProblemGenerator = poisson_test::ProblemGenerator;
   } else if (problem == "rad_pulse") {
@@ -162,6 +167,26 @@ int main(int argc, char *argv[]) {
                                             ReflectBC<X3DIR, BCSide::Inner>);
   pman.app_input->RegisterBoundaryCondition(BF::outer_x3, REFLECTING,
                                             ReflectBC<X3DIR, BCSide::Outer>);
+
+  // VALIDATION B1: inflow-suppressing outflow ("diode"). Parthenon's `outflow` is a plain
+  // zero-gradient copy and admits inflow -- measured as ~-178 per face in WP-6's cons-Mout,
+  // the source of the production mass rise. Registering it as a SEPARATE named BC leaves
+  // `outflow` untouched, so every existing deck stays bit-identical; switching production to
+  // it is result-changing and therefore an explicit, deliberate deck edit.
+  const std::string DIODE = "diode";
+  using Hydro::BoundaryFunction::DiodeBC;
+  pman.app_input->RegisterBoundaryCondition(BF::inner_x1, DIODE,
+                                            DiodeBC<X1DIR, BCSide::Inner>);
+  pman.app_input->RegisterBoundaryCondition(BF::outer_x1, DIODE,
+                                            DiodeBC<X1DIR, BCSide::Outer>);
+  pman.app_input->RegisterBoundaryCondition(BF::inner_x2, DIODE,
+                                            DiodeBC<X2DIR, BCSide::Inner>);
+  pman.app_input->RegisterBoundaryCondition(BF::outer_x2, DIODE,
+                                            DiodeBC<X2DIR, BCSide::Outer>);
+  pman.app_input->RegisterBoundaryCondition(BF::inner_x3, DIODE,
+                                            DiodeBC<X3DIR, BCSide::Inner>);
+  pman.app_input->RegisterBoundaryCondition(BF::outer_x3, DIODE,
+                                            DiodeBC<X3DIR, BCSide::Outer>);
 
   pman.ParthenonInitPackagesAndMesh();
 

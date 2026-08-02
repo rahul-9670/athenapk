@@ -17,6 +17,14 @@ add_executable(
         hydro/diffusion/hall.cpp
         hydro/diffusion/resistivity.cpp
         hydro/diffusion/viscosity.cpp
+        diagnostics/angmom_diag.cpp
+        diagnostics/angmom_diag.hpp
+        diagnostics/cons_diag.cpp
+        diagnostics/cons_diag.hpp
+        diagnostics/grav_diag.cpp
+        diagnostics/grav_diag.hpp
+        diagnostics/mag_diag.cpp
+        diagnostics/mag_diag.hpp
         hydro/hydro_driver.cpp
         hydro/hydro.cpp
         hydro/ct/ct.cpp

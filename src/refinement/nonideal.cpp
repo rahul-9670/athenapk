@@ -34,6 +34,9 @@ parthenon::AmrTag JeansNonideal(MeshBlockData<Real> *rc) {
   auto hydro_pkg = pmb->packages.Get("Hydro");
   const Real njeans = hydro_pkg->Param<Real>("refinement/njeans");
   const Real curr_nsheet = hydro_pkg->Param<Real>("refinement/curr_nsheet");
+  const Real curr_rho_thresh = hydro_pkg->Param<Real>("refinement/curr_rho_thresh");
+  const int curr_max_level = hydro_pkg->Param<int>("refinement/curr_max_level");
+  const int block_level = pmb->loc.level();
   const Real gam = hydro_pkg->Param<Real>("AdiabaticIndex");
   const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
 
@@ -67,11 +70,25 @@ parthenon::AmrTag JeansNonideal(MeshBlockData<Real> *rc) {
 
   // Current-sheet resolution: min over block of (L_B / dx), L_B = |B|/|curl B| (central diffs on
   // the FillGhost prim B). MHD only; skipped (=huge) for hydro.
+  //
+  // DENSITY-GATED: only cells with rho > curr_rho_thresh contribute. Current sheets set the
+  // flux-loss/reconnection ONLY where there is dense gas to lose flux from; the diffuse turbulent
+  // ENVELOPE is full of numerical current sheets (field reversals everywhere) that are irrelevant
+  // to the fossil-flux result. Without this gate curr_nsheet refines the whole turbulent volume
+  // (block runaway 526->1786 pre-collapse -> OOM, validated 2026-07-27). The gate restricts
+  // current-sheet refinement to the collapsing region (near/above the initial core density).
+  // LEVEL CAP: current-sheet refinement is an enhancement, not the essential collapse criterion.
+  // Jeans (Truelove) drives the deep core to a converged collapse; letting the current-sheet
+  // criterion ALSO drive the deepest levels explodes the block count in the dense collapsing core
+  // (validated: jeans_nonideal makes 1.5x [128^3] to 3x [256^3] more blocks than plain jeans ->
+  // deep-core regrid OOM). Capping current-sheet refinement at curr_max_level keeps it in the
+  // moderate-depth flux-loss region while Jeans owns the deepest core, bounding memory.
   Real lbmin = std::numeric_limits<Real>::max();
-  if (mhd) {
+  if (mhd && block_level < curr_max_level) {
     pmb->par_reduce(
         "jeans_ni: current sheet", kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int k, const int j, const int i, Real &llbmin) {
+          if (w(IDN, k, j, i) < curr_rho_thresh) return; // envelope: skip (leave llbmin huge)
           // central differences (ghosts valid: prim is FillGhost)
           const Real dBz_dy = (w(IB3, k, j + 1, i) - w(IB3, k, j - 1, i)) / (2.0 * dy);
           const Real dBy_dz = (w(IB2, k + 1, j, i) - w(IB2, k - 1, j, i)) / (2.0 * dz);

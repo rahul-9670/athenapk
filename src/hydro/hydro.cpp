@@ -33,6 +33,9 @@
 #include "../units/ionization_environment.hpp" // flagship Phase 1: shared CR rate
 #include "defs.hpp"
 #include "ct/ct.hpp"
+#include "../diagnostics/angmom_diag.hpp"
+#include "../diagnostics/cons_diag.hpp"
+#include "../diagnostics/mag_diag.hpp"
 #include "diffusion/diffusion.hpp"
 #include "glmmhd/glmmhd.hpp"
 #include "hydro.hpp"
@@ -288,7 +291,22 @@ void ConsToPrim(MeshData<Real> *md) {
 TaskStatus AddUnsplitSources(MeshData<Real> *md, const SimTime &tm, const Real beta_dt) {
   auto hydro_pkg = md->GetBlockData(0)->GetBlockPointer()->packages.Get("Hydro");
 
-  if (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd) {
+  // GLM/Dedner source terms. Under constrained transport these are not merely redundant,
+  // they are ACTIVELY HARMFUL and are skipped (ct_glm_inert):
+  //   * the extended (Powell) momentum source -(div B) * B uses a cell-centered 2-delta
+  //     divergence of the *projected* face field. The CT invariant is the FACE divergence
+  //     (measured 4e-12 here); the cell-centered one is pure truncation noise, O(1) at a
+  //     shock. Its acceleration scales as 1/rho, so it runs away exactly in evacuated
+  //     magnetized cells: measured dv = 0.22-0.39 per step at rho~1e-3 on the CT flagship,
+  //     versus 4e-7 max anywhere on the matched GLM run.
+  //   * the extended energy source -1/2 B.grad(psi) is driven by a psi that CT has left
+  //     unbounded (see AdiabaticGLMMHDEOS::ConsToPrim): measured ~1e6 x the cell internal
+  //     energy per step in those same cells.
+  // Together they evacuate a pocket at the accretion-shock edge down to the density/pressure
+  // floors, which is what produced the "CT over-magnetizes the core edge" (max ME/E -> 1)
+  // artifact and the dt wall. |B| itself was never anomalous. See DEV_LOG 2026-07-29.
+  if (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd &&
+      !hydro_pkg->Param<bool>("ct_glm_inert")) {
     hydro_pkg->Param<GLMMHD::SourceFun_t>("glmmhd_source")(md, beta_dt);
   }
   const auto &enable_cooling = hydro_pkg->Param<Cooling>("enable_cooling");
@@ -482,6 +500,94 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     PARTHENON_FAIL("AthenaPK hydro: Unknown ct_emf (use 'gs05' or 'arithmetic').");
   }
   pkg->AddParam<>("use_ct_gs05", use_ct_gs05);
+
+  // Under CT the whole GLM/Dedner apparatus (psi transport + Powell/extended source terms)
+  // must be INERT: CT already guarantees div B = 0 in the face sense, and because the
+  // cell-centered B is overwritten by the face projection each substage the psi -> B half of
+  // the cleaning loop is discarded, leaving psi driven but never relieved. Setting
+  // ct_legacy_glm_source=true restores the old (broken) behaviour for A/B bisects only.
+  // One-sided internal-energy guard on the CT magnetic-energy replacement, see
+  // CT_ProjectBfToCC. Fraction of the pre-projection internal energy below which the
+  // projection is not allowed to push the gas. 0 disables (bit-identical, legacy).
+  //
+  // Calibrated on runs/ct_tests/orszag_tang_ad_{ct,glm}.in (CT+AD+RKL2, 128^2, tlim=0.14):
+  //   guard   outcome                          tot-E vs matched GLM
+  //   0.0     ABORT, negative pressure @cyc~100        --
+  //   0.5     ABORT, guard never fires                 --
+  //   0.9     completes                             +0.29%   <- default
+  //   0.99    completes                             +2.76%
+  // At 0.9 the completed run matches the GLM reference to 0.1% in KE and 1.0% in ME, and
+  // ct_maxAbsDivB stays at 3.5e-14. Note the guard is INERT outside the RKL2 path: ideal-CT
+  // and CT+AD-unsplit are bit-identical at 0.0 and 0.9. It is a LIMITER, not a cure -- the
+  // underlying defect is that cons(IEN) and the CT field are advanced by two independent
+  // integrators (see CT_ProjectBfToCC); a consistent-heating / dual-energy formulation is
+  // the real fix and is not implemented here.
+  const Real ct_eint_guard_frac =
+      use_ct ? pin->GetOrAddReal("hydro", "ct_eint_guard_frac", 0.9) : 0.0;
+  PARTHENON_REQUIRE(ct_eint_guard_frac >= 0.0 && ct_eint_guard_frac < 1.0,
+                    "hydro/ct_eint_guard_frac must be in [0,1).");
+  pkg->AddParam<>("ct_eint_guard_frac", ct_eint_guard_frac);
+
+  // CT + RKL2: build the diffusive Poynting energy flux from the same edge EMF that drives
+  // the CT induction (CT_AddDiffusivePoynting) instead of the face-based deposits in
+  // resistivity.cpp/ambipolar.cpp. Those use a different stencil, and the mismatch lands in
+  // the recovered internal energy e = E - KE - ME. Isolated experimentally: with the eint
+  // guard OFF, CT+RKL2 Orszag-Tang is clean with Ohmic alone (matched stencils) but aborts on
+  // negative pressure with ambipolar (direct-edge EMF vs face-based Poynting). Unsplit CT is
+  // unaffected and stays on the face deposits (Bf.flux there carries ideal+diffusive).
+  // Set false to restore the old behaviour for A/B bisects.
+  // RKL2/STS ONLY: there CT_ZeroEMF -> Ohmic -> ambipolar leaves Bf.flux holding the
+  // DIFFUSIVE-ONLY edge EMF, which is what the replacement flux needs. In the unsplit path
+  // Bf.flux carries ideal+diffusive and the ideal Poynting is already in the HLLD energy
+  // flux, so it must keep the face-based deposits (and it is not affected by the defect --
+  // CT+AD-unsplit runs clean). Same default as the real parse site below, so this is a
+  // read-only peek at diffusion/integrator.
+  const bool ct_diffint_rkl2 =
+      pin->GetOrAddString("diffusion", "integrator", "none") == "rkl2";
+  const bool ct_edge_poynting =
+      use_ct && ct_diffint_rkl2 && pin->GetOrAddBoolean("hydro", "ct_edge_poynting", true);
+  pkg->AddParam<>("ct_edge_poynting", ct_edge_poynting);
+
+  // ENERGY-NEUTRAL PROJECTION -- **DEFAULT OFF; EXPERIMENTAL, DO NOT ENABLE FOR SCIENCE.**
+  // Carries the projection's magnetic-energy change into the total energy so that
+  // e = E - KE - ME is held exactly fixed across the face->cell projection. Motivation: the
+  // projection systematically HEATS magnetized low-density cells (+1.5e-3 relative per
+  // application at ME/IE>1 in the flagship), and the damage is amplified by ME/IE (~150
+  // there), which is the mechanism behind the evacuated-hole defect (DEV_LOG 2026-07-29).
+  //
+  // WHY IT IS OFF BY DEFAULT: it trades an amplified LOCAL error for a GLOBAL conservation
+  // error, and the global cost is unacceptable. Measured on orszag_tang_ad_ct to t=0.20
+  // (identical ICs, tot-E = 3.492570e-01 at t=0): ON drifts to 3.318490e-01, **-4.98% total
+  // energy**, while OFF and the GLM reference both conserve to +0.0000%. dt also falls 2.7x
+  // (4.97e-4 vs GLM 1.32e-3). An a-priori estimate from the flagship dump suggested ~1% per
+  // 6.6e6 cycles; that was WRONG because it assumed 2 projections per cycle (VL2). Under RKL2
+  // the projection runs at EVERY super-time-step substage -- 10-26 per cycle here -- so the
+  // real rate is ~1e4 times higher. Lesson: count the actual call sites, not the stage count.
+  //
+  // The underlying inconsistency is that cons(IB) (advanced by the HLLD flux divergence) and
+  // the projection of the CT face field are two independent estimates of the same quantity
+  // whose difference is systematically signed, not zero-mean. Neither dumping it in e (default)
+  // nor in E (this option) is correct; the principled fix is a dual-energy formulation that
+  // evolves the internal energy directly. Kept as an opt-in strictly for A/B experiments.
+  const bool ct_energy_neutral =
+      use_ct && pin->GetOrAddBoolean("hydro", "ct_energy_neutral_projection", false);
+  pkg->AddParam<>("ct_energy_neutral_projection", ct_energy_neutral);
+
+  // Opt-in per-cell diagnostic of the projection's internal-energy transfer. See
+  // CT_ProjectBfToCC. Allocates one extra derived cell field; default off.
+  const bool ct_proj_diag =
+      use_ct && pin->GetOrAddBoolean("hydro", "ct_proj_diag", false);
+  pkg->AddParam<>("ct_proj_diag", ct_proj_diag);
+
+  const bool ct_legacy_glm_source =
+      pin->GetOrAddBoolean("hydro", "ct_legacy_glm_source", false);
+  const bool ct_glm_inert = use_ct && !ct_legacy_glm_source;
+  pkg->AddParam<>("ct_glm_inert", ct_glm_inert);
+  if (ct_glm_inert && parthenon::Globals::my_rank == 0) {
+    std::cout << "## CT: GLM/Dedner machinery held inert (psi == 0, no Powell/extended "
+                 "source terms)."
+              << std::endl;
+  }
   // Following params should (currently) be present independent of solver because
   // they're all used in the main loop.
   // TODO(pgrete) think about which approach (selective versus always is preferable)
@@ -679,9 +785,24 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     const bool use_h2diss = (eos_str == "hydrogen");
     EOSTable::EosTable eos_tab;
     if (use_h2diss) {
+      // WP-11 (2026-08-02): the fallback default below is the COARSE 180x220x200 table, and
+      // silently taking it is a real accuracy hazard -- measured against eos_table_hires.bin it
+      // carries 8.3% p99 and 37.6% worst-case error in the SOUND SPEED (vs <=0.51% p99 for the
+      // hi-res table). Production decks all set eos_table_file explicitly to eos_table_hires.bin
+      // (fhc_flagship.in, fhc_rootladder.in), so a missing key means a deck typo or an
+      // unmaintained deck, not an intentional choice. Warn loudly rather than degrade quietly.
+      // Not a hard failure: the coarse table is legitimate for smoke tests and cheap gates.
+      const bool tabfile_given = pin->DoesParameterExist("hydro", "eos_table_file");
       const auto tabfile = pin->GetOrAddString(
           "hydro", "eos_table_file",
           "/beegfs/u/bbg6470/athenapk/src/eos/eos_table.bin");
+      if (!tabfile_given) {
+        PARTHENON_WARN(
+            "<hydro> eos_table_file was not set, so eos=hydrogen is falling back to the COARSE "
+            "built-in table (src/eos/eos_table.bin, 180x220x200). Measured interpolation error "
+            "vs eos_table_hires.bin: 8.3% p99 / 37.6% max in cs^2. This is FINE for smoke tests "
+            "and NOT fine for production -- set eos_table_file=.../src/eos/eos_table_hires.bin.");
+      }
       eos_tab.Load(tabfile);
       const auto riem = pin->GetOrAddString("hydro", "riemann", "hlld");
       PARTHENON_REQUIRE(riem == "hlld",
@@ -718,6 +839,12 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
 
     // By default disable floors by setting a negative value
     Real dfloor = pin->GetOrAddReal("hydro", "dfloor", -1.0);
+    // WP-13: expose the density floor as a package Param. SelfGravity::FillPoissonRHS needs
+    // it to reproduce prim's floored density exactly while reading `cons` (it must read cons,
+    // not prim, because prim is another package's FillDerived output and the ordering between
+    // packages is not guaranteed -- on restart prim was still zero when the Poisson RHS was
+    // assembled). Registered unconditionally so it does not depend on any diagnostic gate.
+    pkg->AddParam<Real>("grav_rho_floor", dfloor);
     Real pfloor = pin->GetOrAddReal("hydro", "pfloor", -1.0);
     Real Tfloor = pin->GetOrAddReal("hydro", "Tfloor", -1.0);
     Real efloor = Tfloor;
@@ -950,6 +1077,13 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       auto ambipolar_coeff_str =
           pin->GetOrAddString("diffusion", "ambipolar_coeff", "none");
       auto ambipolar_coeff = AmbipolarCoeff::none;
+      // Absolute ceiling on eta_A for the ionization[_chem] coefficient family (code units;
+      // ignored for ambipolar_coeff=fixed). The single-fluid/tensor eta_A ~ B^2/(rho_i rho)
+      // runs away (~1/rho^2) in low-density magnetized cells and sets the parabolic dt to
+      // ~0 there; this bounds that runaway in the diffusion-decoupled regime, the ambipolar
+      // analogue of diffusion/eta_ohm_cap_code. See AmbipolarDiffusivity::eta_cap_.
+      const Real eta_ad_cap_code = pin->GetOrAddReal(
+          "diffusion", "eta_ad_cap_code", std::numeric_limits<Real>::max());
 
       if (ambipolar_coeff_str == "fixed") {
         ambipolar_coeff = AmbipolarCoeff::fixed;
@@ -964,8 +1098,8 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         // are the shared FHC code-unit calibration; override per <diffusion> ion_* keys.
         ambipolar_coeff = AmbipolarCoeff::ionization;
         Ionization::IonizationModel ion = BuildIonizationModel(pin);
-        auto ad_diff =
-            AmbipolarDiffusivity(ambipolar, ambipolar_coeff, 0.0, 0.0, 0.0, 0.0, ion);
+        auto ad_diff = AmbipolarDiffusivity(ambipolar, ambipolar_coeff, 0.0, 0.0, 0.0, 0.0,
+                                            ion, -1, eta_ad_cap_code);
         pkg->AddParam<>("ad_diff", ad_diff);
         if (parthenon::Globals::my_rank == 0) {
           const bool tensor = ion.ad_closure == Ionization::ADClosure::tensor;
@@ -974,6 +1108,10 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                     << ", thermal K x_K=" << ion.x_K
                     << ", AD closure=" << (tensor ? "tensor" : "single_fluid") << ")"
                     << std::endl;
+          if (eta_ad_cap_code < std::numeric_limits<Real>::max()) {
+            std::cout << "## Ambipolar eta_A cap: " << eta_ad_cap_code << " (code units)"
+                      << std::endl;
+          }
         }
 
       } else if (ambipolar_coeff_str == "ionization_chem") {
@@ -986,12 +1124,16 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         const int xe_scalar = pin->GetOrAddInteger("diffusion", "xe_scalar_index", 4);
         const int i_xe_prim = nhydro + xe_scalar;
         auto ad_diff = AmbipolarDiffusivity(ambipolar, ambipolar_coeff, 0.0, 0.0, 0.0, 0.0,
-                                            ion, i_xe_prim);
+                                            ion, i_xe_prim, eta_ad_cap_code);
         pkg->AddParam<>("ad_diff", ad_diff);
         if (parthenon::Globals::my_rank == 0) {
           std::cout << "## Ambipolar diffusion: chemistry-coupled x_e (single_fluid eta_A,"
                     << " x_e from prim scalar index " << i_xe_prim << ", gamma_AD="
                     << ion.gamma_AD << ")" << std::endl;
+          if (eta_ad_cap_code < std::numeric_limits<Real>::max()) {
+            std::cout << "## Ambipolar eta_A cap: " << eta_ad_cap_code << " (code units)"
+                      << std::endl;
+          }
         }
 
       } else {
@@ -1258,6 +1400,95 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                     << std::endl;
         }
       }
+      // FLAGSHIP AUDIT ITEM 5 -- WS-4 DUST -> CONDUCTIVITY COUPLING.
+      // Grains dominate recombination over most of the collapse, so they set x_e and hence
+      // all three non-ideal diffusivities. Until now the ionization model used a FROZEN ISM
+      // MRN population while the dust package evolved (f_dg, a_c) for the OPACITY only --
+      // i.e. the run's own grain evolution never reached its own magnetic microphysics.
+      // With this on, the conductivity grain population is rescaled per cell to the evolved
+      // scalars (see IonizationModel::FDG/Ak and FusedNonidealEval::CellIon).
+      // OFF by default; when off nothing is copied and results are bit-identical.
+      const bool dust_couple =
+          pin->GetOrAddBoolean("diffusion", "dust_coupling", false);
+      pkg->AddParam<>("nonideal_dust_on", dust_couple);
+      if (dust_couple) {
+        PARTHENON_REQUIRE(pin->GetOrAddBoolean("dust", "evolve", false),
+                          "diffusion/dust_coupling=true requires the dust package to be "
+                          "evolving (<dust> evolve=true) -- otherwise the grain population "
+                          "is static and the coupling is a no-op with extra cost.");
+        PARTHENON_REQUIRE(any_ionization,
+                          "diffusion/dust_coupling=true only affects ionization-family "
+                          "coefficients (resistivity/ambipolar/hall _coeff = ionization*).");
+        // Dust stores f_dg at scalar_index and a_c at scalar_index+1 (see dust.cpp);
+        // prim component = nhydro + scalar index, the same convention as x_e.
+        const int dsi = pin->GetOrAddInteger("dust", "scalar_index", 0);
+        pkg->AddParam<>("nonideal_dust_i_fdg", nhydro + dsi);
+        pkg->AddParam<>("nonideal_dust_i_ac", nhydro + dsi + 1);
+        // Reference population the STATIC MRN bins represent. a_ref/f_dg_ref must be the
+        // values the bins were built from, or the scaling is biased at t=0.
+        // NOTE the key is "a_ref_cm", not "a_ref" (see dust.cpp:38). Reading the wrong key
+        // would silently fall back to 1e-5 and bias a_scale for any deck that sets it.
+        pkg->AddParam<>("nonideal_dust_a_ref",
+                        pin->GetOrAddReal("dust", "a_ref_cm", 1.0e-5));
+        pkg->AddParam<>("nonideal_dust_fdg_ref",
+                        pin->GetOrAddReal("dust", "f_dg_ref", 0.01));
+        if (parthenon::Globals::my_rank == 0) {
+          std::cout << "## Dust->conductivity coupling ON (diffusion/dust_coupling): the "
+                       "ionization grain population is rescaled per cell from the evolved "
+                       "(f_dg, a_c) at prim indices " << nhydro + dsi << ", "
+                    << nhydro + dsi + 1 << "." << std::endl;
+        }
+      }
+      // FLAGSHIP AUDIT ITEM 1 -- non-ideal cap-activation diagnostic.
+      // eta_ohm_cap_code / eta_ad_cap_code / eta_hall_cap_code are numerical stabilizers
+      // that MODIFY the induction equation, so a flux-retention number is uninterpretable
+      // without knowing where and how hard they bit. Filled inside PrecomputeNonidealEta
+      // from the same tensor solve (no extra solve, no extra task); OFF by default, and
+      // bit-identical when off (it only writes a Derived field, never feeds back).
+      const bool cap_diag = pin->GetOrAddBoolean("diffusion", "cap_diag", false);
+      PARTHENON_REQUIRE(!cap_diag || eta_cache,
+                        "diffusion/cap_diag=true requires diffusion/eta_cache=true.");
+      pkg->AddParam<>("nonideal_cap_diag", cap_diag);
+      if (cap_diag) {
+        Metadata m_cap({Metadata::Cell, Metadata::Derived, Metadata::OneCopy},
+                       std::vector<int>({CapDiagIdx::NCOMP}),
+                       std::vector<std::string>{"cap_flag_O", "cap_flag_H", "cap_flag_A",
+                                                "cap_dec_O", "cap_dec_H", "cap_dec_A"});
+        pkg->AddField("diff.capdiag", m_cap);
+        auto hst_cap = pkg->Param<parthenon::HstVar_list>(parthenon::hist_param_key);
+        using parthenon::HistoryOutputVar;
+        using parthenon::UserHistoryOperation;
+        // Normalizer: the summed volume of exactly the cells the flags are summed over.
+        // Volume fraction capped = cap-V<term> / cap-Vtot; mass fraction = cap-M<term>/mass;
+        // volume-weighted mean clipped decades over the capped set = cap-D<term>/cap-V<term>.
+        hst_cap.emplace_back(HistoryOutputVar(UserHistoryOperation::sum,
+                                              NonidealCapHstVol, "cap-Vtot"));
+        const std::pair<int, const char *> terms[3] = {{CapDiagIdx::flagO, "O"},
+                                                       {CapDiagIdx::flagH, "H"},
+                                                       {CapDiagIdx::flagA, "A"}};
+        for (const auto &tm : terms) {
+          const int c = tm.first;
+          hst_cap.emplace_back(HistoryOutputVar(
+              UserHistoryOperation::sum,
+              [c](MeshData<Real> *md) { return NonidealCapHstFlag(md, c); },
+              std::string("cap-V") + tm.second));
+          hst_cap.emplace_back(HistoryOutputVar(
+              UserHistoryOperation::sum,
+              [c](MeshData<Real> *md) { return NonidealCapHstMassFlag(md, c); },
+              std::string("cap-M") + tm.second));
+          hst_cap.emplace_back(HistoryOutputVar(
+              UserHistoryOperation::sum,
+              [c](MeshData<Real> *md) { return NonidealCapHstDecade(md, c); },
+              std::string("cap-D") + tm.second));
+        }
+        pkg->UpdateParam(parthenon::hist_param_key, hst_cap);
+        if (parthenon::Globals::my_rank == 0) {
+          std::cout << "## Non-ideal cap diagnostic ON (diffusion/cap_diag): hst cap-V*/"
+                       "cap-M*/cap-D* + field diff.capdiag (add to an output block for "
+                       "the spatial picture)."
+                    << std::endl;
+        }
+      }
       // Freeze the cached eta across the RKL2 stages of each Strang half: the stage
       // tasks skip the PrecomputeNonidealEta refresh, so eta stays at its value from
       // the half's first stage (refreshed 2x per cycle instead of once per stage).
@@ -1287,11 +1518,22 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       pkg->FillDerivedMesh = ConsToPrim<AdiabaticHydroEOS>;
       pkg->EstimateTimestepMesh = EstimateTimestep<Fluid::euler>;
     } else if (fluid == Fluid::glmmhd) {
+      // Boris / semi-relativistic Alfven-speed limiter: cap c_b on the Alfven speed used in
+      // the Maxwell-stress FORCE + signal speeds (via the EOS + a per-interface LLF-Boris
+      // branch in the HLLD solver). Relaxes the timestep / tames the vA runaway in evacuated
+      // strongly-magnetized cells (the first-core magnetic wall). 0 (default) = disabled,
+      // bit-identical.
+      const Real boris_ca_max =
+          pin->GetOrAddReal("hydro", "boris_ca_max_code", 0.0);
       AdiabaticGLMMHDEOS eos(pfloor, dfloor, efloor, vceil, eceil, gamma, use_h2diss,
-                             eos_tab);
+                             eos_tab, boris_ca_max, ct_glm_inert);
       pkg->AddParam<>("eos", eos);
       pkg->FillDerivedMesh = ConsToPrim<AdiabaticGLMMHDEOS>;
       pkg->EstimateTimestepMesh = EstimateTimestep<Fluid::glmmhd>;
+      if (boris_ca_max > 0.0 && parthenon::Globals::my_rank == 0) {
+        std::cout << "## Boris Alfven-speed limiter: c_b = " << boris_ca_max
+                  << " (code units); HLLD->LLF-Boris where vA>0.33 c_b." << std::endl;
+      }
     }
   } else {
     PARTHENON_FAIL("AthenaPK hydro: Unknown EOS");
@@ -1380,11 +1622,235 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
 
     // Face-divergence history diagnostic (max |div B|*dx/|B|); ~round-off on the CT path.
     auto hst_vars = pkg->Param<parthenon::HstVar_list>(parthenon::hist_param_key);
+    // Projection diagnostic (hydro/ct_proj_diag): per-cell relative internal-energy change
+    // imposed by the face->cell projection, i.e. the direct measurement of the E-vs-ME
+    // bookkeeping mismatch. Derived => not carried in restarts; opt-in so production runs
+    // pay no memory. Dump "ct.dEint" in an output block to localize it spatially.
+    if (pkg->Param<bool>("ct_proj_diag")) {
+      auto m_diag = Metadata({Metadata::Cell, Metadata::Derived, Metadata::OneCopy});
+      pkg->AddField("ct.dEint", m_diag);
+      hst_vars.emplace_back(parthenon::HistoryOutputVar(
+          parthenon::UserHistoryOperation::min, Hydro::CT::CT_ProjEintMin,
+          "ct_projEintMin"));
+      hst_vars.emplace_back(parthenon::HistoryOutputVar(
+          parthenon::UserHistoryOperation::max, Hydro::CT::CT_ProjEintMaxAbs,
+          "ct_projEintMaxAbs"));
+    }
     hst_vars.emplace_back(parthenon::HistoryOutputVar(
         parthenon::UserHistoryOperation::max, Hydro::CT::CT_MaxRelFaceDivB, "ct_maxRelDivB"));
     hst_vars.emplace_back(parthenon::HistoryOutputVar(
         parthenon::UserHistoryOperation::max, Hydro::CT::CT_MaxAbsFaceDivB, "ct_maxAbsDivB"));
     pkg->UpdateParam(parthenon::hist_param_key, hst_vars);
+  }
+
+  // FLAGSHIP AUDIT ITEM 2 -- magnetic-transport (fossil-field) history diagnostics.
+  // See src/diagnostics/mag_diag.hpp. Pure read-only volume reductions => bit-identical
+  // when off, and off by default. MHD only (they all need B).
+  const bool mag_diag =
+      pin->GetOrAddBoolean("hydro", "mag_diag", false) && fluid == Fluid::glmmhd;
+  pkg->AddParam<>("mag_diag", mag_diag);
+  // WP-8: density threshold (CODE density) splitting the dissipation integrals into a core
+  // and an envelope budget. 0 = OFF, which registers no extra columns, so the OFF state and
+  // the original column set stay bit-identical. Always added because MagDiagReduce reads it
+  // unconditionally. Sensible value: ~1e2-1e4 code, i.e. well above the t=0 peak (~5 code)
+  // and below rhocrit (1.83e5 code) -- see mag_diag.hpp for why a single global integral of
+  // eta|J|^2 is not a convergent diagnostic.
+  pkg->AddParam<Real>("mag_diag_rho_split",
+                      pin->GetOrAddReal("hydro", "mag_diag_rho_split", 0.0));
+  if (mag_diag) {
+    using Diagnostics::MagDiag;
+    using Diagnostics::MagDiagReduce;
+    auto hst_mag = pkg->Param<parthenon::HstVar_list>(parthenon::hist_param_key);
+    auto add_mag = [&hst_mag](MagDiag w, const std::string &label) {
+      hst_mag.emplace_back(parthenon::HistoryOutputVar(
+          parthenon::UserHistoryOperation::sum,
+          [w](MeshData<Real> *md) { return MagDiagReduce(md, w); }, label));
+    };
+    add_mag(MagDiag::Jsq, "mag-Jsq");
+    add_mag(MagDiag::Hc, "mag-Hc");
+    add_mag(MagDiag::MEtor, "mag-MEtor");
+    add_mag(MagDiag::MEpol, "mag-MEpol");
+    // eta-weighted dissipation needs the cell-centered eta cache; the cap-restricted
+    // variants additionally need the cap flags. Both params only exist when a non-ideal
+    // term is active, so probe rather than assume (mag_diag is legal on an ideal run).
+    const bool have_eta = pkg->AllParams().hasKey("nonideal_eta_cache") &&
+                          pkg->Param<bool>("nonideal_eta_cache");
+    const bool have_cap = pkg->AllParams().hasKey("nonideal_cap_diag") &&
+                          pkg->Param<bool>("nonideal_cap_diag");
+    const Real rho_split = pkg->Param<Real>("mag_diag_rho_split");
+    if (have_eta) {
+      add_mag(MagDiag::dissO, "mag-dissO");
+      add_mag(MagDiag::dissA, "mag-dissA");
+      // "how much of the dissipation is a numerical stabilizer" needs the cap flags.
+      if (have_cap) {
+        add_mag(MagDiag::dissOcap, "mag-dissOcap");
+        add_mag(MagDiag::dissAcap, "mag-dissAcap");
+      }
+      // WP-8 columns are ALL behind rho_split>0, deliberately. Appending columns shifts
+      // every later column index (maxRelDivB would move from 31 to 33), which would break
+      // both the existing analysis scripts and any comparison against the history files
+      // already on disk from the njeans ladder. With rho_split=0 (the default) the column
+      // set is byte-for-byte what it was.
+      if (rho_split > 0.0) {
+        // The carrying volume -- what makes the ill-conditioning visible: 90% of the global
+        // integral was measured to come from a volume fraction of ~1e-7.
+        add_mag(MagDiag::dissOsq, "mag-dissOsq");
+        add_mag(MagDiag::dissAsq, "mag-dissAsq");
+        add_mag(MagDiag::dissOhi, "mag-dissO-hi");
+        add_mag(MagDiag::dissOlo, "mag-dissO-lo");
+        add_mag(MagDiag::dissAhi, "mag-dissA-hi");
+        add_mag(MagDiag::dissAlo, "mag-dissA-lo");
+        add_mag(MagDiag::Vhi, "mag-Vhi");
+      }
+    }
+    pkg->UpdateParam(parthenon::hist_param_key, hst_mag);
+    if (parthenon::Globals::my_rank == 0) {
+      std::cout << "## Magnetic-transport diagnostics ON (hydro/mag_diag): hst mag-Jsq, "
+                   "mag-Hc (current helicity), mag-MEtor/MEpol"
+                << (have_eta ? ", mag-dissO/dissA" : "")
+                << (have_eta && have_cap ? ", mag-dissOcap/dissAcap" : "")
+                << "." << std::endl;
+      if (have_eta && rho_split > 0.0) {
+        std::cout << "## mag_diag density split ON (hydro/mag_diag_rho_split=" << rho_split
+                  << " code): hst mag-dissO-hi/lo, mag-dissA-hi/lo, mag-Vhi. Use these,"
+                     " NOT the global mag-dissO/dissA, for convergence work -- WP-8 measured"
+                     " 90% of the global integral coming from ~1e-7 of the volume."
+                  << std::endl;
+      }
+    }
+  }
+
+  // WP-4 -- angular-momentum history diagnostics. See src/diagnostics/angmom_diag.hpp.
+  // The production history had NO angular-momentum column at all, which for a
+  // magnetic-braking result is the central quantity. Pure read-only reductions => the OFF
+  // state is bit-identical, and OFF is the default.
+  const bool angmom_diag = pin->GetOrAddBoolean("hydro", "angmom_diag", false);
+  pkg->AddParam<>("angmom_diag", angmom_diag);
+  const Real angmom_rho_split =
+      pin->GetOrAddReal("hydro", "angmom_diag_rho_split", 0.0);
+  if (angmom_diag) {
+    using Diagnostics::AngMom;
+    using Diagnostics::AngMomReduce;
+    auto hst_am = pkg->Param<parthenon::HstVar_list>(parthenon::hist_param_key);
+    auto add_am = [&hst_am](AngMom w, const std::string &label) {
+      hst_am.emplace_back(parthenon::HistoryOutputVar(
+          parthenon::UserHistoryOperation::sum,
+          [w](MeshData<Real> *md) { return AngMomReduce(md, w); }, label));
+    };
+    pkg->AddParam<bool>("angmom_diag_mhd", fluid == Fluid::glmmhd);
+    pkg->AddParam<Real>("angmom_diag_rho_split", angmom_rho_split);
+    add_am(AngMom::Lx, "am-Lx");
+    add_am(AngMom::Ly, "am-Ly");
+    add_am(AngMom::Lz, "am-Lz");
+    // THE budget term: the TOTAL stress flux, including the pressure and Maxwell parts.
+    // Measured 2026-07-31: with the advective part alone the budget misses by >2 orders of
+    // magnitude, because the surface pressure torque dominates under outflow BCs.
+    add_am(AngMom::FTx, "am-FTx");
+    add_am(AngMom::FTy, "am-FTy");
+    add_am(AngMom::FTz, "am-FTz");
+    // Advective part alone -- kept because it separates "L was carried off by outflowing
+    // gas" from "L was removed by a surface stress", which are different physical claims.
+    add_am(AngMom::FLx, "am-FLx");
+    add_am(AngMom::FLy, "am-FLy");
+    add_am(AngMom::FLz, "am-FLz");
+    // Gravitational torque -- zero in the continuum for an isolated system, so its measured
+    // size probes the Poisson solve rather than the physics. Needs a potential to exist.
+    if (pin->GetOrAddBoolean("physics", "self_gravity", false)) {
+      add_am(AngMom::TgravX, "am-Tgravx");
+      add_am(AngMom::TgravY, "am-Tgravy");
+      add_am(AngMom::TgravZ, "am-Tgravz");
+    }
+    // The Lorentz torque needs a field. INTERPRETIVE ONLY -- do not add to am-FT*, which
+    // already contains the Maxwell stress; see angmom_diag.hpp on the double-count.
+    if (fluid == Fluid::glmmhd) {
+      add_am(AngMom::TmagX, "am-Tmagx");
+      add_am(AngMom::TmagY, "am-Tmagy");
+      add_am(AngMom::TmagZ, "am-Tmagz");
+    }
+    // Density-split L (WP-4 follow-up). ALL of these sit behind rho_split > 0, deliberately
+    // and for the same reason as mag_diag's WP-8 columns: appending history columns shifts
+    // every downstream index and would silently break parsers reading .hst files already on
+    // disk. With the default rho_split = 0 the column set is bit-identical.
+    if (angmom_rho_split > 0.0) {
+      add_am(AngMom::Lxhi, "am-Lx-hi");
+      add_am(AngMom::Lxlo, "am-Lx-lo");
+      add_am(AngMom::Lyhi, "am-Ly-hi");
+      add_am(AngMom::Lylo, "am-Ly-lo");
+      add_am(AngMom::Lzhi, "am-Lz-hi");
+      add_am(AngMom::Lzlo, "am-Lz-lo");
+      add_am(AngMom::Mhi, "am-Mhi");
+    }
+    pkg->UpdateParam(parthenon::hist_param_key, hst_am);
+    if (parthenon::Globals::my_rank == 0) {
+      const auto &ms = pin->GetOrAddReal("parthenon/mesh", "x1min", 0.0);
+      const auto &me = pin->GetOrAddReal("parthenon/mesh", "x1max", 0.0);
+      std::cout << "## Angular-momentum diagnostics ON (hydro/angmom_diag): hst am-Lx/Ly/Lz,"
+                   " am-FLx/FLy/FLz (advective flux OUT through the domain faces,"
+                   " outward-positive)"
+                << (fluid == Fluid::glmmhd ? ", am-Tmagx/y/z (Lorentz torque)" : "")
+                << ". Moments about the BOX CENTRE, x1 centre = " << 0.5 * (ms + me)
+                << " code. Budget: d(am-L)/dt = am-Tmag - am-FL + (pressure and gravity"
+                   " torques, NOT instrumented -- see angmom_diag.hpp)."
+                << std::endl;
+    }
+  }
+
+  // WP-6 -- conservation-budget history diagnostics. See src/diagnostics/cons_diag.hpp.
+  // These exist because tot-E excludes the gravitational potential energy (so energy
+  // conservation is currently UNVERIFIABLE, not merely unverified), mass RISES under
+  // outflow BCs, and 1-mom drifts ~10%. All read-only => bit-identical when off.
+  const bool cons_diag = pin->GetOrAddBoolean("hydro", "cons_diag", false);
+  pkg->AddParam<>("cons_diag", cons_diag);
+  if (cons_diag) {
+    using Diagnostics::ConsDiag;
+    using Diagnostics::ConsDiagReduce;
+    // Cached for the reduction kernel: the floor values and whether B exists. Read from
+    // pin with the SAME defaults hydro.cpp uses above, so a deck that omits them gets the
+    // same -1.0 "disabled" sentinel here and the floor columns stay identically zero.
+    pkg->AddParam<Real>("cons_diag_dfloor", pin->GetOrAddReal("hydro", "dfloor", -1.0));
+    pkg->AddParam<Real>("cons_diag_pfloor", pin->GetOrAddReal("hydro", "pfloor", -1.0));
+    pkg->AddParam<bool>("cons_diag_mhd", fluid == Fluid::glmmhd);
+
+    auto hst_c = pkg->Param<parthenon::HstVar_list>(parthenon::hist_param_key);
+    auto add_c = [&hst_c](ConsDiag w, const std::string &label) {
+      hst_c.emplace_back(parthenon::HistoryOutputVar(
+          parthenon::UserHistoryOperation::sum,
+          [w](MeshData<Real> *md) { return ConsDiagReduce(md, w); }, label));
+    };
+    // W = 1/2 int rho Phi dV needs the solver's potential field to exist.
+    const bool have_phi = pin->GetOrAddBoolean("physics", "self_gravity", false);
+    if (have_phi) add_c(ConsDiag::Wgrav, "cons-W");
+    add_c(ConsDiag::Mout, "cons-Mout");
+    // The factor-2 experiment: the same faces read from the SOLVER's own flux array.
+    // Agreement with cons-Mout localises the discrepancy to the time integration;
+    // a factor of 2 between them localises it to the surface integral. See cons_diag.hpp.
+    add_c(ConsDiag::MoutSolver, "cons-Mout-solver");
+    add_c(ConsDiag::MoutSolverInner, "cons-Mout-solver-in");
+    add_c(ConsDiag::MoutSolverOuter, "cons-Mout-solver-out");
+    add_c(ConsDiag::MoutInner, "cons-Mout-in");
+    add_c(ConsDiag::MoutOuter, "cons-Mout-out");
+    add_c(ConsDiag::PoutX, "cons-Poutx");
+    add_c(ConsDiag::PoutY, "cons-Pouty");
+    add_c(ConsDiag::PoutZ, "cons-Poutz");
+    add_c(ConsDiag::nfloor, "cons-nfloor");
+    add_c(ConsDiag::Mfloor, "cons-Mfloor");
+    add_c(ConsDiag::npfloor, "cons-npfloor");
+    pkg->UpdateParam(parthenon::hist_param_key, hst_c);
+    if (parthenon::Globals::my_rank == 0) {
+      std::cout << "## Conservation-budget diagnostics ON (hydro/cons_diag): hst "
+                << (have_phi ? "cons-W (grav. PE), " : "")
+                << "cons-Mout, cons-Poutx/y/z (TOTAL momentum flux incl. pressure and"
+                   " Maxwell stress), cons-nfloor/Mfloor/npfloor. All *out columns are"
+                   " OUTWARD-POSITIVE, so a NEGATIVE cons-Mout is inflow through an"
+                   " outflow face. Budgets: d(mass)/dt = -cons-Mout, d(i-mom)/dt ="
+                   " -cons-Pouti. Floor columns are a PROXY for floor activity, NOT the"
+                   " mass injected -- see cons_diag.hpp."
+                << std::endl;
+      if (!have_phi) {
+        std::cout << "## cons_diag: self_gravity is off, so cons-W is not registered."
+                  << std::endl;
+      }
+    }
   }
 
   const auto refine_str = pin->GetOrAddString("refinement", "type", "unset");
@@ -1432,8 +1898,23 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     const auto curr_nsheet = pin->GetOrAddReal("refinement", "curr_nsheet", 4.0);
     PARTHENON_REQUIRE(curr_nsheet > 0.,
                       "Make sure to set refinement/curr_nsheet > 0 (typically 4-8).");
+    // Density gate (code units): current-sheet refinement only applies to cells denser than this,
+    // so it targets the collapsing region, NOT the diffuse turbulent envelope (which is full of
+    // irrelevant numerical current sheets -> block runaway/OOM if ungated). Default 10 code =
+    // ~2x the canonical BE-sphere t=0 peak (~5 code), so it activates only once gas is clearly
+    // collapsing; tune per IC.
+    const auto curr_rho_thresh =
+        pin->GetOrAddReal("refinement", "curr_rho_thresh", 10.0);
+    PARTHENON_REQUIRE(curr_rho_thresh >= 0.,
+                      "Make sure to set refinement/curr_rho_thresh >= 0 (code density).");
+    // Max refinement level the current-sheet criterion may drive (Jeans still refines deeper).
+    // Bounds the deep-core block explosion; default 99 = effectively uncapped (prior behavior).
+    const auto curr_max_level =
+        pin->GetOrAddInteger("refinement", "curr_max_level", 99);
     pkg->AddParam<Real>("refinement/njeans", njeans);
     pkg->AddParam<Real>("refinement/curr_nsheet", curr_nsheet);
+    pkg->AddParam<Real>("refinement/curr_rho_thresh", curr_rho_thresh);
+    pkg->AddParam<int>("refinement/curr_max_level", curr_max_level);
   } else if (refine_str == "user") {
     pkg->CheckRefinementBlock = Hydro::ProblemCheckRefinementBlock;
   }
@@ -1903,10 +2384,17 @@ TaskStatus FirstOrderFluxCorrect(MeshData<Real> *u0_data, MeshData<Real> *u1_dat
   IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
   IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
 
-  std::vector<parthenon::MetadataFlag> flags_ind({Metadata::Independent});
-  auto u0_cons_pack = u0_data->PackVariablesAndFluxes(flags_ind);
+  // Pack "cons" by NAME rather than by the {Independent} flag. Under Constrained Transport
+  // the {Independent} flag also matches the FACE field Bf (WithFluxes) whose EDGE fluxes
+  // (E1/E2/E3) have no X1/X2/X3 cell-flux slots -- indexing them in this cell-centered
+  // kernel segfaults (cudaErrorIllegalAddress). FOFC only needs the cell-centered hydro cons
+  // (rho, mom, E, cell-B, psi); CT evolves the staggered Bf via its own EMF, so the
+  // cell-B-flux redo here is inert (the cell-centered B is re-projected from Bf each stage).
+  // Mirrors the cons-by-name pack the STS/driver use for the same CT reason (hydro_driver.cpp).
+  const std::vector<std::string> cons_name{"cons"};
+  auto u0_cons_pack = u0_data->PackVariablesAndFluxes(cons_name, cons_name);
   auto const &u0_prim_pack = u0_data->PackVariables(std::vector<std::string>{"prim"});
-  auto u1_cons_pack = u1_data->PackVariablesAndFluxes(flags_ind);
+  auto u1_cons_pack = u1_data->PackVariablesAndFluxes(cons_name, cons_name);
   auto pkg = pmb->packages.Get("Hydro");
 
   const auto &eos =

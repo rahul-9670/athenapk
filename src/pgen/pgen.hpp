@@ -30,6 +30,11 @@ void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg
 
 namespace collapse_be {
 void ProblemGenerator(parthenon::MeshBlock *pmb, parthenon::ParameterInput *pin);
+// WP-13: registers the collapse_be_* Params. MUST be wired in main.cpp -- it runs on both a
+// fresh start and a restart, whereas ProblemGenerator does NOT run on restart, which silently
+// dropped the ApplyBarotropicCooling task (and its outside-sphere momentum BC) on every resume.
+void ProblemInitPackageData(parthenon::ParameterInput *pin,
+                            parthenon::StateDescriptor *hydro_pkg);
 parthenon::TaskStatus ApplyBarotropicCooling(parthenon::MeshData<parthenon::Real> *md,
                                               const parthenon::SimTime &tm,
                                               const parthenon::Real dt);

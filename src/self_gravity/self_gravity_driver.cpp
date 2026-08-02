@@ -11,6 +11,7 @@
 #include <parthenon/package.hpp>
 #include <solvers/solver_utils.hpp>
 
+#include "../diagnostics/grav_diag.hpp"
 #include "self_gravity.hpp"
 #include "poisson_equation.hpp"
 #include <solvers/internal_prolongation.hpp>
@@ -42,6 +43,7 @@ void SolvePoisson(TaskCollection &tc, Mesh *pmesh) {
 
   auto pkg = pmesh->packages.Get("self_gravity");
   auto psolver = pkg->Param<std::shared_ptr<parthenon::solvers::SolverBase>>("solver_pointer");
+  const bool solver_diag = pkg->Param<bool>("solver_diag");
 
   auto partitions = pmesh->GetDefaultBlockPartitions();
   const int num_partitions = partitions.size();
@@ -67,6 +69,23 @@ void SolvePoisson(TaskCollection &tc, Mesh *pmesh) {
     // Solve
     auto setup = psolver->AddSetupTasks(tl, copy_rhs, i, pmesh);
     auto solve = psolver->AddTasks(tl, setup, i, pmesh);
+
+    // VALIDATION WP-5: record iteration count / final residual and flag a solve that
+    // exhausted max_iterations (the solver reports neither). once_per_region because the
+    // recorded scalars are global -- every partition would write the same values.
+    // Pure read of solver state + package Params; touches no field data => bit-identical.
+    if (solver_diag) {
+      solve = tl.AddTask(
+          TaskQualifier::once_per_region, solve, "grav solver convergence diag",
+          [](Mesh *pm) { return Diagnostics::GravDiagRecord(pm); }, pmesh);
+    }
+
+    // B2: the non-convergence WARNING is unconditional -- production does not set solver_diag
+    // (it adds hst columns), which is exactly why the failure mode was invisible where it
+    // mattered. Reads solver state only, writes no field data => bit-identical.
+    solve = tl.AddTask(
+        TaskQualifier::once_per_region, solve, "grav solver nonconvergence warn",
+        [](Mesh *pm) { return Diagnostics::GravConvergenceWarn(pm); }, pmesh);
 
     // Communicate phi ghost cells after solve (so ApplyGravitySource sees full halo).
     auto bcs = parthenon::AddBoundaryExchangeTasks(solve, tl, md_phi, pmesh->multilevel);

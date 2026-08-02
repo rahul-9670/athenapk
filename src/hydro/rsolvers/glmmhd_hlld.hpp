@@ -158,6 +158,55 @@ struct Riemann<Fluid::glmmhd, RiemannSolver::hlld> {
       fr.by = ur.by * wri[IV1] - bxi * wri[IV2];
       fr.bz = ur.bz * wri[IV1] - bxi * wri[IV3];
 
+      //--- Step 3b. Boris hybrid: in strongly-magnetized (super-cap) interfaces the
+      // Boris-reduced fast speed makes the HLLD star-state algebra inconsistent with the
+      // full-force Maxwell stress; there, use a consistent LLF flux with the magnetic FORCE
+      // terms scaled by the per-state Boris factor lambda (induction b-fluxes + hydro
+      // advection unscaled). vA_eff -> c_b so the runaway/dt-wall is capped without adding
+      // mass. Full HLLD (bit-identical) everywhere else and whenever Boris is off.
+      if (eos.BorisOn()) {
+        const Real b2l =
+            wli[IB1] * wli[IB1] + wli[IB2] * wli[IB2] + wli[IB3] * wli[IB3];
+        const Real b2r =
+            wri[IB1] * wri[IB1] + wri[IB2] * wri[IB2] + wri[IB3] * wri[IB3];
+        const Real lamL = eos.BorisLambda(wli[IDN], b2l);
+        const Real lamR = eos.BorisLambda(wri[IDN], b2r);
+        // Switch to LLF-Boris only where the cap actually bites (lambda < 0.9 ~ vA > 0.33 c_b),
+        // so HLLD (with the <=5% Boris-reduced signal speed) runs only where it stays
+        // consistent with the full-force flux.
+        constexpr Real kBorisSwitch = 0.9;
+        if (lamL < kBorisSwitch || lamR < kBorisSwitch) {
+          // Boris-scaled physical fluxes: magnetic pressure/tension (momentum) and transverse
+          // Poynting (energy) scaled by lambda; hydro advection and induction unscaled.
+          const Real flB_mx = ul.mx * wli[IV1] + wli[IPR] + lamL * (pbl - bxsq);
+          const Real flB_my = ul.my * wli[IV1] - lamL * bxi * ul.by;
+          const Real flB_mz = ul.mz * wli[IV1] - lamL * bxi * ul.bz;
+          const Real flB_e =
+              wli[IV1] * (ul.e - pbl + wli[IPR]) +
+              lamL * (wli[IV1] * (2.0 * pbl - bxsq) -
+                      bxi * (wli[IV2] * ul.by + wli[IV3] * ul.bz));
+          const Real frB_mx = ur.mx * wri[IV1] + wri[IPR] + lamR * (pbr - bxsq);
+          const Real frB_my = ur.my * wri[IV1] - lamR * bxi * ur.by;
+          const Real frB_mz = ur.mz * wri[IV1] - lamR * bxi * ur.bz;
+          const Real frB_e =
+              wri[IV1] * (ur.e - pbr + wri[IPR]) +
+              lamR * (wri[IV1] * (2.0 * pbr - bxsq) -
+                      bxi * (wri[IV2] * ur.by + wri[IV3] * ur.bz));
+          // LLF dissipation with the Boris-reduced max signal speed (spd already Boris-aware).
+          const Real smax = std::max(spd[4], -spd[0]);
+          cons.flux(ivx, IDN, k, j, i) = 0.5 * (fl.d + fr.d - smax * (ur.d - ul.d));
+          cons.flux(ivx, ivx, k, j, i) = 0.5 * (flB_mx + frB_mx - smax * (ur.mx - ul.mx));
+          cons.flux(ivx, ivy, k, j, i) = 0.5 * (flB_my + frB_my - smax * (ur.my - ul.my));
+          cons.flux(ivx, ivz, k, j, i) = 0.5 * (flB_mz + frB_mz - smax * (ur.mz - ul.mz));
+          cons.flux(ivx, IEN, k, j, i) = 0.5 * (flB_e + frB_e - smax * (ur.e - ul.e));
+          cons.flux(ivx, iBx, k, j, i) = flxi[IB1]; // GLM decoupled Bx (psii), unchanged
+          cons.flux(ivx, iBy, k, j, i) = 0.5 * (fl.by + fr.by - smax * (ur.by - ul.by));
+          cons.flux(ivx, iBz, k, j, i) = 0.5 * (fl.bz + fr.bz - smax * (ur.bz - ul.bz));
+          cons.flux(ivx, IPS, k, j, i) = flxi[IPS]; // SQR(c_h)*bxi, unchanged
+          return; // skip HLLD star-state algebra for this interface
+        }
+      }
+
       //--- Step 4.  Compute middle and Alfven wave speeds
 
       Real sdl = spd[0] - wli[IV1]; // S_i-u_i (i=L or R)

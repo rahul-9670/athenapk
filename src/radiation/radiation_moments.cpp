@@ -371,20 +371,31 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
                             groups, optab, n_group, Eg0, e0_ref);
         };
         // Bracket [Tlo, Thi]. Thi capped inside the tabulated EOS/opacity range (Tmax_table).
+        const Real Tguess = T; // warm start: pre-coupling gas temperature (a good initial guess)
         Real Tlo = tfloor;
         Real Thi = coupling_tmax; // code T; opacity/EOS-table Tmax (stay in range)
         if (Thi <= Tlo) Thi = 1.0e5; // fallback (ideal EOS: no table cap)
-        Real flo = Rof(Tlo), fhi = Rof(Thi);
+        // EARLY EXIT: if the gas is already in radiative equilibrium (residual already ~0 at the
+        // current T), skip the whole solve. In relaxed regions most cells are near equilibrium, so
+        // this avoids the ~30-bisection cold-start over the huge [tfloor, ~1e6 K] bracket.
+        const Real fguess = Rof(Tguess);
         bool conv = false;
-        if (flo >= 0.0) {            // root at/below floor: gas cools to tfloor
-          T = Tlo; conv = true;
-        } else if (fhi <= 0.0) {     // root above table cap: clamp (unphysical; safe)
-          T = Thi; conv = true;
+        if (std::abs(fguess) / etot <= inner_tol) {
+          T = Tguess; conv = true;             // already in radiative equilibrium
+        } else if (fguess > 0.0 && Rof(Tlo) >= 0.0) {
+          T = Tlo; conv = true;                // root at/below floor: gas cools to tfloor
+        } else if (fguess < 0.0 && Rof(Thi) <= 0.0) {
+          T = Thi; conv = true;                // root above table cap: clamp (unphysical; safe)
+        }
+        if (conv) {
+          // handled above
         } else {
-          // rtsafe: orient so f(Tlo)<0<f(Thi); Newton step if in-bracket & decreasing, else bisect.
-          T = 0.5 * (Tlo + Thi);
+          // rtsafe with a WARM START at Tguess (Newton from a good guess converges in a few steps;
+          // the [Tlo,Thi] bracket remains the safety net). Tighten the bracket with fguess's sign.
+          if (fguess < 0.0) Tlo = Tguess; else Thi = Tguess;
+          T = Tguess; // == clamp(Tguess,[Tlo,Thi]) after the tightening above
           Real dTold = Thi - Tlo, dTstep = dTold;
-          Real f = Rof(T);
+          Real f = fguess; // reuse: Rof(Tguess) already computed for the early-exit check
           for (int it = 0; it < inner_max; ++it) {
             const Real dT = 1.0e-4 * T + 1.0e-12;
             const Real df = (Rof(T + dT) - f) / dT; // numerical derivative (monotone => df>0)
@@ -726,6 +737,8 @@ void AddRadiationTasks(TaskCollection &tc, Mesh *pmesh, const Real dt) {
   const Real dt_rad = RadDtMesh(pmesh);
   const int nsub = std::max(1, static_cast<int>(std::ceil(dt / (dt_rad + RadFuzz()))));
   const Real dts = dt / static_cast<Real>(nsub);
+  if (getenv("RAD_PRINT_NSUB") != nullptr && parthenon::Globals::my_rank == 0)
+    printf("[RAD_NSUB] nsub=%d dt=%.3e dt_rad=%.3e\n", nsub, dt, dt_rad), fflush(stdout);
 
   auto pkg = pmesh->packages.Get("radiation");
   const bool do_coupling = pkg->Param<bool>("matter_coupling");

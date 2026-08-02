@@ -36,6 +36,23 @@ void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
   Real d0 = 25.0 / (36.0 * M_PI);
   Real v0 = 1.0;
   Real p0 = 5.0 / (12.0 * M_PI);
+  // Optional LOW-BETA variant (diagnostic, 2026-07-29). b_amp scales the field amplitude;
+  // p_amp scales the thermal pressure. Both default to 1.0 => the standard Orszag-Tang
+  // (beta_0 = 2 p0/B0^2 = 10/3, and the CT/GLM ideal budgets then agree to ~1e-4).
+  //
+  // Purpose: the standard test never leaves the moderate-beta regime (measured beta_min =
+  // 0.176 at t=0.5), whereas the failing flagship region sits at beta = 2.6e-3 with
+  // ME/IE = 152. Any inconsistency between how the magnetic energy is ADVANCED (CT curl of
+  // the edge EMF) and how it is SUBTRACTED to recover e = E - KE - ME (cell-centered B from
+  // the HLLD fluxes) is a *relative* error in ME, so its damage to the internal energy grows
+  // like ME/IE. A test at ME/IE ~ 4 cannot see what a run at ME/IE ~ 150 suffers. Scaling
+  // p_amp down (or b_amp up) walks the same problem into the flagship's regime while keeping
+  // the geometry, the shocks and the div-free initialization identical.
+  // NOTE: B is scaled here AND in the vector potential Az below, so div(B)_face stays exact.
+  const Real b_amp = pin->GetOrAddReal("problem/orszag_tang", "b_amp", 1.0);
+  const Real p_amp = pin->GetOrAddReal("problem/orszag_tang", "p_amp", 1.0);
+  B0 *= b_amp;
+  p0 *= p_amp;
 
   auto &coords = pmb->coords;
 

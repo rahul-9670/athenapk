@@ -4,6 +4,7 @@
 // Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
 
+#include <limits>
 #include <array>
 #include <memory>
 #include <string>
@@ -17,6 +18,7 @@
 #include <solvers/mg_solver.hpp>
 #include <solvers/solver_utils.hpp>
 
+#include "../diagnostics/grav_diag.hpp"
 #include "../main.hpp"          // for IDN
 #include "self_gravity.hpp"
 #include "poisson_equation.hpp"
@@ -245,6 +247,82 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   }
   pkg->AddParam("solver_pointer", psolver);
 
+  // --- VALIDATION WP-5: Poisson-solver convergence reporting -----------------
+  // The BiCGSTAB completion task returns TaskStatus::complete both when a tolerance is
+  // met and when max_iterations is exhausted, and reports neither -- so a solve that
+  // silently bails at the ceiling is indistinguishable from a converged one. Record the
+  // iteration count / final residual and flag the ceiling case. See diagnostics/grav_diag.hpp.
+  // Default OFF; when off nothing is registered and no task is added => bit-identical.
+  const bool solver_diag = pin->GetOrAddBoolean(block_name, "solver_diag", false);
+  pkg->AddParam<>("solver_diag", solver_diag);
+
+  // B2 (2026-08-02): the NON-CONVERGENCE WARNING is unconditional, unlike the hst columns.
+  // Rationale: a Poisson solve that quietly gave up corrupts the potential for that step, and
+  // production runs do NOT set solver_diag (it adds hst columns, which would shift every column
+  // index and break existing analysis scripts). Gating the warning on the diagnostic meant the
+  // one failure mode that most needs to be loud was silent in exactly the runs that matter.
+  // These two Params are always registered; the warn task reads solver state only and touches
+  // no field data, so the OFF-state remains bit-identical.
+  const int max_iters_always =
+      pin->GetOrAddInteger(solver_params_block, "max_iterations", 1000);
+  pkg->AddParam<int>("grav_max_iters", max_iters_always);
+  pkg->AddParam<int>("grav_nonconv_count", 0, true);
+
+  // B3 (2026-08-02): the convergence criterion is an ABSOLUTE residual unless the deck asks
+  // otherwise. From bicgstab_solver.hpp:54-66, `relative_residual` defaults to FALSE, and in
+  // that branch  absolute_residual_tolerance = residual_tolerance  while
+  // relative_residual_tolerance = 0. The test is therefore on
+  //     rms_res = sqrt( sum(r^2) / total_cells )
+  // of  grad^2 phi = 4 pi G rho,  with a FIXED ceiling. Through a collapse the RHS grows by
+  // many decades while that ceiling does not move, so the *relative* accuracy being demanded
+  // tightens monotonically -- the run gets progressively harder to converge exactly when the
+  // physics gets most interesting. Measured at smoke scale (WP-5): grav-res climbed
+  // 3.9e-8 -> 9.5e-7 over ~1 t0, i.e. to 95% of a 1e-6 tolerance, before any deep collapse.
+  // This is NOT auto-corrected here: switching to a relative criterion changes which solves
+  // are accepted and is therefore result-changing. It is made LOUD instead.
+  const bool rel_res = pin->GetOrAddBoolean(solver_params_block, "relative_residual", false);
+  if (!rel_res && parthenon::Globals::my_rank == 0) {
+    const Real res_tol = pin->GetOrAddReal(solver_params_block, "residual_tolerance", 1.0e-12);
+    std::cout << "## NOTE [self-gravity] convergence uses an ABSOLUTE residual tolerance ("
+              << res_tol << "); <" << solver_params_block
+              << "> relative_residual is false. As the collapse deepens the RHS grows while "
+                 "this ceiling does not, so the effective relative tolerance tightens "
+                 "monotonically. Watch grav-res (self_gravity/solver_diag=true) and the "
+                 "non-convergence warnings. See B3 in VALIDATION_PLAN.md."
+              << std::endl;
+  }
+
+  if (solver_diag) {
+    // Mirror the ceiling the solver itself parsed, so the "did it bail" test uses the
+    // same number rather than a hard-coded default. The key was already consumed above
+    // by BiCGSTABParams/MGParams, so GetOrAdd here just reads it back.
+    pkg->AddParam<Real>("grav_last_iters", -1.0, true);
+    pkg->AddParam<Real>("grav_last_res", -1.0, true);
+    pkg->AddParam<Real>("grav_last_nonconv", 0.0, true);
+
+    using Diagnostics::GravDiag;
+    using Diagnostics::GravDiagReport;
+    parthenon::HstVar_list hst_grav = {};
+    auto add_grav = [&hst_grav](GravDiag w, const std::string &label) {
+      // max, not sum: the underlying scalars come from a global all-reduce inside the
+      // solver and are identical on every partition, so sum would multiply by the
+      // partition count.
+      hst_grav.emplace_back(parthenon::HistoryOutputVar(
+          parthenon::UserHistoryOperation::max,
+          [w](MeshData<Real> *md) { return GravDiagReport(md, w); }, label));
+    };
+    add_grav(GravDiag::iters, "grav-iters");
+    add_grav(GravDiag::res, "grav-res");
+    add_grav(GravDiag::nonconv, "grav-nonconv");
+    pkg->AddParam<>(parthenon::hist_param_key, hst_grav);
+
+    if (parthenon::Globals::my_rank == 0) {
+      std::cout << "## Self-gravity solver diagnostics ON (self_gravity/solver_diag): "
+                   "hst grav-iters, grav-res, grav-nonconv; max_iterations="
+                << max_iters_always << "." << std::endl;
+    }
+  }
+
   return pkg;
 }
 
@@ -257,7 +335,32 @@ void FillPoissonRHS(MeshData<Real> *md) {
   const Real four_pi_G = grav_pkg->Param<Real>("four_pi_G");
   const bool has_multipole = grav_pkg->Param<bool>("grav_has_multipole");
 
-  const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
+  // WP-13 (2026-08-02): read the density from "cons", NOT "prim".
+  //
+  // This function is self_gravity's FillDerivedMesh. `prim` is produced by *Hydro's*
+  // FillDerivedMesh (ConsToPrim), and Parthenon does not guarantee that one package's
+  // FillDerived runs before another's. On a FRESH start that was harmless: initialization
+  // performs several FillDerived passes and the last one sees a populated `prim`. On a
+  // RESTART there is a single init pass, and self_gravity's ran first -- so `prim` was still
+  // ALL ZEROS (measured: "prim rho entire[0,0] interior[0,0]"), the Poisson RHS came out
+  // identically zero, and the first solve of the first step fed BiCGSTAB a zero right-hand
+  // side. The Krylov recurrence then divided by a zero residual norm and returned phi = NaN
+  // in all 512000 cells, which the gravity kick applied to momentum and energy, flooring the
+  // entire domain in one step (mass 5.17e4 -> 0.1406, KE = nan). Silent, and fatal.
+  //
+  // cons(IDN) and prim(IDN) are the SAME number -- density is not transformed by
+  // ConsToPrim -- so this is numerically a no-op on every ordinary step, while removing the
+  // inter-package FillDerived ordering dependency entirely. `cons` is Independent and is
+  // restored directly from the restart file, so it is valid before any derived quantity is.
+  // The density floor ConsToPrim applies (adiabatic_glmmhd.hpp:152 /
+  // adiabatic_hydro.hpp:81 do `u_d = max(u_d, density_floor_)`). Applying it here is what
+  // makes reading `cons` EXACTLY equivalent to reading `prim`: without it the RHS uses
+  // unfloored (possibly sub-floor or negative) densities and the trajectory changes -- which
+  // it measurably did, diverging from the pre-fix fresh run by cycle 2. A no-op fix must
+  // reproduce prim bit-for-bit, floor included.
+  const Real rho_floor = pm->packages.Get("Hydro")->Param<Real>("grav_rho_floor");
+
+  const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
   auto &resolved = pm->resolved_packages;
   auto desc_rhs = parthenon::MakePackDescriptor<grav::rhs>(resolved.get());
   auto rhs_pack = desc_rhs.GetPack(md);
@@ -279,10 +382,10 @@ void FillPoissonRHS(MeshData<Real> *md) {
         parthenon::DevExecSpace(), 0, nblocks - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i,
                       Real &lmass, Real &lvol) {
-          const auto &coords = prim_pack.GetCoords(b);
+          const auto &coords = cons_pack.GetCoords(b);
           const Real vv = coords.CellVolume(k, j, i);
           lvol += vv;
-          lmass += prim_pack(b, IDN, k, j, i) * vv;
+          lmass += (cons_pack(b, IDN, k, j, i) > rho_floor ? cons_pack(b, IDN, k, j, i) : rho_floor) * vv;
         },
         Kokkos::Sum<Real>(total_mass), Kokkos::Sum<Real>(total_volume));
     Kokkos::fence();
@@ -310,9 +413,9 @@ void FillPoissonRHS(MeshData<Real> *md) {
         DEFAULT_LOOP_PATTERN, "SG::Moments", parthenon::DevExecSpace(), 0, nblocks - 1,
         kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
-          const auto &coords = prim_pack.GetCoords(b);
+          const auto &coords = cons_pack.GetCoords(b);
           const Real vv = coords.CellVolume(k, j, i);
-          const Real dm = prim_pack(b, IDN, k, j, i) * vv;
+          const Real dm = (cons_pack(b, IDN, k, j, i) > rho_floor ? cons_pack(b, IDN, k, j, i) : rho_floor) * vv;
           const Real x = coords.Xc<parthenon::X1DIR>(k, j, i);
           const Real y = coords.Xc<parthenon::X2DIR>(k, j, i);
           const Real z = coords.Xc<parthenon::X3DIR>(k, j, i);
@@ -366,9 +469,10 @@ void FillPoissonRHS(MeshData<Real> *md) {
       DEFAULT_LOOP_PATTERN, "SG::SetRHS", parthenon::DevExecSpace(), 0, nblocks - 1,
       kbe.s, kbe.e, jbe.s, jbe.e, ibe.s, ibe.e,
       KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
-        const Real rho = prim_pack(b, IDN, k, j, i);
+        const Real rho = (cons_pack(b, IDN, k, j, i) > rho_floor ? cons_pack(b, IDN, k, j, i) : rho_floor);
         rhs_pack(b, te, grav::rhs(), k, j, i) = four_pi_G * (rho - grav_mean_rho);
       });
+
 
   // --- Multipole boundary lift ----------------------------------------------
   // The Poisson solver runs a LINEAR operator with HOMOGENEOUS Dirichlet ghosts on the
@@ -402,7 +506,7 @@ void FillPoissonRHS(MeshData<Real> *md) {
             DEFAULT_LOOP_PATTERN, "SG::MultipoleRHSLift", parthenon::DevExecSpace(),
             b, b, k0, k1, j0, j1, i0, i1,
             KOKKOS_LAMBDA(const int bb, const int k, const int j, const int i) {
-              const auto &coords = prim_pack.GetCoords(bb);
+              const auto &coords = cons_pack.GetCoords(bb);
               Real px = coords.Xc<parthenon::X1DIR>(k, j, i);
               Real py = coords.Xc<parthenon::X2DIR>(k, j, i);
               Real pz = coords.Xc<parthenon::X3DIR>(k, j, i);
@@ -450,6 +554,7 @@ TaskStatus ApplyGravitySource(MeshData<Real> *md, const parthenon::SimTime &tm,
   IndexRange ib = md->GetBoundsI(IndexDomain::interior);
   IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
   IndexRange kb = md->GetBoundsK(IndexDomain::interior);
+
   const int nblocks = md->NumBlocks();
   const int ndim = pm->ndim;
   const bool multi_d = (ndim > 1);

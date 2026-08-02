@@ -73,9 +73,11 @@ struct EosTable {
   Real EspFromP(Real rho, Real P) const {
     const Real lr = std::log10(rho);
     Real lelo = le0_, lehi = le0_ + (ne_ - 1) * dle_;
-    // 30 bisections => interval 2^-30 ~ 1e-9 of the log-esp range, far below the ~1%
-    // table interpolation accuracy, so more iterations only cost cycles in the hot loop.
-    for (int it = 0; it < 30; ++it) {
+    // 20 bisections => interval 2^-20 ~ 1e-6 of the log-esp range, still ~1e4x below the ~1%
+    // table interpolation accuracy. FIXED count (not early-exit) is deliberate: on GPU a warp
+    // runs until its slowest lane converges, so a fixed low count is faster + divergence-free than
+    // an early-exit. 20 (was 30) trims this hot per-cell inversion (sound speed etc.) ~33%.
+    for (int it = 0; it < 20; ++it) {
       const Real lem = 0.5 * (lelo + lehi);
       const Real Pm = bilin(P_, nr_, ne_, lr0_, dlr_, le0_, dle_, lr, lem);
       if (Pm < P) lelo = lem; else lehi = lem;

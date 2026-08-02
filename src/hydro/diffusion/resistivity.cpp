@@ -99,6 +99,9 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
   // *energy* (Poynting/heating) term in cons.flux(IEN) is unaffected and stays on the
   // finite-volume energy flux. GLM path (use_ct=false): deposits unchanged, bit-identical.
   const bool ct_induction = hydro_pkg->Param<bool>("use_ct");
+  // See ambipolar.cpp: under CT+RKL2 the diffusive Poynting flux is rebuilt from the CT
+  // edge EMF (CT_AddDiffusivePoynting) so induction and energy share one stencil.
+  const bool ct_energy = hydro_pkg->Param<bool>("ct_edge_poynting");
 
   auto const &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
 
@@ -173,10 +176,12 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
           cons.flux(X1DIR, IB2, k, j, i) += -eta * j3;
           cons.flux(X1DIR, IB3, k, j, i) += eta * j2;
         }
-        cons.flux(X1DIR, IEN, k, j, i) +=
-            0.5 * eta *
-            ((prim(IB3, k, j, i - 1) + prim(IB3, k, j, i)) * j2 -
-             (prim(IB2, k, j, i - 1) + prim(IB2, k, j, i)) * j3);
+        if (!ct_energy) {
+          cons.flux(X1DIR, IEN, k, j, i) +=
+              0.5 * eta *
+              ((prim(IB3, k, j, i - 1) + prim(IB3, k, j, i)) * j2 -
+               (prim(IB2, k, j, i - 1) + prim(IB2, k, j, i)) * j3);
+        }
       });
 
   if (ndim < 2) {
@@ -238,10 +243,12 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
           cons.flux(X2DIR, IB1, k, j, i) += eta * j3;
           cons.flux(X2DIR, IB3, k, j, i) += -eta * j1;
         }
-        cons.flux(X2DIR, IEN, k, j, i) +=
-            0.5 * eta *
-            ((prim(IB1, k, j - 1, i) + prim(IB1, k, j, i)) * j3 -
-             (prim(IB3, k, j - 1, i) + prim(IB3, k, j, i)) * j1);
+        if (!ct_energy) {
+          cons.flux(X2DIR, IEN, k, j, i) +=
+              0.5 * eta *
+              ((prim(IB1, k, j - 1, i) + prim(IB1, k, j, i)) * j3 -
+               (prim(IB3, k, j - 1, i) + prim(IB3, k, j, i)) * j1);
+        }
       });
 
   if (ndim < 3) {
@@ -301,10 +308,12 @@ void OhmicDiffFluxIsoFixed(MeshData<Real> *md) {
           cons.flux(X3DIR, IB1, k, j, i) += -eta * j2;
           cons.flux(X3DIR, IB2, k, j, i) += eta * j1;
         }
-        cons.flux(X3DIR, IEN, k, j, i) +=
-            0.5 * eta *
-            ((prim(IB2, k - 1, j, i) + prim(IB2, k, j, i)) * j1 -
-             (prim(IB1, k - 1, j, i) + prim(IB1, k, j, i)) * j2);
+        if (!ct_energy) {
+          cons.flux(X3DIR, IEN, k, j, i) +=
+              0.5 * eta *
+              ((prim(IB2, k - 1, j, i) + prim(IB2, k, j, i)) * j1 -
+               (prim(IB1, k - 1, j, i) + prim(IB1, k, j, i)) * j2);
+        }
       });
 }
 

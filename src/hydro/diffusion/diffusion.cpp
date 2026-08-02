@@ -57,6 +57,7 @@ bool MakeFusedNonidealEval(parthenon::StateDescriptor *pkg, FusedNonidealEval &f
       fusable = false;
     } else {
       fe.ion = d.GetIonModel();
+      fe.ad_cap = d.EtaCap();
     }
     if (fe.ad_chem && fe.i_xe < 0) fe.i_xe = d.XeIndex();
   }
@@ -71,6 +72,16 @@ bool MakeFusedNonidealEval(parthenon::StateDescriptor *pkg, FusedNonidealEval &f
       fe.hall_cap = d.EtaCap();
     }
     if (fe.hall_chem && fe.i_xe < 0) fe.i_xe = d.XeIndex();
+  }
+  // WS-4 dust -> conductivity coupling (flagship audit item 5). Params only exist when the
+  // diffusion block ran, which is guaranteed here (we already read resistivity/ambipolar/hall).
+  if (pkg->AllParams().hasKey("nonideal_dust_on") &&
+      pkg->Param<bool>("nonideal_dust_on")) {
+    fe.dust_on = true;
+    fe.i_fdg = pkg->Param<int>("nonideal_dust_i_fdg");
+    fe.i_ac = pkg->Param<int>("nonideal_dust_i_ac");
+    fe.dust_a_ref = pkg->Param<Real>("nonideal_dust_a_ref");
+    fe.dust_fdg_ref = pkg->Param<Real>("nonideal_dust_fdg_ref");
   }
   return fusable;
 }
@@ -143,7 +154,9 @@ Real EstimateNonidealTimestepIonizationFused(MeshData<Real> *md) {
 
         // Minimum tensor solves -> all three diffusivities (matches per-term Get()).
         Real eta_O, eta_H, eta_A;
-        feval.Eta(rho, temp, bmag, xe, eta_O, eta_H, eta_A);
+        feval.Eta(rho, temp, bmag, xe, eta_O, eta_H, eta_A,
+                  feval.dust_on ? prim(feval.i_fdg, k, j, i) : -1.0,
+                  feval.dust_on ? prim(feval.i_ac, k, j, i) : -1.0);
 
         // eta is a scalar per cell, so min_d(dx_d^2/eta) = (min_d dx_d^2)/eta exactly.
         Real mindx2 = SQR(coords.Dxc<1>(k, j, i));
@@ -241,7 +254,9 @@ void EstimateNonidealTimestepIonizationFusedMixed(MeshData<Real> *md,
         const Real xe = (feval.i_xe >= 0) ? prim(feval.i_xe, k, j, i) : -1.0;
 
         Real eta_O, eta_H, eta_A;
-        feval.Eta(rho, temp, bmag, xe, eta_O, eta_H, eta_A);
+        feval.Eta(rho, temp, bmag, xe, eta_O, eta_H, eta_A,
+                  feval.dust_on ? prim(feval.i_fdg, k, j, i) : -1.0,
+                  feval.dust_on ? prim(feval.i_ac, k, j, i) : -1.0);
 
         Real mindx2 = SQR(coords.Dxc<1>(k, j, i));
         if (ndim >= 2) {
@@ -333,6 +348,13 @@ TaskStatus PrecomputeNonidealEta(StateDescriptor *hydro_pkg, MeshData<Real> *md)
   const bool useh2_nid = eos_nid.UseH2Diss();
   const auto T_unit_nid = feval.ion.T_unit;
 
+  // FLAGSHIP AUDIT ITEM 1: cap-activation diagnostic, filled from the SAME tensor solve
+  // that fills the eta cache (no second solve). Only the fused/ionization family is
+  // supported -- that is the production configuration, and hydro.cpp hard-requires it.
+  const bool cap_diag = hydro_pkg->Param<bool>("nonideal_cap_diag");
+  auto capd_pack = cap_diag ? md->PackVariables(std::vector<std::string>{"diff.capdiag"})
+                            : eta_pack;
+
   parthenon::par_for(
       DEFAULT_LOOP_PATTERN, "PrecomputeNonidealEta", DevExecSpace(), 0,
       prim_pack.GetDim(5) - 1, kl, ku, jl, ju, il, iu,
@@ -348,7 +370,31 @@ TaskStatus PrecomputeNonidealEta(StateDescriptor *hydro_pkg, MeshData<Real> *md)
         if (fused) {
           const Real xe = (feval.i_xe >= 0) ? prim(feval.i_xe, k, j, i) : -1.0;
           Real eO, eH, eA;
-          feval.Eta(rho, temp, bmag, xe, eO, eH, eA);
+          feval.EtaRaw(rho, temp, bmag, xe, eO, eH, eA,
+                       feval.dust_on ? prim(feval.i_fdg, k, j, i) : -1.0,
+                       feval.dust_on ? prim(feval.i_ac, k, j, i) : -1.0);
+          if (cap_diag) {
+            // raw (pre-ceiling) magnitudes; |.| because eta_H is signed
+            const Real rO = eO, rH = std::abs(eH), rA = eA;
+            Real cO = eO, cH = eH, cA = eA;
+            feval.Clamp(cO, cH, cA);
+            const Real aO = cO, aH = std::abs(cH), aA = cA;
+            // A capped cell returns the ceiling EXACTLY, so ">" on the raw value is an
+            // exact test for "this ceiling bit here".
+            const Real fO = (rO > aO) ? 1.0 : 0.0;
+            const Real fH = (rH > aH) ? 1.0 : 0.0;
+            const Real fA = (rA > aA) ? 1.0 : 0.0;
+            capd_pack(b, CapDiagIdx::flagO, k, j, i) = fO;
+            capd_pack(b, CapDiagIdx::flagH, k, j, i) = fH;
+            capd_pack(b, CapDiagIdx::flagA, k, j, i) = fA;
+            capd_pack(b, CapDiagIdx::decO, k, j, i) =
+                (fO > 0.0 && aO > 0.0) ? std::log10(rO / aO) : 0.0;
+            capd_pack(b, CapDiagIdx::decH, k, j, i) =
+                (fH > 0.0 && aH > 0.0) ? std::log10(rH / aH) : 0.0;
+            capd_pack(b, CapDiagIdx::decA, k, j, i) =
+                (fA > 0.0 && aA > 0.0) ? std::log10(rA / aA) : 0.0;
+          }
+          feval.Clamp(eO, eH, eA);
           eta_pack(b, NonidealEtaIdx::O, k, j, i) = eO;
           eta_pack(b, NonidealEtaIdx::H, k, j, i) = eH;
           eta_pack(b, NonidealEtaIdx::A, k, j, i) = eA;
@@ -375,6 +421,56 @@ TaskStatus PrecomputeNonidealEta(StateDescriptor *hydro_pkg, MeshData<Real> *md)
         }
       });
   return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+// FLAGSHIP AUDIT ITEM 1 -- cap-activation history reductions over "diff.capdiag".
+// Shared driver: sum over interior cells of w * dV, where w is selected by `mode`.
+namespace {
+enum class CapRed { volume, flag, decade, massflag };
+
+Real CapReduce(MeshData<Real> *md, CapRed mode, int comp) {
+  const auto &capd = md->PackVariables(std::vector<std::string>{"diff.capdiag"});
+  const auto &prim = md->PackVariables(std::vector<std::string>{"prim"});
+  IndexRange ib = md->GetBlockData(0)->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBlockData(0)->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBlockData(0)->GetBoundsK(IndexDomain::interior);
+  Real sum = 0.0;
+  Kokkos::parallel_reduce(
+      "NonidealCapHst",
+      Kokkos::MDRangePolicy<Kokkos::Rank<4>>(
+          DevExecSpace(), {0, kb.s, jb.s, ib.s},
+          {capd.GetDim(5), kb.e + 1, jb.e + 1, ib.e + 1}, {1, 1, 1, ib.e + 1 - ib.s}),
+      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &lsum) {
+        const auto &coords = capd.GetCoords(b);
+        const Real dV = coords.CellVolume(k, j, i);
+        Real w = 1.0;
+        if (mode == CapRed::flag) {
+          w = capd(b, comp, k, j, i);
+        } else if (mode == CapRed::decade) {
+          // flag * decades: `dec*` is already 0 where the ceiling is inactive.
+          w = capd(b, comp + CapDiagIdx::decO, k, j, i);
+        } else if (mode == CapRed::massflag) {
+          w = capd(b, comp, k, j, i) * prim(b, IDN, k, j, i);
+        }
+        lsum += w * dV;
+      },
+      sum);
+  return sum;
+}
+} // namespace
+
+Real NonidealCapHstVol(MeshData<Real> *md) {
+  return CapReduce(md, CapRed::volume, 0);
+}
+Real NonidealCapHstFlag(MeshData<Real> *md, int comp) {
+  return CapReduce(md, CapRed::flag, comp);
+}
+Real NonidealCapHstDecade(MeshData<Real> *md, int comp) {
+  return CapReduce(md, CapRed::decade, comp);
+}
+Real NonidealCapHstMassFlag(MeshData<Real> *md, int comp) {
+  return CapReduce(md, CapRed::massflag, comp);
 }
 
 TaskStatus CalcDiffFluxes(StateDescriptor *hydro_pkg, MeshData<Real> *md,

@@ -1509,3 +1509,918 @@ VERIFICATIONS this session: (a) CPU build of the charge-solver fix under REAL Ko
 (b) hi-res EOS regeneration is bit-for-bit reproducible (md5 6b8e3999eca19806d8f4d43054e0447c).
 NOT done (needs user go, both result-changing): the GPU rebuild that carries the charge-solver
 fix into production, and the production EOS input-key swap. prod_v9 remains HELD.
+
+## 2026-07-29 — CT "core-edge over-magnetization" ROOT-CAUSED: it was never a B problem
+
+**The reported symptom was misdiagnosed.** The CT flagship's max ME/E per cell -> 0.998 was
+read for three sessions as "CT over-concentrates flux at the stagnant core edge". Direct
+measurement of the flagship dump (`fc128fixc/parthenon.out1.00003.phdf`, t=1.10387) against
+the matched GLM run (`fc128glm/parthenon.out1.00001.phdf`, t=1.10293) falsifies that:
+
+- CT and GLM agree bin-for-bin on the whole radial structure of rho, |B|, v_rad and ME/E.
+  Core |B|max 88.3 (CT) vs 78.0 (GLM) at a slightly later time; |B| by density decade agrees
+  to ~10% for rho > 100.
+- The ME/E=0.998 cell has |B| = 15.85, which is 3x *BELOW* the 50.0 mass-weighted mean of its
+  own radial shell. The field there is weak, not strong.
+- ME/E -> 1 because rho and P collapsed: rho = 3.6e-3 (shell mean 4.1e4), P = 1.0e-8 = pfloor
+  exactly. It is a PRESSURE/DENSITY hole, not a magnetic pile-up.
+- The hole is not a shell and not a checkerboard: 678 cells with ME/E>0.5, 588 of them in ONE
+  meshblock (blk 264, level 6, r~0.41, |cos theta| 0.61-0.68); grid-scale roughness of |B|
+  there is 0.003 median (a checkerboard reads 2-4). |B| is monotone to 3%/cell across a
+  density jump of 600x.
+- It grows: rho_min(r<1) 0.126 (t=1.1028, fc128b) -> 1.97e-2 (t=1.1034) -> 8.0e-4 (t=1.1039);
+  cells at pfloor 0 -> 57 -> 77. GLM at t=1.1029 has rho_min = 3.99 and ZERO pfloor cells.
+
+### Root cause (A): the GLM/Dedner machinery is still live under CT, as an open-loop noise source
+`divergence_control=ct` left the whole GLM apparatus running ("decoupled", per the old comment
+in hydro.cpp). It is not decoupled -- it is an amplifier:
+
+1. HLLD sources psi from cell-centered normal-field jumps (`flxi[IPS] = c_h^2 * bxi`).
+2. `CT_ProjectBfToCC` overwrites cons(IB1..3) from the face field every substage, DISCARDING
+   the psi->B half of the Dedner loop. psi is driven but never relieved.
+   Measured: |psi|max = 4.75e2 (CT) vs 1.95e0 (GLM). **244x runaway.**
+3. That psi feeds straight back into every Riemann solve via the decoupled normal field
+   `bxi = 0.5(BL+BR) - (psiR-psiL)/(2 c_h)` (glmmhd_hlld.hpp:89), corrupting the momentum and
+   energy fluxes -- bxi enters bxsq/pbl/pbr and every star state.
+4. `DednerSource<extended>` adds the Powell momentum source -(divB_cc)*B, where divB_cc is a
+   cell-centered 2-delta divergence of the PROJECTED face field. The CT invariant is the FACE
+   divergence (measured ct_maxRelDivB = 4.3e-12); divB_cc is pure truncation noise, O(1) at a
+   shock. Its acceleration scales as 1/rho -> runaway in evacuated cells.
+   Measured (code's own stencil, applied to the dump): at rho 1e-3..1e-2 the spurious Powell
+   term delivers **dv = 0.22-0.39 per step** where |v| ~ 10-25; max acceleration 7.4e5.
+   Same quantity on the matched GLM run: **4.0e-7 max anywhere.** Six orders of magnitude.
+5. `DednerSource<extended>` also adds -0.5*B.grad(psi) to cons(IEN): measured at **~1e6 x the
+   cell's internal energy per step** in those cells.
+
+Everywhere else these terms are negligible (dv/step 1e-9..1e-10 at rho 0.1..10), which is why
+this only ever bit at the accretion-shock edge and why global diagnostics stayed clean.
+
+**Fix A** (`hydro/ct_legacy_glm_source=true` restores the old behaviour for A/B bisects):
+- `AdiabaticGLMMHDEOS::ConsToPrim` holds the CONSERVED psi at exactly 0 under CT. Doing it in
+  cons->prim (not just prim) covers restarts and ghosts: psi is 0 before every flux
+  evaluation, so bxi reduces to the plain average and flxi[IPS] is re-zeroed each stage.
+- `AddUnsplitSources` skips the GLM source entirely under CT (new param `ct_glm_inert`).
+
+### Root cause (B): cons(IEN) and the CT field are advanced by two independent integrators
+Separate, pre-existing, and it has its own cheap reproducer. `cons(IEN)` is advanced by the
+conservative flux divergence (energy flux consistent with the cell-centered, Riemann-solved
+field); the magnetic energy is advanced by the CT curl -- and in the RKL2 path by a SECOND
+independent recurrence (`RKL2StepFirst` on cons vs `CT_RKL2FirstBf` on Bf). Nothing reconciles
+their magnetic-energy bookkeeping, so the entire discrepancy is silently dumped into
+e = E - KE - ME. Made worse by the 2026-07-28 direct-edge AD stencil: the induction now uses
+`AmbiEdgeEMF_E*` while the energy still uses `AmbipolarDiffFluxIsoFixed`'s Poynting term from
+a different stencil.
+
+Reproducer (5 s, CPU): `runs/ct_tests/orszag_tang_ad_ct.in` aborts on negative pressure at
+cycle ~100. **This gate was ALREADY failing before this session's changes** -- the previous
+session's own `ot_ad_ct_fix/` and `ot_ad_ct_edge/` logs both end in a PARTHENON ERROR at
+cycle ~50-100, contradicting the handoff's "must NOT NaN" framing. Isolation: ideal-CT clean
+to cycle 300, CT+AD-*unsplit* clean to cycle 300, CT+AD+*RKL2* aborts. GLM+AD+RKL2 clean.
+
+**Fix B is a LIMITER, not a cure** (`hydro/ct_eint_guard_frac`, default 0.9, 0 = off):
+one-sided guard in `CT_ProjectBfToCC` -- the projection may HEAT the gas (numerical
+dissipation, stabilizing) but may not cool it below a fraction of the internal energy the
+conservative update produced. Bit-identical when it does not fire; when it does, E is
+corrected using the cell's own pre-projection internal energy instead of letting the global
+pressure floor fire. Calibration on orszag_tang_ad_ct (tlim=0.14) vs matched GLM:
+
+  guard 0.0  -> ABORT      guard 0.5 -> ABORT (never fires)
+  guard 0.9  -> completes, tot-E +0.29% vs GLM   <- default
+  guard 0.99 -> completes, tot-E +2.76% vs GLM
+
+At 0.9 the run matches GLM to 0.1% in KE and 1.0% in ME, ct_maxAbsDivB = 3.5e-14. The real fix
+is a consistent-heating / dual-energy formulation (derive the diffusive heating from the same
+discrete EMF that updates the field, or evolve e_int separately). NOT implemented.
+
+### Verification (CPU, build_cpu)
+- `orszag_tang_ad_ct.in`: was ABORT -> now completes 300 cycles, 0 errors.
+- `orszag_tang_ad_glm.in`: cycle 200 t=2.6565828685855680e-01 -- **bit-identical to the
+  pre-change `runs/ct_tests/ot_ad_glm/run.log`**. GLM path proven untouched.
+- ideal-CT at guard 0.9 vs 0.0: bit-identical (3.7557117331232648e-01). Guard inert.
+- CT+AD-unsplit at guard 0.9 vs 0.0: bit-identical (2.5428594604064228e-02).
+- AD damped-Alfven uniform gate: rel err 5.47e-04, unchanged from the direct-edge stencil.
+
+### Consequences for the earlier CT work
+The direct-edge ambipolar stencil and `eta_ad_cap=3.0` were treating symptoms of (A): the
+pocket's v_A = B/sqrt(rho) = 267 and its eta_A ~ 1/rho^2 are *consequences* of the spurious
+evacuation, which is why the cap bought robustness but "did not cure the over-magnetization".
+There was no over-magnetization to cure.
+
+### Files (all UNCOMMITTED, branch flagship-phase2-ct)
+`src/eos/adiabatic_glmmhd.hpp` (psi held at 0 under CT), `src/hydro/hydro.cpp` (ct_glm_inert,
+ct_eint_guard_frac, source gate), `src/hydro/ct/ct.cpp` (guard in CT_ProjectBfToCC).
+GPU binary `build_gpu/bin/athenaPK_ctfix_8f5c623c` (md5 8f5c623c). `bin/athenaPK` was
+RESTORED to 68497eb4 so the in-flight fc128fixc chain (2420447/2420448) is unaffected.
+NOT YET RUN ON GPU / not yet tested against the flagship itself.
+
+## 2026-07-29 (later) — Root cause B properly FIXED: the AD energy flux used a different stencil from the AD induction
+
+The `ct_eint_guard_frac` limiter above is now SUPERSEDED as the mechanism (kept only as an
+inert safety net). Root cause B was isolated to a specific stencil inconsistency, not to the
+energy formulation, and it is now fixed at source.
+
+### Isolation
+With the internal-energy guard turned fully OFF, CT+RKL2 Orszag-Tang:
+  - Ohmic only   -> CLEAN to cycle 300 (t=0.2648, GLM gives 0.2657)
+  - ambipolar    -> ABORT, negative pressure, cycle ~100
+Ohmic's edge EMF (eta*J from the tight 1dx curl of Bf) and its face-based Poynting deposit in
+resistivity.cpp are nearly the same stencil, so their bookkeeping agrees. Ambipolar's are not:
+since 2026-07-28 the induction uses the direct-edge `AmbiEdgeEMF_E*` (tight in-plane + wide
+2-cell along-edge) while `ambipolar.cpp` still deposited an energy flux built from face-
+averaged cell-centered B and a face-centered current. e = E - KE - ME absorbs the whole
+difference, which at a shock is O(1) and of arbitrary sign.
+
+### Fix
+New `CT_AddDiffusivePoynting` (ct.cpp): deposits S = E x B into cons.flux(IEN) using the SAME
+edge EMF in Bf.flux(E*) that drives the CT induction --
+  S_1 = E2 B3 - E3 B2,  S_2 = E3 B1 - E1 B3,  S_3 = E1 B2 - E2 B1
+each transverse EMF averaged from the two edges bounding the face, with the identical face-
+tangential b1/b2/b3 the face kernels use, so ONLY the EMF source changes. The face-based IEN
+deposits in ambipolar.cpp and resistivity.cpp are gated off by `hydro/ct_edge_poynting`
+(default true). Wired into BOTH RKL2/STS sites before the flux correction, so the coarse-fine
+reflux restricts the IEN deposit too.
+
+Scope is deliberately narrow: RKL2/STS only, where CT_ZeroEMF -> Ohmic -> ambipolar leaves
+Bf.flux holding the DIFFUSIVE-ONLY EMF. The unsplit path keeps the face deposits (Bf.flux
+there carries ideal+diffusive and the ideal Poynting is already in the HLLD energy flux); it
+was never affected -- CT+AD-unsplit always ran clean.
+
+### Result: the limiter is no longer needed at all
+Orszag-Tang + ambipolar, 128^2, t=0.14, vs the matched GLM run:
+
+  quantity        CT (fixed, guard OFF)        GLM         rel. diff
+  dt                     1.351400e-03    1.352760e-03      -0.1005%
+  cycles                          106             106      +0.0000%
+  mass                   2.210490e-01    2.210490e-01      +0.0000%
+  KE                     9.024120e-02    9.030400e-02      -0.0695%
+  tot-E                  3.492570e-01    3.492570e-01      +0.0000%
+  ME                     2.516770e-02    2.499210e-02      +0.7026%
+  ct_maxAbsDivB                                            3.86e-14
+
+**Total energy now agrees with GLM to 6 significant figures** (it was +0.29% with the guard at
+0.9 and +2.76% at 0.99), and the run takes GLM's timestep -- 106 cycles to t=0.14 versus 242
+with the guard, a 2.3x speedup. The stencil mismatch was also driving the small CT timestep.
+
+### Verification
+- `orszag_tang_ad_ct` at guard 0.9 and at guard 0.0: **identical** (2.5933364231939193e-01).
+  The guard never fires any more -> defect B is fixed, not masked. Guard left at 0.9 as an
+  inert safety net.
+- `orszag_tang_ad_glm`: 2.6565828685855680e-01, still bit-identical to the pre-change log.
+- `orszag_tang_ct` (ideal): bit-identical (3.7557117331232648e-01).
+- `orszag_tang_aduns_ct` (unsplit): bit-identical (2.5428594604064228e-02) -- confirms the
+  gate correctly excludes the unsplit path (an earlier revision got this wrong and moved it
+  0.14%; fixed by gating on diffusion/integrator==rkl2).
+- `orszag_tang_ohm_ct`: 2.6483553677547106e-01 vs 2.6485245929392315e-01, a 6.4e-5 relative
+  change -- the new edge-based flux is a near-identity for Ohmic, as it must be.
+- AD damped-Alfven uniform gate: 5.47e-04, unchanged.
+
+### GPU probe of fix A (job 2420973, runs/flagship_integration/fc128ctfix/)
+Restarted from fc128b/out2.00002 (t=1.100) on athenaPK_ctfix_8f5c623c (fix A + guard, WITHOUT
+this stencil fix). Confirms fix A on GPU and across a restart: **|psi|max = 0.0000e+00**
+in the restart it wrote, versus 4.9329e+02 in the pre-fix restart it read. At t=1.10344 it is
+running dt = 5.1e-6, about 10x the ~5e-7 the old binary was crawling at over the same epoch.
+
+### Binaries (2026-07-29, build_gpu/bin/)
+- `athenaPK_ctfull_faf89f87` (md5 faf89f87) = **complete fix**: A (ct_glm_inert) + B
+  (ct_edge_poynting) + the inert eint guard. NOT yet run.
+- `athenaPK_ctfix_8f5c623c` (md5 8f5c623c) = fix A + guard only, no stencil fix. This is what
+  the fc128ctfix probe (job 2420973) is running.
+- `athenaPK` = 68497eb4, the pre-fix production binary, deliberately RESTORED so nothing in
+  flight picks up a new binary at job start. `athenaPK_PRESERVED_68497eb4` is the backup.
+  NOTE: rebuilding build_gpu in place overwrites bin/athenaPK, which every submit script reads
+  at job start -- always preserve it first.
+
+## 2026-07-29 — GPU RESULT: fix A alone HALVES the pathology but does not eliminate it
+
+`runs/flagship_integration/fc128ctfix/`, job 2420973, binary athenaPK_ctfix_8f5c623c (fix A +
+the guard, WITHOUT the stencil fix B). Forward from fc128b/out2.00002 (t=1.100), i.e. from
+before the pocket exists. Stopped deliberately after the first science dump.
+
+Measured on `fc128ctfix/parthenon.out1.00002.phdf` (t=1.103599), against fc128fixc
+(direct-edge + eta_ad_cap, old binary) at t=1.103872 and the matched GLM run at t=1.102925:
+
+  metric                     fix A (t=1.1036)   fc128fixc (t=1.1039)      GLM
+  |psi|max                        0.0000e+00           (4.75e2)         1.95e0
+  rho_min(r<1)                      1.156e-2           8.024e-4         3.989e0
+  cells rho<1e-1                         118                240               0
+  cells rho<1e-2                         [0]                 45               0
+  cells rho<1e-3                           0                  1               0
+  cells at pfloor                         50                 77               0
+  max ME/E                            0.9512             0.9977          0.0690
+  cells ME/E>0.9                          18                 72               0
+  cells ME/E>0.5                         375                678               0
+
+**psi is now identically zero, on GPU and across a restart** (the restart it READ carried
+|psi|max = 4.93e2). Fix A is confirmed working. The deep tail of the evacuation is gone (no
+cell below rho=1e-2, versus 45), rho_min is 14x higher, and the ME/E>0.5 population is roughly
+halved. Progress rate improved ~3.7x in physical time per wall second (2.5e-7 vs 6.6e-8),
+crossing the old death point t=1.1035 clean with 0 NaN.
+
+**But the pocket still forms**: 118 cells below rho=0.1, 50 still at the pressure floor, max
+ME/E = 0.95 where GLM is 0.069. So fix A is necessary but NOT sufficient. Caveat on the
+comparison: the two runs are at slightly different times (the pocket deepens with time) and
+fc128fixc resumed from t=1.1024 with a partly-formed pocket, so this is not a controlled A/B.
+
+That residual is what defect B predicts: the ambipolar energy/induction stencil mismatch
+corrupts the internal energy exactly at the accretion shock, which is where the pocket lives.
+
+### -> COMPLETE-FIX RUN LAUNCHED
+`runs/flagship_integration/fc128full/`, job 2421116, binary athenaPK_ctfull_faf89f87 (fix A +
+fix B + the now-inert guard), same t=1.100 restart, same config. Script submit_fc128full.sh.
+Controls on disk from the identical restart: fc128b (old), fc128fixc (direct-edge+cap),
+fc128ctfix (fix A only), fc128glm (GLM reference).
+
+## 2026-07-29 — COMPLETE-FIX GPU RESULT: pressure flooring ELIMINATED; a magnetized low-density region remains
+
+`runs/flagship_integration/fc128full/`, job 2421116, binary athenaPK_ctfull_faf89f87 (fix A +
+fix B). Startup verified: the `## CT: GLM/Dedner machinery held inert` banner fired and cycle
+200 reproduced the restart point exactly (dt 4.849e-05, identical to the fix-A run).
+
+Time-matched comparison, both from the SAME t=1.100 restart, dumps 8e-6 apart in time:
+
+  metric                     FULL FIX (t=1.103591)   fix A only (t=1.103599)      GLM (t=1.1029)
+  P_min (inner)                       3.935e-02              1.000e-08 = pfloor      3.915e-02
+  cells at pfloor                          [0]                     50                   0
+  rho_min(r<1)                        1.1446e-2              1.1564e-2             3.989e0
+  cells rho<1e-1                           131                    118                   0
+  cells rho<1e-2                             0                      0                   0
+  max ME/E                              0.9402                 0.9512              0.0690
+  cells ME/E>0.9                            15                     18                   0
+  cells ME/E>0.5                           366                    375                   0
+  dt at cycle 400                     3.482e-06              3.386e-06                --
+
+### What fix B demonstrably did
+**The pressure floor is no longer hit anywhere in the inner region: 50 cells -> 0, and the
+minimum pressure went from 1.000e-08 (the floor constant) to 3.935e-02 -- essentially GLM's
+value (3.915e-02).** That is precisely the quantity fix B targets: with the ambipolar energy
+flux and the ambipolar induction now sharing one stencil, the internal energy is no longer
+being destroyed at the accretion shock. The thermodynamic corruption is gone.
+
+### What it did NOT do
+The density depression at r ~ 0.41 is essentially unchanged (rho_min 1.14e-2 vs 1.16e-2;
+131 vs 118 cells below rho=0.1), and max ME/E only moved 0.951 -> 0.940. dt at cycle 400 is
+also unchanged (3.48e-6 vs 3.39e-6) -- unlike the Orszag-Tang gate, where fix B recovered
+GLM's full timestep. So on the flagship the remaining limiter on dt is NOT the stencil
+mismatch.
+
+### Open question -- DO NOT over-claim either way
+With P no longer floored, the max-ME/E cell reads rho=4.18e-2, P=0.361, |B|=16.57, |v|=19.4,
+beta=2.6e-3, and ME=137 vs KE=7.8 and IE=0.90. That is a magnetically dominated, fast-moving,
+evacuated region -- which is a REAL feature of magnetized collapse (magnetic tower / cavity on
+the low-density side of the accretion shock), not obviously a defect. It cannot be called
+numerical on present evidence, and it cannot be called physical either:
+
+  **The GLM control does not extend to this time.** fc128glm's only science dump is t=1.102925,
+  and at t=1.1029 the CT runs also had almost no pocket (fc128b: 3 cells below rho=0.1). The
+  comparison that would settle it is a GLM run continued to t=1.1036 from its preserved
+  restart (fc128glm/parthenon.out2.00002.rhdf, t=1.1029) -- a matched-epoch control. NOT RUN.
+
+Until that exists, the defensible claim is: two definite bugs found and fixed, with the
+pressure-flooring pathology eliminated; the residual low-density magnetized region is
+UNCLASSIFIED.
+
+## 2026-07-29 — MATCHED-EPOCH GLM CONTROL: the residual density hole is NOT physical. A THIRD CT defect remains.
+
+`submit_fc128glm_ext.sh`, job 2422856: continued the existing fc128glm chain from its own
+restart (out2.00002, t=1.102925) to tlim=1.1040. Exited cleanly on tlim and wrote
+`fc128glm/parthenon.out1.final.phdf` (t=1.104000) -- a LATER time than the CT dump it is
+compared against, so any growing pathology would be MORE developed, not less.
+
+  metric (inner, r<1)      GLM control (t=1.104000)   CT full fix (t=1.103591)
+  rho_min                            3.9809e+00              1.1446e-02
+  cells rho<1e-1                              0                     131
+  cells at pfloor                             0                       0
+  nblocks                                   540                     638
+
+In the shell r=0.386-0.479 where the CT hole lives, GLM has rho_min = 9.518, max ME/E = 0.0415
+and P_min = 15.41, while its SHELL AVERAGES match CT closely: <rho>_m 3.65e4 (CT 4.07e4),
+<|B|>_m 49.9 (CT 50.0), |B|max 89.4 (CT 83.2). Same large-scale solution; CT has a localized
+4-decade hole that GLM does not.
+
+**Conclusion: the low-density magnetized region is a third, still-unidentified CT-specific
+defect.** The two fixed defects were real and are fixed -- psi/Powell forcing (fix A) and the
+pressure-floor destruction of internal energy (fix B, P_min 1e-8 -> 3.9e-2 = GLM's value) --
+but neither is what evacuates the gas.
+
+### The confound, stated honestly
+GLM reaches level 5 in that shell; CT reaches level 6. A genuine structure resolvable only at
+level 6 could in principle be invisible to GLM. I do not think that explains it, for four
+reasons, but it is not formally excluded:
+  1. GLM is at a LATER time, so a growing feature would be more developed, not absent.
+  2. The shell-averaged rho, |B| and |B|max agree between the codes -- same large-scale flow.
+  3. The hole is confined to essentially one meshblock (588 of 678 ME/E>0.5 cells in blk264).
+  4. Nothing physical holds it open: |B| INSIDE the hole (16) is BELOW the shell mean (50), so
+     the magnetic pressure gradient points inward. It should be crushed, not sustained.
+
+### Leading hypothesis for defect 3 (NOT tested)
+Dynamic AMR prolongation of the face field Bf onto newly created level-6 blocks. The pocket
+first appears exactly at the level-5 -> level-6 refinement at r~0.409 (fc128b: lev5 at
+t=1.102796 -> lev6 at t=1.102884), and that dump carries NBNew=574 of 638 blocks. Divergence-
+free face prolongation preserves div B (measured 4e-12, consistent) but the cell-centered
+projection of a prolonged face field need not be consistent with the independently prolonged
+momentum and energy -- an inconsistency injected at every refinement event, concentrated
+exactly where refinement is happening, i.e. the collapsing core edge.
+
+Cheap discriminating test: rerun the CT config from t=1.100 with level 6 disallowed in that
+region (lower refinement/curr_max_level, or static refinement), and see whether the hole still
+forms. If it does not, prolongation is implicated.
+
+### Housekeeping
+GLM's own chain had been failing on **GPU OOM**, not physics: `Kokkos ERROR: Cuda memory space
+failed to allocate 4.984 MiB (label="prim")` at cycle ~260 (t=1.1080) on 2 H100s. Because the
+restart cadence is dn=100 and it died at cycle 260, no restart past cycle 200 was ever written,
+so slots 7/8/9 each re-ran the identical segment and died identically. Note for any future GLM
+continuation: it needs more GPUs or a finer restart cadence. Its dt through this region is
+healthy (1.6e-4 -> 3.3e-5, roughly 10x the CT runs at the same epoch).
+
+## 2026-07-29 — FROZEN-MESH TEST: AMR is an AMPLIFIER, not the cause. Resolution confound EXCLUDED. Defect 3 is in the CT BASE SCHEME.
+
+`runs/flagship_integration/fc128noamr/`, job 2423385, binary athenaPK_ctfull_faf89f87 (both
+fixes), identical to fc128full in every respect EXCEPT `parthenon/mesh/amr_check_interval=1e9`
+(regridding disabled; mesh stays as the restart left it: 540 blocks, max level 5). Ran to
+tlim=1.1037.
+
+THREE-WAY COMPARISON AT MATCHED TIME (dumps within 4e-5 of each other):
+
+  run                     mesh          t          rho_min   n(rho<0.1)  maxME/E  n(>0.5)
+  GLM control          540 blk, L5   1.104000     3.9809e+00        0     0.0697       0
+  CT frozen mesh       540 blk, L5   1.103633     6.8145e-02        5     0.8349      47
+  CT full (AMR on)     638 blk, L6   1.103591     1.1446e-02      131     0.9402     366
+
+### Result 1: AMR regridding AMPLIFIES the defect but does NOT cause it
+Freezing the mesh reduces the hole substantially -- rho_min 6x shallower, 26x fewer evacuated
+cells, 7.8x fewer ME/E>0.5 cells, and the ME/E>0.9 population is eliminated entirely (15 -> 0)
+-- but the hole STILL FORMS (5 cells below rho=0.1, max ME/E = 0.835). So face-field
+prolongation onto new fine blocks is a genuine amplifier, and is worth fixing on its own, but
+it is not the origin. The hypothesis is PARTIALLY CONFIRMED, and the "hole gone" branch of the
+pre-registered read-out did NOT occur.
+
+### Result 2 (the important one): the resolution confound is now EXCLUDED
+The frozen CT run sits on **exactly the same mesh as the GLM control** -- 540 blocks, max
+level 5, both descended from the same t=1.100 state. At that identical resolution:
+    GLM:        rho_min = 3.98,     0 cells below 0.1,  max ME/E = 0.070
+    CT frozen:  rho_min = 6.81e-2,  5 cells below 0.1,  max ME/E = 0.835
+That is a ~58x difference in rho_min at matched mesh and matched epoch (GLM again measured at
+a LATER time, so a growing feature would be more developed in GLM, not less). The earlier
+caveat -- "GLM only reaches level 5, CT reaches level 6, so this might be a structure only
+level 6 resolves" -- is now dead. **Defect 3 is a real CT-vs-GLM difference in the base
+scheme, independent of AMR and independent of resolution.**
+
+### Leading hypothesis for the remaining defect (NOT tested): the IDEAL analogue of fix B
+Fix B corrected the DIFFUSIVE energy flux to use the same edge EMF as the diffusive induction.
+The IDEAL terms have exactly the same structure and have NOT been corrected: under CT the ideal
+induction comes from the GS05 edge EMF, while cons(IEN) and cons(IM1..3) are advanced by the
+HLLD fluxes built from the cell-centered, Riemann-solved B. Those two are not the same discrete
+object, and at a strong shock they differ at O(1) -- with the difference again landing in
+e = E - KE - ME and in the Lorentz force. This is the classic CT energy-consistency problem and
+it is the natural next suspect, being the one place the same class of bug is known to remain.
+Supporting (weak) evidence already on disk: the pure-ideal CPU gate shows CT and GLM differing
+by 6.4e-4 relative in time-to-cycle-300 (3.7557117331232648e-01 vs 3.7581318877074060e-01) --
+small in a smooth test, but the flagship has a strong accretion shock.
+Cheap next test: a CPU Orszag-Tang IDEAL CT-vs-GLM energy-budget comparison at a strong shock,
+or an FHC-like 1D/2D shock with CT, watching e = E - KE - ME across the shock.
+
+### Housekeeping
+`fc128full` (AMR on, both fixes) was stopped at t=1.1041934 (cycle 840, dt 5.9e-7) to free the
+GPU for this test; its pocket trend is recorded above (rho_min 1.14e-2 -> 3.82e-4 over
+t=1.1036 -> 1.1042, pressure NEVER floored, confirming fix B holds while the evacuation
+continues). Analysis script now lives at ~/.ct_analysis/pocket.py (survives session changes).
+
+## 2026-07-29 — LOW-BETA SHOCK TEST: hypothesis FALSIFIED (ideal CT conserves BETTER than GLM). eta_ad_cap confound checked and EXCLUDED.
+
+### Tooling
+Added `problem/orszag_tang/b_amp` and `p_amp` (default 1.0) to src/pgen/orszag_tang.cpp: scales
+the field / thermal pressure to walk the standard test into the flagship's low-beta regime.
+B is scaled in BOTH the cell-centered IC and the vector potential Az, so div(B)_face stays
+exact. Defaults verified BIT-IDENTICAL to the standard test (3.7557117331232648e-01 at cycle
+300, matching the earlier ideal_ct gate) with ct_maxAbsDivB = 2.0e-15.
+
+### Why the standard test was useless for this question
+At the standard beta the ideal CT and GLM budgets agree to ~1e-4 (total IE -0.0094%, total
+energy -0.0000%). But OT's beta_min is only 0.176 and its max ME/IE ~ 4, whereas the failing
+flagship region is beta = 2.6e-3 with ME/IE = 152. A relative error in the magnetic-energy
+bookkeeping damages the internal energy in proportion to ME/IE, so a test at ME/IE ~ 4 cannot
+see what a run at ME/IE ~ 150 suffers. Hence the p_amp sweep.
+
+### Result: the hypothesis is FALSIFIED, and in the OPPOSITE direction
+Ideal CT vs ideal GLM, 128^2, t=0.5, floors pfloor=1e-10/dfloor=1e-8 (without floors BOTH
+schemes crash at low beta; notably CT survived LONGER than GLM there -- t=0.299 vs 0.101 at
+p_amp=0.03 -- already contrary to the hypothesis):
+
+  p_amp   quantity            CT            GLM        CT-GLM
+  0.03    total IE       1.192975e+03   1.145737e+03   +4.12%
+  0.03    total energy   2.621989e+03   2.560798e+03   +2.39%
+  0.03    P_min          5.960e-05      4.064e-05      CT 1.47x higher
+  0.003   total IE       1.150887e+03   1.077516e+03   +6.81%
+  0.003   total energy   2.572557e+03   2.477147e+03   +3.85%
+  0.003   P_min          2.869e-07      1.000e-10      CT 2869x higher
+  0.003   n(beta<0.01)         10             56
+
+At p_amp=0.003 **GLM's P_min is EXACTLY the pressure floor (1.000000e-10) while CT's is 2.9e-7,
+2869x above it.** By local-beta bins the CT internal energy is HIGHER everywhere, and most so
+where beta is lowest (+505% in beta<0.01, +71% in 0.01-0.1, +13% in 0.1-1, +3% at beta>10).
+In an idealized low-beta strong-shock test **CT preserves internal energy better than GLM and
+GLM is the scheme that floors** -- the exact opposite of the predicted failure. The ideal
+GS05-EMF-vs-HLLD-flux inconsistency is therefore NOT the mechanism behind the flagship hole.
+(Consistent with GLM's known non-conservative Dedner damping: GLM's total energy is 3.9% lower.)
+
+### eta_ad_cap confound: CHECKED, EXCLUDED
+Noticed while reading the run configs that `submit_fc128glm.sh` carries NO `eta_ad_cap_code`
+while every CT run (fc128fixc/ctfix/full/noamr) sets `eta_ad_cap_code=3.0`. Since eta_A ~
+1/rho^2, the cap suppresses ambipolar diffusion exactly in the evacuating low-density gas, so
+this could by itself have produced the whole CT-vs-GLM difference. It does not:
+  - `submit_fc128.sh` (which wrote fc128b, CT) vs `submit_fc128glm.sh` differ in EXACTLY ONE
+    CLI argument -- `hydro/divergence_control=glm`. Neither sets eta_ad_cap_code.
+  - Matched time, both no-cap:
+      fc128b  (CT)  t=1.102884: rho_min=6.90e-2, 3 cells <0.1, 2 at pfloor, maxME/E=0.582
+      fc128glm(GLM) t=1.102925: rho_min=3.99,    0 cells <0.1, 0 at pfloor, maxME/E=0.069
+    A 58x difference in rho_min from a one-flag config difference.
+So the CT-vs-GLM divergence predates the cap and is not caused by it. (Caveat: fc128b and
+fc128glm ran on different days and the shared `bin/athenaPK` path may have held different
+binaries; the arg sets are identical.)
+
+### Where this leaves defect 3
+Ruled out so far: psi/Powell forcing (fixed), the diffusive AD energy/induction stencil
+mismatch (fixed), AMR prolongation (amplifier only -- frozen mesh still forms it), resolution
+(frozen CT matches GLM's mesh exactly and still differs 58x), eta_ad_cap (excluded above), and
+now the ideal CT energy inconsistency (falsified -- CT is the BETTER scheme in that test).
+Remaining suspects, all requiring CT + the flagship's extra physics rather than ideal MHD:
+  (a) HALL under CT -- dispersive, unsplit-only, needs an Ohmic floor; the one non-ideal term
+      whose CT path fix B did NOT touch (CT_AddDiffusivePoynting covers Ohmic+AD only, and
+      hall.cpp still deposits its own face-based cons.flux(IEN) Poynting term).
+  (b) an interaction of CT with self-gravity / radiation / chemistry source terms.
+Cheapest next test: rerun fc128noamr with `diffusion/hall=none` (frozen mesh, short window) --
+if the hole vanishes, Hall under CT is defect 3. That is a single ~40 min GPU slot.
+
+## 2026-07-29 — HALL-OFF TEST: Hall EXCLUDED. Defect 3 still open; stop ablating, measure directly.
+
+`runs/flagship_integration/fc128nohall/`, job 2425618. Controlled: the actual mpirun command
+lines differ from submit_fc128noamr.sh by EXACTLY ONE argument, `diffusion/hall=none` (verified
+by diffing the arg sets, not by inspection). Same t=1.100 restart, same binary
+athenaPK_ctfull_faf89f87, same frozen mesh (amr_check_interval=1e9), same cadence.
+
+Matched epoch (dumps 6e-6 apart in time):
+
+  metric (inner r<1)     HALL OFF (t=1.103639)   HALL ON (t=1.103633)
+  rho_min                     6.5107e-02              6.8145e-02
+  cells rho<0.1                      1                       5
+  cells at pfloor                    5                       0
+  max ME/E                      0.8634                  0.8349
+  cells ME/E>0.5                    35                      47
+
+**The hole is unchanged** (rho_min differs by 5%, and max ME/E is marginally WORSE with Hall
+off). This is the pre-registered "hole unchanged" branch: **Hall under CT is NOT defect 3**,
+despite hall.cpp still depositing a face-based cons.flux(IEN) Poynting term against a CT
+edge-EMF induction. That inconsistency is real and worth fixing for correctness, but it is not
+what evacuates the gas. Walltime note: the diagnostic inherited --time=08:00:00 from the
+production chain; corrected to 01:00:00 (the window takes ~40 min) and AthenaPK's internal
+-t to 00:50:00, since a 7h45m internal limit under a 1h Slurm limit would never trigger the
+graceful stop.
+
+### Elimination table for defect 3 (all measured this session)
+  psi / Powell forcing ............ REAL, FIXED (fix A)
+  AD energy/induction stencil ..... REAL, FIXED (fix B)
+  AMR prolongation ................ amplifier only (frozen mesh still forms the hole)
+  Resolution ...................... excluded (frozen CT == GLM mesh, still 58x)
+  eta_ad_cap=3.0 .................. excluded (fc128b vs fc128glm, no cap either side, 58x)
+  Ideal CT energy inconsistency ... FALSIFIED (low-beta OT: CT conserves BETTER; GLM floors)
+  Hall under CT ................... EXCLUDED (this test)
+  Remaining ....................... CT x {self-gravity, radiation, chemistry} source terms
+
+### RECOMMENDATION: stop ablating, measure the mechanism directly
+Seven ablations have narrowed the location but none has produced a mechanism. The direct
+measurement is cheap and already half-written: `CT_ProjectBfToCC` (ct.cpp) ALREADY computes
+me_pre (cell-centered ME before the face projection overwrites it) and me_post (after) for the
+eint guard. Emitting max/sum of (me_pre - me_post)/eint_pre as a history variable measures, in
+the flagship itself and cycle by cycle, exactly how much energy the projection silently moves
+into or out of the internal energy -- and localizes WHERE. If that quantity is small in the
+hole, the projection is exonerated and the cause is in the source-term coupling; if it is O(1)
+there, the mechanism is identified with a number rather than by elimination.
+This is a CPU-side code change plus one GPU rebuild, and it answers "what is the mechanism"
+instead of "what is it not".
+
+## 2026-07-29 — DEFECT 3 MECHANISM IDENTIFIED: the CT projection SPURIOUSLY HEATS magnetized cells (wrong sign from what was assumed)
+
+Direct measurement, `runs/flagship_integration/fc128diag/`, job 2425796, binary
+athenaPK_ctdiag_42f8c311, `hydro/ct_proj_diag=true`, frozen mesh, from t=1.100. New per-cell
+field `ct.dEint` = (eint_post - eint_pre)/eint_pre imposed by CT_ProjectBfToCC, recorded before
+the guard acts. (Diagnostic CPU-validated first: OFF-state bit-identical; separates the
+known-broken from the known-fixed CT+AD+RKL2 config by 3.9x as the shock strengthens.)
+
+### The transfer is negligible almost everywhere and explodes with ME/IE
+At t=1.101883, median |dEint_rel| over the whole mesh is 1.9e-11 -- round-off, the scheme is
+fine in the bulk. Binned by the amplification factor ME/IE:
+
+  ME/IE bin        n          mean dE      median dE   n(neg)    verdict
+  0 .. 0.1     17692611      5.50e-10     -1.48e-12    55.7%     symmetric noise
+  0.1 .. 1         1914     -8.86e-05     -7.93e-07    68.2%     biased COOLING
+  1 .. 3            187     +1.22e-03     +8.59e-04    28.3%     biased HEATING
+  3 .. 10             7     +6.33e-03     +7.64e-03    14.3%     biased HEATING
+  10 ..               1     +2.34e-02     +2.34e-02     0.0%     biased HEATING
+
+Seven orders of magnitude between the bulk and the magnetized cells, and the transfer TRACKS
+ME/IE -- the specific signature predicted, not merely a magnitude. In the shell where the hole
+forms (0.38<r<0.48) with ME/IE>1: mean = +1.52e-3 per projection application, 72% positive.
+
+### The sign is HEATING, not cooling -- which is why fix B did not stop the evacuation
+Fix B removed the *cooling*/pressure-flooring pathology (P_min 1e-8 -> 3.9e-2, confirmed).
+The evacuation is driven by the OPPOSITE sign: spurious HEATING of magnetized low-density
+cells. Runaway loop: projection heats a magnetized cell -> P rises -> gas expands -> rho drops
+-> ME/IE rises -> heating per application grows -> ... Compounding at the measured mean:
+(1+1.52e-3)^500 = 2.14, ^1000 = 4.56.
+
+### FALSIFICATION TEST (the decisive evidence): the hole is HOT, and expansion cannot heat
+If the low-density region were physical expansion, it would be adiabatically COOLED. Measured
+in fc128full at t=1.104169, shell 0.38<r<0.48:
+
+  ambient (shell median)   rho = 88.46      T = P/rho = 0.9946
+  evacuated (rho<0.1)      rho = 4.213e-2   T        = 7.203     |B| 15.3 vs 2.06 ambient
+  expansion factor 2100x  =>  adiabatic T would be 0.0466 (a 21x COOLING)
+  observed T is 7.203  =>  **154x hotter than adiabatic expansion permits**
+
+Expansion cannot heat; an energy source is required, and the diagnostic identifies it as the
+projection (+1.5e-3 per application in exactly those cells). The matched GLM control has NO
+cells below rho=1 anywhere in that shell and a uniform T=1.7-2.5.
+
+### Consistency with everything previously measured
+  - Explains why the hole survived fix A and fix B (both addressed cooling-side pathologies).
+  - Explains why AMR amplifies it (each regrid re-seeds the magnetized low-density cells).
+  - Explains why ideal low-beta Orszag-Tang saw nothing: its max ME/IE is 0.78, i.e. entirely
+    inside the "symmetric noise" bin. The regime was never probed.
+  - Explains why Hall was irrelevant (the projection runs regardless of which non-ideal terms
+    are active).
+
+### Caveats (stated, not hidden)
+  - The ME/IE>1 statistics rest on 187-194 cells at this epoch; the trend across bins is
+    monotone and spans 7 decades, but the top bins are small samples.
+  - The compounding estimate is Eulerian (same cells repeatedly); a Lagrangian parcel moves
+    through the shell, so it is an order-of-magnitude argument, not a rate.
+  - Correlation vs causation for the heating itself is settled by the adiabatic argument
+    above, which is independent of the diagnostic.
+
+### THE FIX (design, NOT yet implemented)
+The projection must not be allowed to inject energy. Options, in order of preference:
+  1. Make the replacement energy-neutral: when overwriting cons(IB) with the face projection,
+     also correct cons(IEN) by the SAME amount, i.e. hold e = E - KE - ME fixed across the
+     projection (E += me_post - me_pre). The magnetic energy then changes without touching the
+     gas, which is the physically correct statement -- the projection is a change of magnetic
+     REPRESENTATION, not a physical process. This is a two-line change in CT_ProjectBfToCC and
+     makes the existing one-sided eint guard redundant.
+     RISK: it makes total energy non-conservative by the same amount instead; must be measured.
+  2. Two-sided version of the existing guard (currently one-sided, permits heating).
+  3. Evolve internal energy separately (dual energy) -- the principled but invasive fix.
+Option 1 should be tried first and is directly testable with the same diagnostic: ct.dEint
+must go to round-off everywhere by construction, and the hole must then not form.
+
+## 2026-07-30 — Energy-neutral projection IMPLEMENTED, MEASURED, and DEFAULTED OFF (the risk materialized)
+
+Implemented `hydro/ct_energy_neutral_projection` in CT_ProjectBfToCC: carry the projection's
+magnetic-energy change into cons(IEN) so e = E - KE - ME is exactly preserved.
+
+### The pre-implementation risk check said it was safe. IT WAS WRONG, and here is why.
+From the flagship dump (fc128diag, t=1.101883) the net injection per projection application was
+-7.6e-08 % of E_tot, and I converted that to "1% of E_tot per 6.6e6 cycles" ASSUMING 2
+applications per cycle (the VL2 stage count). That assumption is false: under RKL2 the
+projection runs at EVERY super-time-step substage (CT_RKL2FirstBf / CT_RKL2OtherBf each call
+CT_ProjectBfToCC), which is 10-26 applications per cycle in these tests. The true rate is
+~1e4 times higher than estimated. **Lesson: count the actual call sites, not the stage count.**
+
+### Measured outcome (orszag_tang_ad_ct, tlim=0.20, identical ICs tot-E = 3.492570e-01)
+  config                       tot-E at t=0.20     drift        dt
+  CT energy-neutral ON          3.318490e-01      -4.9843%    4.97e-04
+  CT (fix A+B only, OFF)        3.492570e-01      +0.0000%    1.86e-04
+  GLM reference                 3.492570e-01      +0.0000%    1.32e-03
+Also ME +2.93% vs GLM with ON (vs +0.78% with OFF), and dt 2.7x below GLM. So the option trades
+an amplified LOCAL error for a GLOBAL 5% energy loss -- strictly worse overall in this test.
+**Defaulted OFF.** Kept as an opt-in for A/B experiments only, clearly marked experimental.
+
+### Regression after defaulting off -- all five gates BIT-IDENTICAL to the pre-experiment state
+  otad_ct  2.5933364231939193e-01   otad_glm 2.6565828685855680e-01
+  ideal_ct 3.7557117331232648e-01   ohmic_ct 2.6483553677547106e-01
+  aduns_ct 2.5428594604064228e-02
+So the tree is exactly where it was after fixes A+B, plus the (default-off) diagnostic and the
+(default-off) experimental option.
+
+### What this teaches about defect 3 -- the mechanism stands, the cure does not
+The measurement that identified the mechanism is unaffected: the projection systematically heats
+magnetized cells, and the flagship hole is 154x hotter than adiabatic expansion permits. What is
+now also clear is WHY a naive cure fails. cons(IB) (advanced by the HLLD flux divergence) and the
+projection of the CT face field are two INDEPENDENT estimates of the same quantity, and their
+difference is systematically signed rather than zero-mean. That difference has to be absorbed
+somewhere:
+  - into e  (current default): amplified by ME/IE -> destroys the thermodynamics locally
+  - into E  (this option):     destroys global conservation (-5%)
+Neither is acceptable, which means the discrepancy must be ELIMINATED rather than relocated.
+The principled route is a dual-energy formulation: evolve the internal energy with its own
+equation and use it (not E - KE - ME) wherever the magnetic energy dominates, falling back to
+the conservative total energy elsewhere. That is a substantial piece of work, not a patch.
+
+### Current recommended state of the flagship
+Fixes A and B are real, verified, conservative, and should be kept. Defect 3 (the evacuated
+hole) is diagnosed with a mechanism and a number but NOT fixed; CT remains unsuitable for
+production in strongly magnetized low-density regions. GLM reaches first core and conserves
+energy exactly, and remains the correct choice for production science until dual energy exists.
+
+## 2026-07-30 — CORRECTION: the "spurious heating" is largely PHYSICAL dissipation. Defect 3 is a CONDITIONING problem, not a bookkeeping bug.
+
+The failed energy-neutral experiment produced the evidence that overturns the earlier framing.
+Orszag-Tang + AD at t=0.20, IE = tot-E - KE - ME (where the dissipated heat lives):
+
+  config                    tot-E          KE          ME            IE      IE vs GLM
+  CT energy-neutral ON   3.318490e-01  7.2886e-02  2.4832e-02  2.341314e-01   -7.339%
+  CT fixes A+B (OFF)     3.492570e-01  7.2335e-02  2.4313e-02  2.526082e-01   -0.026%
+  GLM reference          3.492570e-01  7.2458e-02  2.4124e-02  2.526750e-01   +0.000%
+
+Two conclusions:
+1. **With fixes A+B the CT scheme already delivers the correct TOTAL dissipation heating** --
+   internal energy matches the GLM reference to 0.026%. Fix B did its job.
+2. **The energy I "neutralized" was real Ohmic/ambipolar heat**: forcing e constant destroyed
+   7.3% of the internal energy and 5% of the total. That is why it failed, and it retroactively
+   proves the transfer is (largely) physical dissipation correctly delivered via e = E - KE - ME,
+   NOT a spurious numerical source.
+
+**Therefore the earlier claim "the projection spuriously heats magnetized cells" was WRONG as a
+statement of mechanism.** The measurement stands (dEint tracks ME/IE over 7 decades; the hole is
+154x hotter than adiabatic) but the interpretation must change: the heating is physical, and the
+defect is that in cells with ME/IE ~ 150 the internal energy is a CATASTROPHICALLY ILL-CONDITIONED
+difference of large numbers. A relative error eps in the magnetic-energy bookkeeping becomes a
+relative error ~150*eps in the gas heat, so a truncation-level (1e-3) inconsistency between two
+independent estimates of ME becomes an O(1) error in the temperature -- which then drives the
+expansion/evacuation runaway. The total heat is right; its DISTRIBUTION across cells is not.
+
+Note this is DISCRETIZATION error, not round-off: the mismatch is ~1e-3 relative, not 1e-16.
+Higher-precision accumulation of E - KE - ME therefore would NOT help. Ruled out.
+
+### What can and cannot be fixed
+No conservative scheme can deliver both exact total-energy conservation AND an accurate internal
+energy when e/E -> 0; that is a conditioning constraint, not an implementation gap. The options:
+  (a) status quo -- exact conservation, e unusable where ME dominates (current behaviour)
+  (b) dual energy -- evolve e with its own equation and prefer it where ME dominates; accurate
+      e, but non-conservative exactly where it engages
+  (c) energy-consistent CT (construct the discrete energy flux so the ME bookkeeping cancels
+      identically) -- research-level, no standard recipe for this scheme + STS + AMR combination
+  (d) global energy-neutral projection -- MEASURED AND REJECTED above (-5% total energy)
+The earlier failure of (d) was a special case of a general rule: the discrepancy cannot be
+RELOCATED, only eliminated (c) or side-stepped (b).
+
+### Design that makes (b) cheap -- THRESHOLDED dual energy
+(d) failed because it applied in every cell. Dual energy should engage ONLY where the
+conditioning is actually bad. In the flagship dump at t=1.101883 the population is:
+    ME/IE > 1  : 195 cells out of 1.8e7   (1e-5 of the mesh)
+    ME/IE > 3  : 8 cells
+so a switch at ME/IE > ~10 touches a vanishing fraction of the volume, which bounds the
+conservation error to the heat content of those few cells while fixing precisely the cells that
+drive the runaway. This is the standard Bryan/Enzo-style dual-energy switch, and here the switch
+threshold is not arbitrary hand-tuning -- it can be set from the measured conditioning
+(engage where ME/IE exceeds ~1/sqrt(truncation), i.e. where 150*eps approaches unity).
+
+## 2026-07-30 — DECISION: GLM for production; CT work stopped. Final state.
+
+User decision after the conditioning analysis: keep GLM for production science, stop CT
+development. The reasoning is sound -- GLM reaches first core, conserves energy exactly, and
+matches CT on every bulk diagnostic measured this session; the remaining CT defect requires a
+dual-energy formulation whose cost (non-conservation where it engages) is not obviously worth
+paying for a scheme that offers no measured advantage on the science.
+
+### Production requires NO config change -- verified, not assumed
+`runs/prod_v9/fhc.in` sets `fluid = glmmhd` and contains NO `divergence_control` key, so it
+takes the code default ("glm"). Production has been on GLM all along. The CT work was confined
+to `runs/flagship_integration/` (the fc128* family), which uses `fhc_flagship.in`.
+
+### What is banked (real, verified, keep)
+1. **Fix A -- `ct_glm_inert`**: under CT the GLM/Dedner apparatus is held inert (psi == 0 in
+   ConsToPrim on the CONSERVED variable so restarts/ghosts are covered; Powell + B.grad(psi)
+   source terms skipped). Was a 244x psi runaway (475 vs GLM's 1.95) driving a spurious Powell
+   force of dv = 0.22-0.39 per step vs 4e-7 in GLM. GPU-verified: |psi|max = 0.0000e+00 in a
+   restart written from one carrying 4.93e2.
+2. **Fix B -- `ct_edge_poynting`**: the diffusive Poynting energy flux is rebuilt from the same
+   edge EMF that drives the CT induction (new `CT_AddDiffusivePoynting`), RKL2/STS path only.
+   Eliminated the pressure flooring entirely (50 cells -> 0; P_min 1e-8 -> 3.9e-2 = GLM's
+   value) and recovered GLM's timestep on the gate (106 cycles vs 242).
+3. **Diagnostics kept, default OFF**: `hydro/ct_proj_diag` (+ field `ct.dEint`, history vars
+   `ct_projEintMin` / `ct_projEintMaxAbs`) and `problem/orszag_tang/{b_amp,p_amp}` for low-beta
+   variants. Both verified bit-identical when off.
+4. **Rejected and defaulted OFF**: `hydro/ct_energy_neutral_projection` (-5% total energy),
+   `hydro/ct_eint_guard_frac` (superseded by fix B; inert).
+
+### Final regression state -- all bit-identical to the post-fix-A+B baseline
+  otad_ct  2.5933364231939193e-01   otad_glm 2.6565828685855680e-01
+  ideal_ct 3.7557117331232648e-01   ohmic_ct 2.6483553677547106e-01
+  aduns_ct 2.5428594604064228e-02   AD eigenmode rel err 5.47e-04
+GLM path bit-identical to the pre-session log throughout -- verified, not assumed.
+
+### Open item, documented not fixed
+Defect 3 (the evacuated hole) is diagnosed with a mechanism, a number, and an elimination table
+covering psi/Powell, the AD stencil, AMR prolongation, resolution, eta_ad_cap, the ideal CT
+energy inconsistency and Hall. It is a conditioning failure of e = E - KE - ME at ME/IE ~ 150,
+not a bookkeeping bug. A warning block documenting this now sits at the
+`divergence_control = ct` line of `runs/flagship_integration/fhc_flagship.in` so nobody enables
+CT for science without seeing it. All controls preserved on disk for any future attempt:
+fc128b (old), fc128fixc, fc128ctfix (fix A), fc128full (A+B), fc128noamr (frozen mesh),
+fc128nohall (Hall off), fc128diag (projection diagnostic), fc128glm + its t=1.1040 extension.
+
+### Binaries
+  build_gpu/bin/athenaPK                     = 68497eb4, pre-session production, RESTORED
+  build_gpu/bin/athenaPK_ctfull_faf89f87     = fixes A+B
+  build_gpu/bin/athenaPK_ctdiag_42f8c311     = A+B + projection diagnostic
+  build_cpu/bin/athenaPK                     = current source (A+B, diagnostics default-off)
+Uncommitted, branch flagship-phase2-ct. Reminder: rebuilding build_gpu in place overwrites
+bin/athenaPK, which every submit script reads at job start -- preserve it first.
+
+## 2026-07-30 — Flagship audit response, items 1/2/4/5 implemented (item 3 staged, NOT launched)
+
+Response to an external (Codex) flagship review. Verdict on the review itself: directionally
+right on ranking (flux transport is the blocker) but wrong in specifics — its headline CT
+evidence (peak ME/E 0.689 -> 0.520 vs GLM 0.428) ranks by the wrong quantity, since the
+"over-magnetization" was root-caused 2026-07-29 as a density/pressure hole where |B| is 3x
+BELOW its shell mean. It also under-read the microphysics: it lists grain size distribution,
++/-/neutral grain charging and thermal alkali ionization as MISSING; all three are implemented
+(ionization.hpp: 5 MRN bins, OML charging, Wardle sigma_O/H/P, K-Saha, sublimation).
+
+CT-vs-GLM, measured not argued (runs/inc7_gate, matched IC, Hall off, both at t=1.0945):
+  retention 2.4382 (GLM) vs 2.4770 (CT) = 1.6% ; mu_core 5.4628 vs 5.3541 = 2.0%.
+  prod_v9 GLM maxRelDivB (= dx|divB|/|B|, peak over ALL cells): median 2.7%, p90 6.5%,
+  max 11%, FLAT from t=0.42 to t=1.09. => dropping CT is not a leading error term.
+
+IMPLEMENTED (all default-OFF and verified bit-identical when off):
+ 1. diffusion/cap_diag -- cap-activation diagnostic. FusedNonidealEval::Eta refactored into
+    EtaRaw() + Clamp() so the diagnostic applies EXACTLY the physics clamps. Filled inside
+    PrecomputeNonidealEta (no second Wardle solve, no new driver task). hst: cap-Vtot,
+    cap-V/M/D{O,H,A} (volume, mass, clipped-decades); field diff.capdiag for the spatial map.
+ 2. hydro/mag_diag -- src/diagnostics/mag_diag.{hpp,cpp}. hst: mag-Jsq, mag-Hc (CURRENT
+    helicity, gauge-invariant so no vector potential needed), mag-MEtor/MEpol (toroidal/
+    poloidal split about z), mag-dissO/dissA, and mag-dissOcap/dissAcap = the dissipation
+    occurring in CAPPED cells -> "how much of the flux loss is a numerical stabilizer".
+ 4. runs/ensemble/design.py -- Omega.B POLARITY axis (the Hall-polarity class). Applied as
+    omegatff *= +/-1 (NOT B0z, which enters as B0z^2 and is log-sampled). Verified: a
+    polarity pair of decks differs in exactly ONE line.
+ 5. diffusion/dust_coupling -- WS-4 dust -> conductivity. Previously the ionization model used
+    a FROZEN ISM MRN population while the dust package evolved (f_dg, a_c) for OPACITY ONLY:
+    the run's grain evolution never reached its own magnetic microphysics. Now the grain
+    population is rescaled per cell (IonizationModel::FDG/Ak + FusedNonidealEval::CellIon):
+    cross-section ~ f_dg_scale/a_scale, so growth raises the etas.
+
+VERIFICATION
+ * Pre-refactor CONTROL built and run (Eta() body restored verbatim, rebuilt, eos_smoke
+   ionization path): cycle log identical for all 12 cycles AND the .hst byte-identical.
+   Necessary because the OT gates use ambipolar_coeff=fixed and never enter the fused path.
+ * Gates after ALL changes, all exactly matching the pre-session reference:
+   otad_glm 2.6565828685855680e-01 | otad_ct 2.5933364231939193e-01
+   aduns_ct 2.5428594604064228e-02 | ohmic_ct 2.6483553677547106e-01
+ * Cap detector FALSIFICATION: with production caps it reported 0% (plausible at t~0, but
+   unproven), so it was re-run with eta_*_cap=1e-20 -> 100% of cells flagged, mean clipped
+   decades 9.6 (O) / 17.4 (H) / 18.3 (A). The detector fires.
+ * mag_diag closure: MEtor+MEpol == ME exactly (at t=0, MEtor=0 and MEpol==ME bitwise). An
+   apparent 8e-7 residual at later rows is the .hst file's ~5-significant-digit WRITE
+   PRECISION, not an error -- relevant to any small-difference flux diagnostic.
+
+ITEM 3 (resolution ladder) -- STAGED, NOT LAUNCHED. nj4/nj8/nj16 dirs created + wrap_mod.sh
+copied; one command from launch. Deliberately NOT submitted, for two reasons:
+ (a) submit_conv.sh uses build_gpu/bin/athenaPK, which does NOT contain items 1/2/5. Running
+     the ladder now yields data that cannot answer the cap question item 1 exists to answer.
+     Correct order: GPU rebuild (via SLURM) -> ladder with cap_diag+mag_diag ON.
+ (b) SCALE: 3 chained campaigns, 5x H100, 12h slots, MAX_CHAIN=40, njeans=16 ~64x the cost of
+     njeans=4. That is a multi-week GPU commitment and needs an explicit go.
+ NOTE / DISCREPANCY: build_gpu/bin/athenaPK is md5 90b18289 dated 2026-07-30 09:41, NOT the
+ 68497eb4 recorded at the end of the 2026-07-29 session. It was rebuilt today by someone else.
+ Not overwritten. Identify it before rebuilding.
+
+Build: CPU only (build_cpu). GPU binary untouched. Nothing committed (branch flagship-phase2-ct).
+
+## 2026-07-30 — Flagship audit response (external review items 1-5)
+
+Context: an external review (Codex) listed 12 limitations blocking "precision fossil-field"
+claims. Audited all 12 against the tree; then implemented items 1-5 of my re-prioritized list.
+Everything below is OFF by default and every gate is bit-identical with it off.
+
+**Prior question settled first — does dropping CT for GLM matter?** No, not for the observable.
+`runs/inc7_gate/` (same IC, Hall off, both at t=1.0945): retention 2.4382 (GLM) vs 2.4770 (CT)
+= **1.6%**; mu_core 5.4628 vs 5.3541 = 2.0%. That is DEFECTIVE CT, pre-fix. Caveat: matched in
+time, not in state (rho_max 57 vs 34 rho_crit), and one low-res Hall-off gate. prod_v9
+maxRelDivB (= dx|divB|/|B|, peak over all cells): median 2.7%, p90 6.5%, max 11%, flat from
+t=0.42 to 1.09 -- bounded, not creeping. Mechanistic reason the gap is small: CT does not
+reduce numerical reconnection (same PLM+HLLD EMF); it removes monopole forces, not flux loss.
+
+**Where the review was wrong.** (a) It ranked CT by peak ME/E -- the metric shown on 2026-07-29
+to be a density hole, not over-magnetization. (b) It called the microphysics not grain-aware:
+`ionization.hpp` is NICIL-class with 5 MRN bins, OML grain charging, sigma_O/H/P inversion,
+K-Saha thermal ionization and grain sublimation -- essentially its entire "should include" list.
+The real gap is narrower: AD uses `ionization_chem`+single_fluid while Ohm/Hall use the tensor,
+and `diffusion/ion_ad_closure=tensor` already unifies them (off to keep the Athena++ 1:1 match).
+(c) "PPM/WENO if supported" -- ppm/limo3/wenoz are all instantiated for glmmhd+hlld.
+
+**Item 1 - cap-activation diagnostics** (`diffusion/cap_diag`). `FusedNonidealEval::Eta` split
+into `EtaRaw()` + `Clamp()`; the diagnostic applies the SAME `Clamp()` so it cannot drift.
+Fills `diff.capdiag` (6 comp: flag+decades per term) inside PrecomputeNonidealEta -- no second
+tensor solve, no new task. 10 hst columns cap-Vtot/cap-V*/cap-M*/cap-D*.
+VERIFIED: refactor bit-identical on the ionization path against a rebuilt pre-refactor control
+(eos_smoke, 12 cycles, full hst byte-identical). Detector falsified positively: with
+eta_*_cap=1e-20, 100% vol/mass capped, mean clipped decades 9.57/17.44/18.32 (O/H/A).
+
+**Item 2 - magnetic-transport diagnostics** (`hydro/mag_diag`, new `src/diagnostics/mag_diag.*`).
+hst mag-Jsq, mag-Hc (CURRENT helicity int B.J -- gauge-invariant, needs no vector potential),
+mag-MEtor/MEpol (about z), mag-dissO/dissA (eta-weighted), and mag-dissOcap/dissAcap = the
+dissipation occurring in CAPPED cells, i.e. the direct "is this flux loss physics or a
+stabilizer" number. J = curl B on the same stencil as the jeans_nonideal current-sheet trigger.
+VERIFIED: MEtor+MEpol == ME exactly at t=0 (MEtor=0, purely poloidal IC). NOTE: the .hst file
+writes ~5 significant digits -- too coarse for small-difference field diagnostics.
+
+**Item 4 - Omega.B polarity in the ensemble** (`runs/ensemble/design.py --polarity`). Hall is
+the only non-ideal term not invariant under B -> -B, so one polarity is one branch, not a
+prediction. Applied to the SIGN of omegatff (omega enters v1,v2 linearly, no positivity guard);
+NOT to B0z, which enters the energy as B0z^2 and is log-sampled. VERIFIED: a +/- pair of decks
+differs in exactly one line.
+
+**Item 5 - dust -> conductivity coupling** (`diffusion/dust_coupling`). IonizationModel gains
+f_dg_scale/a_scale + FDG()/Ak(); FusedNonidealEval::CellIon rescales the grain population per
+cell from the evolved (f_dg, a_c). Physics: cross-section ~ f_dg_scale/a_scale, so growth raises
+the etas. Pointer (not ternary) dispatch so the uncoupled path copies nothing.
+Found + fixed en route: the coupling read `dust/a_ref`, but dust.cpp reads **`a_ref_cm`** --
+wrong key would have silently biased a_scale.
+**NOT DELIVERED as working physics.** Measured: `prim[14]`/`prim[15]` are identically 0.0 on an
+FHC run even with `<dust> evolve=true` -- **collapse_be never initializes the dust scalars**, so
+both CellIon guards fire and the coupling is a silent no-op (mag-dissO/dissA bit-identical
+coupled vs uncoupled vs a_ref_cm=2e-6). Blocker documented at the guard. WS-4 dust is inert for
+this problem until collapse_be seeds f_dg=f_dg_ref and a_c=a_ref_cm.
+
+**Item 3 - resolution ladder: STAGED, NOT LAUNCHED.** `runs/convergence_ladder/nj{4,8,16}/`
+created with wrap_mod.sh. Two reasons not to submit: (i) the ladder uses
+`build_gpu/bin/athenaPK`, which does NOT contain items 1/2/5 -- running it now produces data
+that cannot answer the cap question item 1 exists to answer, so the GPU rebuild must come first;
+(ii) **that binary's md5 changed to 90b18289 (dated Jul 30 09:41), from the 68497eb4 recorded at
+the end of the 2026-07-29 session** -- someone rebuilt it outside this session, so I did not
+overwrite it. Queue is empty; nothing was running.
+
+Gates after every change (CPU, bit-identical to reference): otad_glm 2.6565828685855680e-01,
+otad_ct 2.5933364231939193e-01, aduns_ct 2.5428594604064228e-02, ohmic_ct 2.6483553677547106e-01,
+eos_smoke ionization path byte-identical hst.
+Front-end run recipe (rediscovered): `OMPI_MCA_io=romio341 OMPI_MCA_pml=ob1 mpirun -n 1 ...`
+(ompio cannot open files on BeeGFS; pml=ob1 avoids the psm2/libfabric bus error).
+
+## 2026-07-30 (evening) — Item 5 FIXED at the source (pgen dust IC); it was also silently zeroing the RADIATION opacity
+
+**The bug.** `collapse_be.cpp` seeded the chemistry species and then ran
+`for (int s = NSPEC; s < nscalars_ic; ++s) u(iscal0+s,...) = 0.0;` — which zeroed the WS-4 dust
+pair as well. Any run with `<dust> evolve=true` therefore started (and stayed) at
+**f_dg = 0, a_c = 0**. Measured this morning: `prim[14]`/`prim[15]` identically 0.0.
+
+**Consequence 1 (known):** `diffusion/dust_coupling` was a silent no-op — both `CellIon` guards fire.
+
+**Consequence 2 (NEW, and worse):** the radiation package is the *other* consumer of those
+scalars. `radiation_moments.cpp:334,579` computes
+`kdust = Dust::DustFactor(f_dg, a_c, f_ref, a_ref)`, and `dust.hpp:120` is
+`(f_dg/f_ref) * (a_ref/max(a_c,1e-30))`. With f_dg = 0 this is **exactly 0.0**, and `kdust`
+multiplies BOTH `PlanckOpacity` and `RosselandOpacity` (lines 239/425/441/628/660). So
+`<dust> evolve=true` gave **kappa_P = kappa_R = 0**: radiation fully decoupled from the matter,
+silently, with no warning. The `a_c -> 0` guard in `DustFactor` protects the division but not
+this. Not a production regression — grep of `runs/*/*.in` shows the only deck that ever set
+dust on is `validation_rt/dust_smoke.in`; every FHC production deck (prod_v9, mg_prod_tab) has
+dust OFF — but it would have fired the first time anyone enabled dust, which is exactly what
+the flagship test does.
+
+**Fix** (`src/pgen/collapse_be.cpp`): read `<dust> evolve / scalar_index / f_dg_ref / a_ref_cm`,
+and after the species zero-fill write `u(iscal0+si) = rho*f_dg_ref`, `u(iscal0+si+1) = rho*a_ref_cm`.
+Guarded by `seed_dust = evolve && (si+1 < nscalars)` => no-op for every non-dust deck.
+
+**Verification**
+- Seeding: FHC smoke with `<dust> evolve=true`, nscalars=7, scalar_index=5 =>
+  `prim[14] = 1.000000e-02`, `prim[15] = 1.000000e-05` at t=0 AND at the final dump
+  (was 0.0 / 0.0 before the fix).
+- Coupling is now LIVE — and the earlier "a_ref_cm=2e-6 changes nothing" test was **self-
+  cancelling**: `nonideal_dust_a_ref` is read from the same `a_ref_cm`, so moving that key moves
+  the IC and the reference together and `a_scale == 1` identically. The correct falsification is
+  to let grains EVOLVE away from the reference: with `freeze_growth=false, alpha_turb=1.0,
+  growth_cap=0.5`, a_c grows to 1.000530e-05 (+530 ppm) in 12 cycles and then
+  `dust_coupling` on vs off differ — `mag-dissO` 9.40226e-10 vs 9.40230e-10, and
+  t(cycle 12) 1.1211425978498728 vs 1.1211425978494329. Before the fix these were bit-identical.
+  The response is weak here because this smoke is at low density where CR ionization, not grain
+  recombination, sets x_e; grains dominate at collapse densities.
+- OFF-state: `runs/eos_smoke/fhc.in` (dust off) run on a purpose-built PRE-EDIT control binary
+  (`athenaPK_preDustIC`, md5 ff75a064) vs the post-edit binary (ff6888ee), same host, same
+  OMP_NUM_THREADS=4 — see the A/B gate result recorded below.
+
+**Caution for anyone comparing against older logs:** the eos_smoke gate value is thread-count
+sensitive in its last 1-2 digits (reduction order). At OMP_NUM_THREADS=4 both the pre- and
+post-edit binaries give `cycle=12 time=1.1211428341296690e+00`; the `...688` recorded earlier in
+DEV_LOG came from a different thread count. Compare A/B at matched threads, not against history.
+
+**Also this session**
+- Codex's 09:41 rebuild identified: it recompiled 7 objects (ct.cpp, hydro.cpp, hydro_driver.cpp,
+  the 4 pgens) — i.e. the CT fixes A+B from 2026-07-29, built from this same working tree before
+  the audit items existed. Nothing of ours was lost. Preserved as
+  `build_gpu/bin/athenaPK_codex_90b18289`; `athenaPK_PRESERVED_68497eb4` still present.
+- GPU rebuild submitted (job 2431675) — first GPU binary containing items 1/2/5 + `mag_diag.cpp`.
+- `runs/prod_flagship_test/` created: the mg_prod_tab flagship deck + `nscalars=7`,
+  `<physics> dust=true`, `<dust>` block, `diffusion/{cap_diag,dust_coupling}=true`,
+  `hydro/mag_diag=true`. GLM (no CT). One bounded 4 h slot, NOT self-chaining, submitted as job
+  2431680 with `--dependency=afterok:2431675`. Deck parse-checked on CPU at toy resolution
+  (32^3/numlevel=2/nlim=3): runs clean, prints "Dust->conductivity coupling ON ... prim indices 14, 15".
+- `runs/convergence_ladder/submit_conv.sh` now also passes `diffusion/cap_diag=true
+  hydro/mag_diag=true` — without cap accounting the ladder cannot say whether a resolution trend
+  is physics or the `eta_ohm_cap_code=0.1` stabilizer. Ladder still NOT launched: it needs the
+  new GPU binary (building) and the memory cost of the 6-component `diff.capdiag` derived field
+  at njeans=16 is unmeasured — the flagship test's `gpumem.log` measures it at production
+  resolution first.
+- Housekeeping: the front-end `/tmp` is a 50 MB tmpfs and is 100% FULL. `submit_build_gpu.sh` is
+  launched with `TMPDIR=/tmp`, which is the COMPUTE node's /tmp, so the build is unaffected — but
+  any front-end work must use the scratchpad, not /tmp.

@@ -96,30 +96,49 @@ TaskStatus CT_AssembleEMF_GS05(MeshData<Real> *md, const Real dt);
 // (E3) / (E1,E2) cells bounding the edge. Unsplit only (STS+CT is incompatible).
 TaskStatus CT_AddOhmicEMF(MeshData<Real> *md);
 
-// Non-ideal (ambipolar) edge EMF for CT (Phase 2, increment 4). Adds the perpendicular-
-// current EMF E_A = eta_A (J - (J.bhat) bhat) onto the ideal edge EMF in Bf.flux(E*).
-// Unlike the Ohmic term (whose EMF is eta*J, a single curl component that lives naturally
-// on the edge), the AD EMF needs the *full* current and field vectors, so it is built the
-// way Athena++'s FieldDiffusion::AddEMF does: the perp-current EMF is evaluated at cell
-// FACES with the exact same stencils as the GLM path (AmbipolarDiffFluxIsoFixed) and the
-// relevant component is arithmetic-averaged from the four faces bounding each edge (the
-// same four-face pattern GS05 uses for the ideal base EMF). div B stays at round-off (the
-// edge value is single-valued, so its curl telescopes) and the operator is identical to
-// the validated GLM AD operator by construction. As with Ohmic, the matching cons.flux(IBn)
-// induction deposits in AmbipolarDiffFluxIsoFixed are gated OFF under CT while its
-// cons.flux(IEN) ambipolar-Poynting term stays on the finite-volume energy flux. Must run
-// after CT_AssembleEMF[_GS05] and before the flux-correction round. Unsplit only.
+// Non-ideal (ambipolar) edge EMF for CT (Phase 2, increment 4; edge-current design fixed
+// 2026-07-28). Adds the perpendicular-current EMF E_A = eta_A (J - (J.bhat) bhat) onto the
+// ideal edge EMF in Bf.flux(E*). Unlike the Ohmic term (whose EMF is eta*J, a single curl
+// component that lives naturally on the edge), the AD EMF needs the *full* current and field
+// vectors at the edge. COMPACT edge-current construction (mirrors CT_AddHallEMF): the edge's
+// own-direction current component comes from the tight 1dx curl of the face field Bf (same
+// stencil Ohmic uses); the two transverse components are interpolated from neighboring
+// SAME-TYPE edges (each already tight), and B is interpolated from Bf with short local
+// averages. eta at the edge is a 4-cell average (NonidealEdgeEta), matching Ohmic/Hall.
+// SUPERSEDES an earlier "assemble the perp-current EMF at 4 cell-prim-based faces (mixing a
+// tight 1dx and a wide 2dx stencil for the same current derivative), then arithmetic-average
+// to the edge" design: a first-principles comparison against the validated GLM face-EMF
+// showed that design under-diffuses a diffusivity feature sharp on the grid scale (~1-2 dx,
+// e.g. a deeply-refined AMR current sheet) by up to ~13% per evaluation -- a per-step deficit
+// that compounds over many diffusion times into an order-of-magnitude under-diffusion (the
+// flagship CT core-edge ME/E runaway that blocks first-core formation under CT+AD). See
+// runs/ct_tests/diffusion_ad_bump_*.in and the AMBIPOLAR_CT_UNDERDIFFUSION note. div B stays
+// at round-off (the edge value is still single-valued, so its curl telescopes); the uniform-
+// eta damped-Alfven gate (diffusion_ad_ct.in) is unaffected (0.055% error, unchanged). As
+// with Ohmic, the matching cons.flux(IBn) induction deposits in AmbipolarDiffFluxIsoFixed are
+// gated OFF under CT while its cons.flux(IEN) ambipolar-Poynting term stays on the
+// finite-volume energy flux. Must run after CT_AssembleEMF[_GS05] and before the
+// flux-correction round. Unsplit only.
 TaskStatus CT_AddAmbipolarEMF(MeshData<Real> *md);
 
 // Non-ideal (Hall) edge EMF for CT (Phase 2, increment 4). Adds the dispersive Hall EMF
 // E_H = eta_H (J x B)/|B| (plus the optional Ohmic stabilizer floor eta_O J) onto the ideal
-// edge EMF, built by the same four-face-average construction as CT_AddAmbipolarEMF (perp
-// EMF evaluated at faces with the GLM stencils, averaged to edges). Hall is dispersive
-// (whistler) and unsplit-only under CT (RKL2+CT is forbidden), so the whistler part and the
-// floor are both applied here. cons.flux(IBn) induction deposit in HallDiffFluxIsoFixed is
-// gated OFF under CT; cons.flux(IEN) Poynting term stays on the FV energy flux. Must run
-// after CT_AssembleEMF[_GS05] and before the flux-correction round.
+// edge EMF, using the same COMPACT edge-current construction as CT_AddAmbipolarEMF above (the
+// original template this fix was ported from: face-EMF-averaged Hall had the analogous
+// whistler-dispersion-corrupting dilution and was replaced with this design first). Hall is
+// dispersive (whistler) and unsplit-only under CT (RKL2+CT is forbidden), so the whistler
+// part and the floor are both applied here. cons.flux(IBn) induction deposit in
+// HallDiffFluxIsoFixed is gated OFF under CT; cons.flux(IEN) Poynting term stays on the FV
+// energy flux. Must run after CT_AssembleEMF[_GS05] and before the flux-correction round.
 TaskStatus CT_AddHallEMF(MeshData<Real> *md);
+
+// Diffusive Poynting energy flux (S = E x B) built from the SAME edge EMF in Bf.flux(E*) that
+// drives the CT induction, deposited into cons.flux(IEN). Replaces the face-based IEN deposits
+// of resistivity.cpp/ambipolar.cpp, whose EMF comes from a different stencil -- a mismatch that
+// lands directly in the recovered internal energy e = E - KE - ME. RKL2/STS path only (Bf.flux
+// must hold the diffusive-only EMF); no-op unless "ct_edge_poynting". Must run after
+// CT_AddOhmicEMF/CT_AddAmbipolarEMF and before the flux-correction round. See ct.cpp.
+TaskStatus CT_AddDiffusivePoynting(MeshData<Real> *md);
 
 // VL2 low-storage face update: Bf_base = gam0*Bf_base + gam1*Bf_u1
 //                                       + beta_dt * curl(edge EMF stored in Bf.flux).
@@ -158,6 +177,14 @@ TaskStatus CT_RKL2OtherBf(MeshData<Real> *md_Y0, MeshData<Real> *md_base,
 
 // Project the face field onto the cell-centered slots IB1..IB3 of "cons".
 TaskStatus CT_ProjectBfToCC(MeshData<Real> *md);
+
+// History reductions over the per-cell projection diagnostic "ct.dEint" (filled by
+// CT_ProjectBfToCC when hydro/ct_proj_diag=true; 0 otherwise). dEint_rel is the RELATIVE
+// internal-energy change the face->cell projection imposes, measured BEFORE the eint guard
+// acts -- i.e. the raw magnitude of the E-vs-ME bookkeeping mismatch. Min gives the damaging
+// (cooling) direction; MaxAbs gives the largest excursion either way.
+Real CT_ProjEintMin(MeshData<Real> *md);
+Real CT_ProjEintMaxAbs(MeshData<Real> *md);
 
 // History diagnostic: max over interior cells of |div B|_face * dx / |B|.
 // For CT this stays at round-off; for GLM it grows at truncation level.

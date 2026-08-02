@@ -252,15 +252,23 @@ struct AmbipolarDiffusivity {
   Ionization::IonizationModel ion_;
   // prim-pack component index of the chemistry x_e scalar (ionization_chem only; -1 else).
   int i_xe_;
+  // Ceiling on eta_A for the IONIZATION-family coefficients (code units), the ambipolar
+  // analogue of OhmicDiffusivity::eta_cap_ / HallDiffusivity::eta_cap_ and applied
+  // identically everywhere eta_A is consumed (flux kernels via the eta cache, dt
+  // estimators, fused evaluator). The single-fluid/tensor eta_A = B^2/(4 pi gamma rho_i rho)
+  // runs away (~1/rho^2) in low-density magnetized cells and drives the explicit/RKL2
+  // parabolic dt to ~0 there; this bounds that runaway in the diffusion-decoupled regime
+  // exactly as eta_ohm_cap does for Ohm. Default (huge) = disabled (bit-identical).
+  Real eta_cap_;
 
  public:
   KOKKOS_INLINE_FUNCTION
   AmbipolarDiffusivity(Ambipolar ambipolar, AmbipolarCoeff ambipolar_coeff_type, Real coeff,
                        Real mbar, Real me, Real kb,
                        Ionization::IonizationModel ion = Ionization::IonizationModel(),
-                       int i_xe = -1)
+                       int i_xe = -1, Real eta_cap = std::numeric_limits<Real>::max())
       : ambipolar_(ambipolar), ambipolar_coeff_type_(ambipolar_coeff_type), coeff_(coeff),
-        mbar_(mbar), me_(me), kb_(kb), ion_(ion), i_xe_(i_xe) {}
+        mbar_(mbar), me_(me), kb_(kb), ion_(ion), i_xe_(i_xe), eta_cap_(eta_cap) {}
 
   // temp = code-unit temperature (p = rho*T); ignored for AmbipolarCoeff::fixed.
   KOKKOS_INLINE_FUNCTION
@@ -277,6 +285,9 @@ struct AmbipolarDiffusivity {
   KOKKOS_INLINE_FUNCTION
   AmbipolarCoeff GetCoeffType() const { return ambipolar_coeff_type_; }
 
+  KOKKOS_INLINE_FUNCTION
+  Real EtaCap() const { return eta_cap_; }
+
   // prim-pack index of the x_e scalar (-1 if the chem coupling is not active).
   KOKKOS_INLINE_FUNCTION
   int XeIndex() const { return i_xe_; }
@@ -289,18 +300,18 @@ struct AmbipolarDiffusivity {
 KOKKOS_INLINE_FUNCTION
 Real AmbipolarDiffusivity::Get(const Real bmag, const Real rho, const Real temp) const {
   if (ambipolar_coeff_type_ == AmbipolarCoeff::fixed) {
-    // Athena++ convention: eta_A = coeff * B^2
+    // Athena++ convention: eta_A = coeff * B^2 (uncapped: fixed-coeff test/idealised path)
     return coeff_ * SQR(bmag);
   } else if (ambipolar_coeff_type_ == AmbipolarCoeff::ionization) {
     // Self-consistent eta_A from the reduced CR+thermal+grain ionization model.
     Real eta_O, eta_H, eta_A;
     Ionization::Diffusivities(ion_, rho, temp, bmag, eta_O, eta_H, eta_A);
-    return eta_A;
+    return (eta_A < eta_cap_) ? eta_A : eta_cap_;
   } else if (ambipolar_coeff_type_ == AmbipolarCoeff::ionization_chem) {
     // chem x_e is supplied via the 4-arg Get; without it fall back to equilibrium.
     Real eta_O, eta_H, eta_A;
     Ionization::Diffusivities(ion_, rho, temp, bmag, eta_O, eta_H, eta_A);
-    return eta_A;
+    return (eta_A < eta_cap_) ? eta_A : eta_cap_;
   } else {
     PARTHENON_FAIL("Unknown Ambipolar coeff");
   }
@@ -321,7 +332,10 @@ Real AmbipolarDiffusivity::Get(const Real bmag, const Real rho, const Real temp,
     // it is smaller/comparable, the equilibrium value bounds the dense-gas runaway.
     Real eta_O, eta_H, eta_eq;
     Ionization::Diffusivities(ion_, rho, temp, bmag, eta_O, eta_H, eta_eq);
-    return (eta_chem < eta_eq) ? eta_chem : eta_eq;
+    const Real eta_A = (eta_chem < eta_eq) ? eta_chem : eta_eq;
+    // Absolute ceiling (diffusion-decoupled runaway guard) ON TOP of the equilibrium
+    // ceiling: even eta_eq blows up (~1/rho^2) in low-density magnetized cells.
+    return (eta_A < eta_cap_) ? eta_A : eta_cap_;
   }
   return Get(bmag, rho, temp);
 }
@@ -467,28 +481,78 @@ struct FusedNonidealEval {
   Real ohm_cap = std::numeric_limits<Real>::max();
   // |eta_H| ceiling mirrored from HallDiffusivity::EtaCap() (signed clamp; huge = disabled).
   Real hall_cap = std::numeric_limits<Real>::max();
+  // eta_A ceiling mirrored from AmbipolarDiffusivity::EtaCap() (huge = disabled). Bounds the
+  // low-density single-fluid/tensor eta_A runaway that otherwise sets the parabolic dt.
+  Real ad_cap = std::numeric_limits<Real>::max();
 
+  // --- WS-4 DUST COUPLING (flagship audit item 5) ---------------------------------------
+  // prim-pack indices of the evolved dust scalars (f_dg, a_c) and the reference grain
+  // radius the STATIC MRN bins correspond to. dust_on=false (default) => the ionization
+  // model keeps its frozen ISM MRN population and every result is bit-identical.
+  int i_fdg = -1;      // prim index of the dust-to-gas mass ratio
+  int i_ac = -1;       // prim index of the characteristic grain radius a_c [cm]
+  Real dust_a_ref = 1.0e-5; // [cm] a_c the static bins represent (DustModel::a_ref)
+  Real dust_fdg_ref = 0.01; // dust-to-gas ratio the static bins represent
+  bool dust_on = false;
+
+  //! Per-cell ionization model: the static one, or a copy rescaled to the evolved grain
+  //! population. The copy is only made when dust coupling is ON, so uncoupled runs pay
+  //! nothing (the model is a ~40-Real POD; copying it per cell is not free on GPU).
   KOKKOS_INLINE_FUNCTION
-  void Eta(const Real rho, const Real temp, const Real bmag, const Real xe, Real &eta_O,
-           Real &eta_H, Real &eta_A) const {
+  Ionization::IonizationModel CellIon(const Real f_dg, const Real a_c) const {
+    Ionization::IonizationModel mc = ion;
+    // Guard degenerate/uninitialized scalars: fall back to the static population rather
+    // than divide by zero or hand the charge solve a zero-radius grain.
+    //
+    // HISTORY (2026-07-30): collapse_be used to leave these scalars at 0.0 even with
+    // <dust> evolve=true (its species zero-fill ran past the chemistry block), so both
+    // guards fired and this coupling was a silent no-op. FIXED in collapse_be.cpp, which
+    // now seeds f_dg = <dust> f_dg_ref and a_c = <dust> a_ref_cm. The guards stay as a
+    // backstop for other pgens: falling back to the static population is always safer than
+    // handing the charge solve a zero-radius grain. NOTE that a_scale == 1 at t=0 BY
+    // DESIGN (the static MRN bins represent exactly the reference population), so this
+    // coupling only bites once the dust package moves (f_dg, a_c) away from the reference
+    // -- changing <dust> a_ref_cm alone moves the IC and the reference together and does
+    // nothing.
+    mc.f_dg_scale = (f_dg > 0.0 && dust_fdg_ref > 0.0) ? f_dg / dust_fdg_ref : 1.0;
+    mc.a_scale = (a_c > 0.0 && dust_a_ref > 0.0) ? a_c / dust_a_ref : 1.0;
+    return mc;
+  }
+
+  //! UNCAPPED diffusivities: everything Eta() does except the three ceiling clamps.
+  //! Eta() == EtaRaw() + clamps, so the physics path is unchanged by construction; this
+  //! exists so the cap diagnostic (FillNonidealCapDiag) can report how much diffusivity
+  //! the ceilings actually remove, without a second Wardle tensor solve.
+  KOKKOS_INLINE_FUNCTION
+  void EtaRaw(const Real rho, const Real temp, const Real bmag, const Real xe, Real &eta_O,
+              Real &eta_H, Real &eta_A, const Real f_dg = -1.0,
+              const Real a_c = -1.0) const {
+    // Dust coupling: rescale the grain population to the evolved (f_dg, a_c) for THIS cell.
+    // Pointer (not a ternary) on purpose: `dust_on ? CellIon(...) : ion` is a PRVALUE, so it
+    // would copy the model even in the OFF branch -- the exact cost this is avoiding.
+    Ionization::IonizationModel mcell;
+    const Ionization::IonizationModel *pim = &ion;
+    if (dust_on) {
+      mcell = CellIon(f_dg, a_c);
+      pim = &mcell;
+    }
+    const Ionization::IonizationModel &im = *pim;
     Real eO_eq = 0.0, eH_eq = 0.0, eA_eq = 0.0;
     if ((ohm_on && !ohm_chem) || (hall_on && !hall_chem) || ad_on) {
-      Ionization::Diffusivities(ion, rho, temp, bmag, eO_eq, eH_eq, eA_eq);
+      Ionization::Diffusivities(im, rho, temp, bmag, eO_eq, eH_eq, eA_eq);
     }
     Real eO_xe = 0.0, eH_xe = 0.0, eA_xe = 0.0;
     if ((ohm_on && ohm_chem) || (hall_on && hall_chem)) {
-      Ionization::DiffusivitiesFromXe(ion, rho, temp, bmag, xe, eO_xe, eH_xe, eA_xe);
+      Ionization::DiffusivitiesFromXe(im, rho, temp, bmag, xe, eO_xe, eH_xe, eA_xe);
     }
     eta_O = ohm_on ? (ohm_chem ? eO_xe : eO_eq) : 0.0;
-    if (eta_O > ohm_cap) eta_O = ohm_cap;
     eta_H = hall_on ? (hall_chem ? eH_xe : eH_eq) : 0.0;
-    if (eta_H > hall_cap) eta_H = hall_cap;
-    if (eta_H < -hall_cap) eta_H = -hall_cap;
     if (ad_on) {
       if (ad_chem) {
-        // Chemistry x_e single-fluid eta_A capped at the equilibrium value (the
-        // dense-gas runaway ceiling; see AmbipolarDiffusivity::Get 4-arg overload).
-        const Real eta_chem = Ionization::AmbipolarEtaFromXe(ion, rho, bmag, xe);
+        // NOTE: the equilibrium ceiling min(eta_chem, eA_eq) is PHYSICS (the dense-gas
+        // runaway closure), not a numerical ceiling, so it stays in the "raw" value; only
+        // the three explicit eta_*_cap_code ceilings are treated as caps by the diagnostic.
+        const Real eta_chem = Ionization::AmbipolarEtaFromXe(im, rho, bmag, xe);
         eta_A = (eta_chem < eA_eq) ? eta_chem : eA_eq;
       } else {
         eta_A = eA_eq;
@@ -496,6 +560,27 @@ struct FusedNonidealEval {
     } else {
       eta_A = 0.0;
     }
+  }
+
+  //! Apply the three explicit numerical ceilings in place. Split out of Eta() so the cap
+  //! diagnostic applies EXACTLY the same clamps the physics path does (no drift between a
+  //! diagnostic copy and the real thing). When a term is off its eta is 0 and its cap is
+  //! positive, so clamping unconditionally is a no-op there.
+  KOKKOS_INLINE_FUNCTION
+  void Clamp(Real &eta_O, Real &eta_H, Real &eta_A) const {
+    if (eta_O > ohm_cap) eta_O = ohm_cap;
+    if (eta_H > hall_cap) eta_H = hall_cap;
+    if (eta_H < -hall_cap) eta_H = -hall_cap;
+    // ad_on guard so an off-AD eta_A stays exactly 0 even for a pathological ad_cap <= 0
+    // (pre-refactor the eta_A clamp lived inside the ad_on branch).
+    if (ad_on && eta_A > ad_cap) eta_A = ad_cap;
+  }
+
+  KOKKOS_INLINE_FUNCTION
+  void Eta(const Real rho, const Real temp, const Real bmag, const Real xe, Real &eta_O,
+           Real &eta_H, Real &eta_A, const Real f_dg = -1.0, const Real a_c = -1.0) const {
+    EtaRaw(rho, temp, bmag, xe, eta_O, eta_H, eta_A, f_dg, a_c);
+    Clamp(eta_O, eta_H, eta_A);
   }
 };
 
@@ -529,6 +614,37 @@ constexpr int O = 0; // Ohmic eta_O
 constexpr int H = 1; // Hall eta_H (signed)
 constexpr int A = 2; // ambipolar eta_A
 } // namespace NonidealEtaIdx
+
+//----------------------------------------------------------------------------------------
+//! Component indices of the cap-activation diagnostic field "diff.capdiag" (registered when
+//! diffusion/cap_diag=true). FLAGSHIP AUDIT ITEM 1: eta_ohm_cap_code / eta_ad_cap_code /
+//! eta_hall_cap_code and the Hall Ohmic floor are numerical stabilizers that MODIFY the
+//! induction equation. Without this diagnostic there is no way to tell whether a flux-
+//! retention result is physics or a stabilizer. Components 0-2 are a 0/1 activation flag
+//! (a capped cell returns the ceiling exactly, so the test is exact); components 3-5 are
+//! log10(eta_raw / eta_applied) -- how many DECADES of diffusivity the ceiling removed
+//! (0 where inactive). Both are per-cell, so the phdf gives the spatial picture (where the
+//! caps bite relative to the core/accretion shock) for free.
+namespace CapDiagIdx {
+constexpr int flagO = 0;
+constexpr int flagH = 1;
+constexpr int flagA = 2;
+constexpr int decO = 3;
+constexpr int decH = 4;
+constexpr int decA = 5;
+constexpr int NCOMP = 6;
+} // namespace CapDiagIdx
+
+//! Fill "diff.capdiag" from the same per-cell state PrecomputeNonidealEta uses. Called
+//! from PrecomputeNonidealEta itself (gated on the "nonideal_cap_diag" package flag) so
+//! there is no second Wardle tensor solve and no extra task in the driver.
+//! Volume-weighted history reductions over "diff.capdiag" (see CapDiagIdx). All are
+//! plain sums so they compose across meshblocks/ranks; form fractions in analysis by
+//! dividing by "cap-Vtot" (the summed volume of the same cells).
+Real NonidealCapHstVol(MeshData<Real> *md);                   // cap-Vtot  = sum dV
+Real NonidealCapHstFlag(MeshData<Real> *md, int comp);        // sum flag*dV
+Real NonidealCapHstDecade(MeshData<Real> *md, int comp);      // sum flag*decades*dV
+Real NonidealCapHstMassFlag(MeshData<Real> *md, int comp);    // sum flag*rho*dV
 
 //! Fill the cell-centered (eta_O, eta_H, eta_A) cache from prim over the interior
 //! expanded by one ghost layer (all cells the face-averaging in the flux kernels

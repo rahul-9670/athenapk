@@ -49,12 +49,27 @@
   BEFORE the flux-correction round (so the C-F reflux restricts it too). Because `CT_UpdateBf` does
   `dB/dt = -curl(E)`, this reproduces `dB/dt = eta grad^2 B`.
   *Ambipolar:* `CT_AddAmbipolarEMF` (ct.cpp). The perp-current EMF `E_A = eta_A (J - (J.b)b)` needs the
-  *full* J and B vectors, so rather than the edge-direct current it is built the way Athena++'s
-  `FieldDiffusion::AddEMF` does: the perp EMF is evaluated at cell FACES with the *exact same stencils*
-  as the GLM path (`AmbiFaceEMF_X{1,2,3}` mirror `AmbipolarDiffFluxIsoFixed`), and the relevant
-  component is arithmetic-averaged from the four faces bounding each edge — the same four-face index
-  pattern GS05 uses for the ideal base EMF. The edge value is single-valued so its curl telescopes
-  (div B round-off), and the operator equals the validated GLM AD operator by construction.
+  *full* J and B vectors at the edge. **UPDATE (2026-07-28): re-implemented as COMPACT edge-current**,
+  mirroring `CT_AddHallEMF` — the edge's own-direction current is the tight 1dx curl of the *face field*
+  `Bf` (`HallJxE1`/`HallJyE2`/`HallJzE3`, generic "current at an edge" helpers despite the name), the two
+  transverse components are interpolated from neighboring same-type (already-tight) edges, B is
+  interpolated from `Bf` with short local averages, and eta is a 4-cell average (`NonidealEdgeEta`,
+  generalizes `HallEdgeEta`). This SUPERSEDES the original design (perp EMF evaluated at 4
+  cell-prim-based faces with the GLM stencils, arithmetic-averaged to the edge — the same four-face
+  pattern GS05 uses for the ideal base EMF): a first-principles operator-level comparison against the
+  validated GLM face-EMF showed that design MIXES, at every edge, a tight 1dx current estimate (from the
+  two "own-direction" faces) with a wider 2dx central-difference estimate of the *same* current (from
+  the two "cross-direction" faces, which don't sample the derivative directly) — diluting the accurate
+  estimate and systematically under-diffusing a diffusivity feature sharp on the grid scale (~1-2 dx,
+  e.g. a deeply-refined AMR current sheet) by up to ~13% per evaluation, independent of how large the
+  eta contrast is, vanishing (<1%) once the feature spans >~15 dx. This per-step deficit compounds over
+  the many diffusion times a persistent current sheet experiences into an order-of-magnitude
+  under-diffusion — diagnosed as the cause of the flagship CT core-edge ME/E runaway that blocked first-
+  core formation under CT+AD (ME/E→0.985 at t≈1.10354, vs GLM's ME/E~0.10). See
+  `runs/ct_tests/diffusion_ad_bump_*.in` (variable-eta reproduction) and
+  `runs/ct_tests/AMBIPOLAR_CT_UNDERDIFFUSION.md`. The edge value is still single-valued so its curl
+  telescopes (div B round-off); the uniform-eta damped-Alfvén gate below is unaffected (unchanged to 3
+  sig figs) — the defect only bites once eta varies sharply in space, which no pre-fix CT+AD gate tested.
   For both terms the double-count trap is closed by gating the `cons.flux(IBn)` induction deposit in
   `{OhmicDiffFluxIsoFixed,AmbipolarDiffFluxIsoFixed}` behind `!use_ct` (their `cons.flux(IEN)`
   Poynting/heating terms stay on the FV energy flux); GLM path (`use_ct=false`) is bit-identical by
