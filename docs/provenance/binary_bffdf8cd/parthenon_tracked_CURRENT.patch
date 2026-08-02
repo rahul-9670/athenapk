@@ -1,0 +1,282 @@
+diff --git a/src/bvals/comms/boundary_communication.cpp b/src/bvals/comms/boundary_communication.cpp
+index 5e311be4d..6c8d3ec78 100644
+--- a/src/bvals/comms/boundary_communication.cpp
++++ b/src/bvals/comms/boundary_communication.cpp
+@@ -69,7 +69,12 @@ TaskStatus SendBoundBufsWithRestrictOption(std::shared_ptr<MeshData<Real>> &md,
+   }
+ 
+   bool can_write_combined{true};
+-  if (pmesh->do_coalesced_comms)
++  // Flux-correction (flxcor) is NOT coalesced: the coalesced buffer machinery builds the flxcor
++  // buffer set asymmetrically between sender and receiver for CT's Edge-centered flux field
++  // (bnd_flux::Bf) at coarse-fine boundaries (receiver expects small Edge buffers the sender never
++  // sends -> "receiving buffer" abort). flxcor is a tiny exchange, so excluding it costs ~nothing
++  // while the performance-critical halo (any) + GMG exchanges still coalesce.
++  if (pmesh->do_coalesced_comms && bound_type != BoundaryType::flxcor_send)
+     can_write_combined =
+         pmesh->pcoalesced_comms->IsAvailableForWrite(md.get(), bound_type);
+ 
+@@ -153,7 +158,8 @@ TaskStatus SendBoundBufsWithRestrictOption(std::shared_ptr<MeshData<Real>> &md,
+   // Send buffers
+   if (Globals::sparse_config.enabled)
+     Kokkos::deep_copy(sending_nonzero_flags_h, sending_nonzero_flags);
+-  const bool coal_comm = pmesh->do_coalesced_comms;
++  const bool coal_comm =
++      pmesh->do_coalesced_comms && bound_type != BoundaryType::flxcor_send; // flxcor: not coalesced
+ #ifdef MPI_PARALLEL
+   if (!coal_comm && IsSender(bound_type)) Kokkos::fence();
+ #endif
+@@ -164,7 +170,7 @@ TaskStatus SendBoundBufsWithRestrictOption(std::shared_ptr<MeshData<Real>> &md,
+     else
+       buf.SendNull(coal_comm);
+   }
+-  if (pmesh->do_coalesced_comms)
++  if (coal_comm)
+     pmesh->pcoalesced_comms->PackAndSend(md.get(), bound_type);
+ 
+   return TaskStatus::complete;
+@@ -191,7 +197,8 @@ TaskStatus StartReceiveBoundBufs(std::shared_ptr<MeshData<Real>> &md) {
+   if (cache.RequiresReinitialize(pmesh))
+     InitializeBufferCache<bound_type>(md, &(pmesh->boundary_comm_map), &cache, ReceiveKey,
+                                       false);
+-  if (!pmesh->do_coalesced_comms) {
++  if (!pmesh->do_coalesced_comms || bound_type == BoundaryType::flxcor_recv) {
++    // flxcor is not coalesced (see SendBoundBufs) -> post individual receives for it
+     std::for_each(std::begin(cache.buf_vec), std::end(cache.buf_vec),
+                   [](auto pbuf) { pbuf->TryStartReceive(); });
+   }
+@@ -224,7 +231,8 @@ TaskStatus ReceiveBoundBufs(std::shared_ptr<MeshData<Real>> &md) {
+     InitializeBufferCache<bound_type>(md, &(pmesh->boundary_comm_map), &cache, ReceiveKey,
+                                       false);
+ 
+-  const bool coal_comm = pmesh->do_coalesced_comms;
++  const bool coal_comm =
++      pmesh->do_coalesced_comms && bound_type != BoundaryType::flxcor_recv; // flxcor: not coalesced
+   if (coal_comm) pmesh->pcoalesced_comms->TryReceiveAny(md.get(), bound_type);
+   bool all_received = true;
+   std::for_each(std::begin(cache.buf_vec), std::end(cache.buf_vec),
+diff --git a/src/bvals/comms/build_boundary_buffers.cpp b/src/bvals/comms/build_boundary_buffers.cpp
+index df49f6137..ad827d652 100644
+--- a/src/bvals/comms/build_boundary_buffers.cpp
++++ b/src/bvals/comms/build_boundary_buffers.cpp
+@@ -154,7 +154,8 @@ void RegisterCoalescedCommsSubset(std::shared_ptr<MeshData<Real>> &md) {
+         const int sender_rank = Globals::my_rank;
+         if (receiver_rank != sender_rank) {
+           if constexpr (IsSender(BTYPE)) {
+-            pmesh->pcoalesced_comms->AddSendBuffer(md->partition, pmb, nb, v, BTYPE);
++            pmesh->pcoalesced_comms->AddSendBuffer(CoalescedPartitionId(md.get()), pmb,
++                                                   nb, v, BTYPE);
+           }
+           if constexpr (IsReceiver(BTYPE)) {
+             pmesh->pcoalesced_comms->AddRecvBuffer(pmb, nb, v, BTYPE);
+@@ -197,8 +198,12 @@ TaskStatus RegisterCoalescedComms(std::shared_ptr<MeshData<Real>> &md) {
+   PARTHENON_INSTRUMENT
+ 
+   RegisterCoalescedCommsSubset<BoundaryType::any>(md);
+-  RegisterCoalescedCommsSubset<BoundaryType::flxcor_send>(md);
+-  RegisterCoalescedCommsSubset<BoundaryType::flxcor_recv>(md);
++  // flxcor (flux correction) is intentionally NOT registered for coalescing: its coalesced buffer
++  // set is built asymmetrically for CT's Edge-centered flux field (bnd_flux::Bf) at coarse-fine
++  // boundaries, causing the sender/receiver size disagreement ("...receiving buffer" abort).
++  // flxcor uses the individual (non-coalesced) send/recv path instead (see boundary_communication).
++  // RegisterCoalescedCommsSubset<BoundaryType::flxcor_send>(md);
++  // RegisterCoalescedCommsSubset<BoundaryType::flxcor_recv>(md);
+ 
+   return TaskStatus::complete;
+ }
+diff --git a/src/bvals/comms/coalesced_buffers.cpp b/src/bvals/comms/coalesced_buffers.cpp
+index 775e5b351..89a1b6123 100644
+--- a/src/bvals/comms/coalesced_buffers.cpp
++++ b/src/bvals/comms/coalesced_buffers.cpp
+@@ -32,6 +32,16 @@
+ 
+ namespace parthenon {
+ 
++//----------------------------------------------------------------------------------------
++int CoalescedPartitionId(MeshData<Real> *pmd) {
++  if (!pmd->grid.IsMultigrid()) return pmd->partition;
++  Mesh *pmesh = pmd->GetMeshPointer();
++  const int min_level = pmesh->GetGMGMinLevel();
++  // One slot per GMG level plus one for the (non-multigrid) leaf grid
++  const int ngrids = pmesh->GetGMGMaxLevel() - min_level + 2;
++  return pmd->partition * ngrids + (pmd->grid.multigrid_level() - min_level + 1);
++}
++
+ //----------------------------------------------------------------------------------------
+ CoalescedBuffer::CoalescedBuffer(bool sender, int partition, int other_rank,
+                                  BoundaryType b_type, mpi_comm_t comm, Mesh *pmesh)
+@@ -365,12 +375,13 @@ void CoalescedBuffersRank::ResolveAndSendBufInfo() {
+ void CoalescedBuffersRank::PackAndSend(MeshData<Real> *pmd) {
+   PARTHENON_REQUIRE(buffers_built,
+                     "Trying to send combined buffers before they have been built");
+-  if (coalesced_bufs.count(pmd->partition)) {
+-    coalesced_bufs.at(pmd->partition).PackAndSend(pmd->GetUids());
+-  } else {
+-    PARTHENON_FAIL("Trying to do coalesced communication using a partition that is "
+-                   "unregistered (i.e. not a default partition).");
++  const int partition_id = CoalescedPartitionId(pmd);
++  if (coalesced_bufs.count(partition_id)) {
++    coalesced_bufs.at(partition_id).PackAndSend(pmd->GetUids());
+   }
++  // No coalesced buffer for this partition means it has no non-local boundaries
++  // of this boundary type communicating with other_rank (common for multigrid
++  // partitions, e.g. on coarse levels), so there is nothing to send.
+ 
+   return;
+ }
+@@ -378,8 +389,9 @@ void CoalescedBuffersRank::PackAndSend(MeshData<Real> *pmd) {
+ //----------------------------------------------------------------------------------------
+ bool CoalescedBuffersRank::IsAvailableForWrite(MeshData<Real> *pmd) {
+   PARTHENON_REQUIRE(sender, "Shouldn't be checking this on non-sender.");
+-  if (coalesced_bufs.count(pmd->partition) == 0) return true;
+-  return coalesced_bufs.at(pmd->partition).IsAvailableForWrite();
++  const int partition_id = CoalescedPartitionId(pmd);
++  if (coalesced_bufs.count(partition_id) == 0) return true;
++  return coalesced_bufs.at(partition_id).IsAvailableForWrite();
+ }
+ 
+ //----------------------------------------------------------------------------------------
+diff --git a/src/bvals/comms/coalesced_buffers.hpp b/src/bvals/comms/coalesced_buffers.hpp
+index d2edc03ed..7aad5c2c6 100644
+--- a/src/bvals/comms/coalesced_buffers.hpp
++++ b/src/bvals/comms/coalesced_buffers.hpp
+@@ -128,6 +128,15 @@ struct CoalescedBuffersRank {
+   bool IsAvailableForWrite(MeshData<Real> *pmd);
+ };
+ 
++// Coalesced buffers are keyed on (and MPI tagged with) a partition id. Raw
++// MeshData partition ids restart at zero on every grid (the leaf grid and each
++// GMG level), so for multigrid grids we synthesize an id that is unique across
++// grids. Otherwise different GMG levels sharing a partition id would be merged
++// into (and tagged identically on) the same coalesced buffer. The mapping only
++// needs to be injective and stable on the sending rank, since receiving ranks
++// learn the ids from the buffer-info message.
++int CoalescedPartitionId(MeshData<Real> *pmd);
++
+ struct CoalescedComms {
+   // Combined buffers for each rank
+   std::map<std::pair<int, BoundaryType>, CoalescedBuffersRank> coalesced_send_buffers;
+diff --git a/src/driver/driver.cpp b/src/driver/driver.cpp
+index 63cb20de4..9544caa6b 100644
+--- a/src/driver/driver.cpp
++++ b/src/driver/driver.cpp
+@@ -186,7 +186,16 @@ DriverStatus EvolutionDriver::Execute() {
+       }
+ 
+       timer_LBandAMR.reset();
+-      pmesh->LoadBalancingAndAdaptiveMeshRefinement(pinput, app_input);
++      // AthenaPK patch (audit NEW-2): skip the tree-update/redistribute on off cycles.
++      // Tags set this cycle persist on the blocks and are re-evaluated (overwritten) by
++      // next cycle's Tag task, so the next checked cycle acts on current flags.
++      if (amr_check_interval_ <= 1 || (tm.ncycle % amr_check_interval_ == 0)) {
++        pmesh->LoadBalancingAndAdaptiveMeshRefinement(pinput, app_input);
++      } else {
++        // modified is normally cleared inside the call above; clear it here so a stale
++        // true from the last checked cycle doesn't re-trigger InitializeBlockTimeSteps.
++        pmesh->modified = false;
++      }
+       if ((buffer_reset_cadence_ > 0) && (tm.ncycle % buffer_reset_cadence_ == 0)) {
+         pmesh->TryReallocCommBufferPools();
+       }
+diff --git a/src/driver/driver.hpp b/src/driver/driver.hpp
+index 797f94f32..fa38e29ae 100644
+--- a/src/driver/driver.hpp
++++ b/src/driver/driver.hpp
+@@ -135,6 +135,18 @@ class EvolutionDriver : public Driver {
+         "decreased to parthenon/mesh/comm_buffer_reset_fraction times the total number "
+         "of allocated buffers. If set to a non-positive number, the buffer "
+         "pool is never cleared.");
++    // AthenaPK patch (audit NEW-2, 2026-07-19): interval-gate the (expensive, full
++    // mesh-rebuild) LoadBalancingAndAdaptiveMeshRefinement call. Refinement TAGGING
++    // still runs every cycle (cheap; keeps derefine_count semantics exact and flags
++    // current) -- only the tree update + redistribute is skipped on off cycles, so
++    // refinement latency is at most N-1 cycles. Default 1 = check every cycle
++    // (bit-identical to unpatched behavior).
++    amr_check_interval_ = pin->GetOrAddInteger(
++        "parthenon/mesh", "amr_check_interval", 1,
++        "Run the AMR tree-update/load-balance step only every N-th cycle "
++        "(refinement criteria are still evaluated every cycle). N<=1 checks "
++        "every cycle. Only safe when the flow crosses refinement thresholds "
++        "slowly compared to N timesteps.");
+   }
+   DriverStatus Execute() override;
+   virtual void SetGlobalTimeStep();
+@@ -152,6 +164,7 @@ class EvolutionDriver : public Driver {
+   int dt_min_count, dt_max_count;
+   int dt_min_count_max, dt_max_count_max;
+   std::int64_t buffer_reset_cadence_;
++  std::int64_t amr_check_interval_; // AthenaPK patch: see ctor (audit NEW-2)
+   bool output_before_amr;
+ 
+  private:
+diff --git a/src/interface/update.cpp b/src/interface/update.cpp
+index 4c6e74a4d..1f7ce1a52 100644
+--- a/src/interface/update.cpp
++++ b/src/interface/update.cpp
+@@ -63,7 +63,11 @@ template <>
+ TaskStatus FluxDivergence(MeshData<Real> *in_obj, MeshData<Real> *dudt_obj) {
+   const IndexDomain interior = IndexDomain::interior;
+ 
+-  std::vector<MetadataFlag> flags({Metadata::WithFluxes, Metadata::Cell});
++  // Exclude operator-split variables (e.g. M1 radiation moments) from the main
++  // explicit flux-divergence update; they are advanced by their own package tasks.
++  Metadata::FlagCollection flags({Metadata::WithFluxes, Metadata::Cell});
++  if (Metadata::FlagNameExists("OperatorSplit"))
++    flags.Exclude(Metadata::GetUserFlag("OperatorSplit"));
+   const auto &vin = in_obj->PackVariablesAndFluxes(flags);
+   auto dudt = dudt_obj->PackVariables(flags);
+   const IndexRange ib = in_obj->GetBoundsI(interior);
+@@ -118,7 +122,11 @@ TaskStatus UpdateWithFluxDivergence(MeshData<Real> *u0_data, MeshData<Real> *u1_
+                                     const Real beta_dt) {
+   const IndexDomain interior = IndexDomain::interior;
+ 
+-  std::vector<MetadataFlag> flags({Metadata::WithFluxes, Metadata::Cell});
++  // Exclude operator-split variables (e.g. M1 radiation moments) from the low-storage
++  // hydro update; they are advanced by their own operator-split package tasks.
++  Metadata::FlagCollection flags({Metadata::WithFluxes, Metadata::Cell});
++  if (Metadata::FlagNameExists("OperatorSplit"))
++    flags.Exclude(Metadata::GetUserFlag("OperatorSplit"));
+   auto u0_pack = u0_data->PackVariablesAndFluxes(flags);
+   const auto &u1_pack = u1_data->PackVariables(flags);
+   const IndexRange ib = u0_data->GetBoundsI(interior);
+diff --git a/src/mesh/mesh.cpp b/src/mesh/mesh.cpp
+index eb5554a83..875319003 100644
+--- a/src/mesh/mesh.cpp
++++ b/src/mesh/mesh.cpp
+@@ -194,7 +194,12 @@ Mesh::Mesh(ParameterInput *pin, ApplicationInput *app_in, Packages_t &packages,
+     max_level = max_level_ref_;
+   }
+ 
+-  if (multigrid) SetNumberOfCommChannels(BoundaryType::gmg_restrict_send, 2);
++  // With coalesced comms, the coalesced buffer machinery only addresses comm channel 0
++  // (BndId::GetSend hard-codes id 0), so the two concurrent restrict stages (u and
++  // res_err in MGSolver) share a single channel and are serialized by task ordering,
++  // MPI message ordering, and the buffer state machine instead.
++  if (multigrid && !do_coalesced_comms)
++    SetNumberOfCommChannels(BoundaryType::gmg_restrict_send, 2);
+ 
+   SetupMPIComms();
+ 
+diff --git a/src/solvers/mg_solver.hpp b/src/solvers/mg_solver.hpp
+index 421f3b0b1..f9f5caa20 100644
+--- a/src/solvers/mg_solver.hpp
++++ b/src/solvers/mg_solver.hpp
+@@ -464,10 +464,14 @@ class MGSolver : public SolverBase, MGSolverCounter {
+     auto &md_temp = pmesh->mesh_data.Add(container_temp, partition, sol_fields);
+     auto &md_u0 = pmesh->mesh_data.Add(container_u0, partition, sol_fields);
+     auto &md_diag = pmesh->mesh_data.Add(container_diag, partition, sol_fields);
+-    md_res_err->SetBoundBufferId(BoundaryType::gmg_restrict_send,
+-                                 1); // Use a separate set of communication buffers
+-    md_res_err->SetBoundBufferId(BoundaryType::gmg_restrict_recv,
+-                                 1); // Use a separate set of communication buffers
++    // Use a separate set of communication buffers for res_err when multiple comm
++    // channels are available. Under coalesced comms only a single channel exists
++    // (coalesced buffers can only address channel 0), so u and res_err share channel 0
++    // and their restrict communication is serialized by task ordering + MPI FIFO.
++    const int res_err_channel =
++        pmesh->GetNumberOfCommChannels(BoundaryType::gmg_restrict_send) > 1 ? 1 : 0;
++    md_res_err->SetBoundBufferId(BoundaryType::gmg_restrict_send, res_err_channel);
++    md_res_err->SetBoundBufferId(BoundaryType::gmg_restrict_recv, res_err_channel);
+     auto timer_guard_total = TimingAccumulatorGuard(
+         solver_timings.GetOrAddAndRegister(GetTimeLabel("Total", partition), tl));
+ 
