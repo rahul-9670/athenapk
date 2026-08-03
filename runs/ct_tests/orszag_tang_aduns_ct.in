@@ -1,0 +1,67 @@
+# Orszag-Tang vortex + AMBIPOLAR diffusion (fixed eta), rkl2 STS, SINGLE BLOCK (no AMR).
+# Discriminating test: tangled 3D-ish current sheets on a uniform grid. Compare DIAG_TOTAL_B2
+# per STS group + hst ME against the matched _glm.in. If CT under-diffuses B^2 vs GLM here
+# (no coarse-fine boundary anywhere), the flagship 7x AD gap is the tangled-field CT AD
+# operator (dispersive transverse-J), NOT an AMR-reflux issue. Differs from _glm.in ONLY in
+# hydro/divergence_control (+ ct_emf).
+<job>
+problem_id = orszag_tang
+
+<parthenon/mesh>
+refinement = none
+nghost = 3
+nx1 = 128
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 128
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 128
+nx2 = 128
+nx3 = 1
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.4
+tlim = 0.3
+nlim = 300
+ncycle_out = 50
+
+<hydro>
+fluid = glmmhd
+eos = adiabatic
+riemann = hlld
+reconstruction = ppm
+gamma = 1.666666666666667
+first_order_flux_correct = true
+divergence_control = ct
+ct_emf = gs05
+
+<diffusion>
+integrator = unsplit
+cfl = 0.4
+rkl2_max_dt_ratio = 400
+ambipolar = ambipolar
+ambipolar_coeff = fixed
+ambipolar_coeff_code = 0.5
+
+<parthenon/output1>
+file_type = hst
+dt = 0.02
+
+<parthenon/output0>
+file_type = hdf5
+dt = 1000.0
+id = prim
+variables = prim

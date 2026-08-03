@@ -1,0 +1,78 @@
+<comment>
+problem = WS-1 increment 5: accretion mass/momentum conservation.
+# Uniform gas rho=200 at rest, periodic BCs (fully conservative, no boundary loss). A seeded
+# sink (m=1, vx=0.5) moves through and accretes bound gas down to the rho_sink/3 floor. Total
+# (gas+sink) mass and x-momentum must stay constant to machine precision (gate <1e-10/step).
+
+<job>
+problem_id = poisson_test
+
+<problem/poisson_test>
+profile  = tophat
+radius   = 1.0e6
+rho_in   = 200.0
+rho_out  = 200.0
+pressure = 1.0
+
+<parthenon/mesh>
+refinement = none
+nx1 = 32
+x1min = -4.0
+x1max =  4.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 32
+x2min = -4.0
+x2max =  4.0
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 32
+x3min = -4.0
+x3max =  4.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<parthenon/time>
+integrator = vl2
+cfl        = 0.3
+tlim       = 2.0
+nlim       = -1
+
+<hydro>
+fluid          = euler
+eos            = adiabatic
+gamma          = 1.4
+riemann        = hllc
+reconstruction = plm
+
+<physics>
+self_gravity = false
+
+<sinks>
+enabled       = true
+creation      = false
+accretion     = true
+gas_gravity   = false
+rho_sink_code = 100.0
+racc_cells    = 4.0
+four_pi_G     = 12.566370614359172
+nseed         = 1
+seed_x    = 0.0
+seed_y    = 0.0
+seed_z    = 0.1
+seed_vx   = 0.5
+seed_vy   = 0.0
+seed_vz   = 0.0
+seed_mass = 1.0
+
+<parthenon/output0>
+file_type = hdf5
+dt        = 0.1
+variables = prim
+swarms    = sinks
+sinks_variables = mass, vx, vy, vz

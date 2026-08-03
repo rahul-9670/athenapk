@@ -1,0 +1,69 @@
+<comment>
+problem = Ohmic diffusion of a 1D Gaussian B_y(x) -- CT (increment-4) gate. Identical to
+# diffusion_ohmic_glm.in EXCEPT divergence_control=ct (+ ct_emf=gs05). The Ohmic induction
+# is re-routed to an edge-centered CT EMF (CT_AddOhmicEMF); div B must stay at round-off
+# AND the B_y peak decay must match both the analytic curve and the GLM control.
+
+<job>
+problem_id = diffusion
+
+<problem/diffusion>
+iprob = 40
+t0 = 0.5
+amp = 1.0e-3
+
+<parthenon/mesh>
+refinement = none
+nghost = 2
+nx1 = 128
+x1min = -4.0
+x1max = 4.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 8
+x2min = -0.25
+x2max = 0.25
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.25
+x3max = 0.25
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 64
+nx2 = 8
+nx3 = 1
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 2.0
+nlim = -1
+ncycle_out = 200
+
+<hydro>
+fluid = glmmhd
+eos = adiabatic
+gamma = 2.0
+riemann = hlld
+reconstruction = plm
+divergence_control = ct
+ct_emf = gs05
+
+<diffusion>
+integrator = unsplit
+resistivity = ohmic
+resistivity_coeff = fixed
+ohm_diff_coeff_code = 0.25
+
+<parthenon/output0>
+file_type = hdf5
+dt = 2.0
+id = prim
+variables = prim
+
+<parthenon/output1>
+file_type = hst
+dt = 0.05

@@ -1219,8 +1219,13 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         Real hall_coeff_code = pin->GetReal("diffusion", "hall_coeff_code");
         Real hall_ohmic_floor_code =
             pin->GetOrAddReal("diffusion", "hall_ohmic_floor_code", 0.0);
-        auto hall_diff = HallDiffusivity(hall, hall_coeff, hall_coeff_code,
-                                         hall_ohmic_floor_code, 0.0, 0.0, 0.0);
+        // B11: per-cell stabilizer = max(hall_ohmic_floor_code, ratio*|eta_H|). 0 = off.
+        Real hall_ohmic_floor_ratio =
+            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.0);
+        auto hall_diff = HallDiffusivity(
+            hall, hall_coeff, hall_coeff_code, hall_ohmic_floor_code, 0.0, 0.0, 0.0,
+            Ionization::IonizationModel(), -1, std::numeric_limits<Real>::max(),
+            hall_ohmic_floor_ratio);
         pkg->AddParam<>("hall_diff", hall_diff);
 
         if ((resistivity == Resistivity::none) && (hall_ohmic_floor_code <= 0.0) &&
@@ -1238,8 +1243,10 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         Real hall_ohmic_floor_code =
             pin->GetOrAddReal("diffusion", "hall_ohmic_floor_code", 0.0);
         Ionization::IonizationModel ion = BuildIonizationModel(pin);
-        auto hall_diff = HallDiffusivity(hall, hall_coeff, 0.0, hall_ohmic_floor_code, 0.0,
-                                         0.0, 0.0, ion, -1, eta_hall_cap_code);
+        auto hall_diff =
+            HallDiffusivity(hall, hall_coeff, 0.0, hall_ohmic_floor_code, 0.0, 0.0, 0.0,
+                            ion, -1, eta_hall_cap_code,
+                            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.0));
         pkg->AddParam<>("hall_diff", hall_diff);
         if (parthenon::Globals::my_rank == 0) {
           std::cout << "## Hall effect: self-consistent ionization model "
@@ -1265,8 +1272,10 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         Ionization::IonizationModel ion = BuildIonizationModel(pin);
         const int xe_scalar = pin->GetOrAddInteger("diffusion", "xe_scalar_index", 4);
         const int i_xe_prim = nhydro + xe_scalar;
-        auto hall_diff = HallDiffusivity(hall, hall_coeff, 0.0, hall_ohmic_floor_code, 0.0,
-                                         0.0, 0.0, ion, i_xe_prim, eta_hall_cap_code);
+        auto hall_diff =
+            HallDiffusivity(hall, hall_coeff, 0.0, hall_ohmic_floor_code, 0.0, 0.0, 0.0,
+                            ion, i_xe_prim, eta_hall_cap_code,
+                            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.0));
         pkg->AddParam<>("hall_diff", hall_diff);
         if (parthenon::Globals::my_rank == 0) {
           std::cout << "## Hall effect: chemistry-coupled x_e (conductivity-tensor sigma_H, "
@@ -1286,6 +1295,57 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         PARTHENON_FAIL("The Hall effect is enabled but no valid coefficient is set. Set "
                        "diffusion/hall_coeff to 'fixed' (+hall_coeff_code), 'ionization', "
                        "or 'ionization_chem'.");
+      }
+
+      // WP-16 part 3 (2026-08-03): the three branches above each warn when the Ohmic floor is
+      // ABSENT, but a floor that is present and TOO SMALL was silent -- and in 3D that is not a
+      // slow degradation, it is an outright instability. Measured on the analytic Hall eigenmode
+      // (src/pgen/diffusion.cpp iprob=60, which the Hall term must conserve exactly because it is
+      // non-dissipative): with eta_H = 0.5 and this floor at 0.05, the mode AMPLIFIES by five
+      // decades at 128^3 and crashes at 256^3, on both helicity branches. Raising the floor to
+      // 0.1 restores it at both 64^3 and 128^3, with the two resolutions then agreeing to ~5 %.
+      // The requirement is therefore a RATIO eta_floor/|eta_H| ~ 0.1-0.2, not an absolute number
+      // -- Hall and Ohmic damping carry the same power of k, so nothing about it is
+      // resolution-dependent. **1D is entirely unaffected** (stable and 0.4 %-accurate to
+      // 1024^3), which is why this went unnoticed: the historical validation was 1D-only.
+      //
+      // This notice does not attempt to evaluate the criterion -- eta_H is a per-cell runtime
+      // quantity under `ionization`/`ionization_chem` -- it states the criterion so the check can
+      // be made. It IS checkable after the fact: add `nonideal_eta` to an output block and
+      // compare max|eta_H| against the floor (docs/validation/WP16b_hall_3d_instability.md).
+      // Measured on prod_v9 that way: max|eta_H| = 4.3e-02 against a 0.05 floor, i.e. the floor
+      // exceeds |eta_H| in 100 % of 78.7M cells -- production is inside the stable regime, but
+      // empirically rather than by construction.
+      const Real hall_floor_notice =
+          pin->GetOrAddReal("diffusion", "hall_ohmic_floor_code", 0.0);
+      const Real hall_floor_ratio_notice =
+          pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.0);
+      if (parthenon::Globals::my_rank == 0) {
+        if (hall_floor_ratio_notice > 0.0) {
+          std::cout << "## Hall Ohmic stabilizer: per-cell max("
+                    << hall_floor_notice << ", " << hall_floor_ratio_notice
+                    << "*|eta_H|). The ratio term is what makes 3D Hall stable: measured "
+                       "onset of amplification is at eta_floor/|eta_H| ~ 0.11, so >= 0.2 "
+                       "carries ~2x margin. Larger costs Hall fidelity (omega error 6.6e-3 "
+                       "at 0.125 -> 4.7e-2 at 1.0). See WP-16 part 3." << std::endl;
+          if (hall_floor_ratio_notice < 0.15) {
+            std::cout << "### WARNING [Hall] hall_ohmic_floor_ratio = "
+                      << hall_floor_ratio_notice
+                      << " is at or below the measured instability onset (~0.11). Use >= 0.2."
+                      << std::endl;
+          }
+        } else if (hall_floor_notice > 0.0) {
+          std::cout << "## NOTE [Hall] the Ohmic stabilizer floor is ABSOLUTE ("
+                    << hall_floor_notice
+                    << " code units), not scaled to eta_H, so it is only sufficient while "
+                       "|eta_H| stays below it. In 3D the measured stability requirement is "
+                       "eta_floor >~ 0.1-0.2 |eta_H| per cell; below it the scheme AMPLIFIES "
+                       "rather than damps. Either verify max|eta_H| < "
+                    << hall_floor_notice
+                    << " for this problem (write the `nonideal_eta` field) or set "
+                       "diffusion/hall_ohmic_floor_ratio = 0.2. See WP-16 part 3."
+                    << std::endl;
+        }
       }
     }
     pkg->AddParam<>("hall", hall);

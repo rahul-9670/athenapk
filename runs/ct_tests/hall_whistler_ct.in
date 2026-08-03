@@ -1,0 +1,73 @@
+<comment>
+problem = Hall whistler dispersion -- 3D CT run for the increment-4 Hall check.
+# Circularly polarized eigenmode propagating in x, uniform in y,z. 3D box because 2D CT
+# freezes B_z (F3). Differs from hall_whistler_ct.in ONLY in divergence_control.
+
+<job>
+problem_id = diffusion
+
+<problem/diffusion>
+iprob = 60
+Bx    = 1.0
+By    = 0.0
+amp   = 1.0e-6
+nwave = 1.0
+helicity = -1.0
+
+<parthenon/mesh>
+refinement = none
+nghost = 2
+nx1 = 128
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 4
+x2min = -0.015625
+x2max = 0.015625
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 4
+x3min = -0.015625
+x3max = 0.015625
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 128
+nx2 = 4
+nx3 = 4
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 0.05
+nlim = 10000000
+ncycle_out = 500
+
+<hydro>
+fluid = glmmhd
+riemann = hlld
+eos = adiabatic
+reconstruction = plm
+gamma = 2.0
+divergence_control = ct
+ct_emf = gs05
+
+<diffusion>
+integrator = unsplit
+cfl = 0.3
+hall = hall
+hall_coeff = fixed
+hall_coeff_code = 0.5
+hall_ohmic_floor_code = 0.05
+
+<parthenon/output0>
+file_type = hdf5
+dt = 0.05
+variables = prim
+id = prim
+
+<parthenon/output1>
+file_type = hst
+dt = 0.0025

@@ -1,0 +1,140 @@
+<comment>
+problem = EOS integration smoke: tabulated protostellar EOS + BellLin opacity + RT
+# self-gravity + full non-ideal (thermal K+H ionization) + chemistry, tiny box, few cycles.
+# Purpose: confirm the whole new-physics stack initializes (loads EOS table) and steps
+# without NaN/crash. NOT a science run.
+
+<job>
+problem_id = collapse_be
+
+<parthenon/time>
+integrator = rk1
+cfl = 0.0375
+tlim = 0.3
+nlim = 100000
+ncycle_out = 1
+
+<parthenon/mesh>
+refinement = none
+numlevel = 1
+multigrid = true
+nx1 = 64
+x1min = -26.0
+x1max = 26.0
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 64
+x2min = -26.0
+x2max = 26.0
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 64
+x3min = -26.0
+x3max = 26.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<parthenon/meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<hydro>
+fluid = euler
+eos = adiabatic
+gamma = 1.4
+riemann = hllc
+reconstruction = plm
+dfloor = 1.0e-6
+pfloor = 1.0e-8
+nscalars = 5
+angmom_diag = true
+cons_diag = true
+
+<refinement>
+type = jeans
+njeans = 8
+
+<diffusion>
+integrator = unsplit
+cfl = 0.3
+ambipolar = none
+ambipolar_coeff = ionization
+resistivity = none
+resistivity_coeff = ionization
+hall = none
+hall_coeff = ionization
+hall_ohmic_floor_code = 0.05
+
+<physics>
+self_gravity = true
+radiation = false
+chemistry = false
+
+<chemistry>
+network = gow17_reduced
+nsub_max = 400
+cfl_cool = 0.1
+
+<radiation>
+closure = M1
+mu = 2.33
+rho_unit_cgs = 5.467e-19
+v_unit_cgs = 1.9e4
+length_unit_cgs = 2.81e16
+creduc = 1000.0
+opacity_model = belllin
+matter_coupling = true
+cfl = 0.4
+efloor = 1.0e-15
+tfloor_code = 1.0e-3
+
+<self_gravity>
+units_override = true
+four_pi_G = 1.0
+use_swindle = false
+ix1_bc = zero
+ox1_bc = zero
+ix2_bc = zero
+ox2_bc = zero
+ix3_bc = zero
+ox3_bc = zero
+
+<self_gravity/solver_params>
+solver = BiCGSTAB
+max_iterations = 200
+residual_tolerance = 1.0e-6
+do_FAS = true
+max_coarsenings = 20
+smoother = SRJ1
+presmoother = SRJ1
+postsmoother = SRJ1
+preconditioner = Multigrid
+
+<problem/collapse_be>
+mass = 6.0
+temperature = 10.0
+f = 5.0
+rhocrit = 1.0e-13
+amp = 0.0
+omegatff = 0.02
+B0z = 0.0
+turb_mach = 0.0
+turb_alpha = 3.667
+turb_seed = 42
+turb_kmin = 1
+turb_kmax = 8
+turb_nmodes = 128
+turb_zeta = 0.5
+turb_region = sphere
+
+<parthenon/output0>
+file_type = hst
+dt = 0.02
+
+<parthenon/output1>
+file_type = hdf5
+dn = 100000
+variables = prim, grav.phi, rad.Er
+single_precision_output = 1
+hdf5_compression_level = 0

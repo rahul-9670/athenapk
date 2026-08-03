@@ -109,8 +109,18 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // <diffusion> ion_zeta hard-fails from the shared object rather than a local assertion.
   pkg->AddParam("zeta_cr_cgs", zeta_cr_cgs);
 
-  // Running count of cells whose reaction integration was truncated at nsub_max
-  // (under-integrated abundances). Used to warn once on first occurrence.
+  // Running count of cells whose reaction integration was ACCURACY-DEGRADED by nsub_max.
+  // Used to warn once on first occurrence.
+  //
+  // WP-10 (2026-08-03) found this counter was structurally always ZERO for the gow17 and
+  // thermo integrators. Both floor the sub-step at dt_code/nsub_max so the loop always
+  // covers dt_code, which makes the classical "nsub_max exhausted" truncation unreachable --
+  // while the real degradation, a sub-step RAISED above what the accuracy criterion asked
+  // for, went unreported. Measured: at fixed cfl_cool, lifting nsub_max 400 -> 3200 moved
+  // x_CO by 2.1e-2 and x_C+ by 7.2e-3 with the counter reading 0 in every leg. Both
+  // integrators now report floor engagement too. (network_h2 is unaffected -- it is explicit
+  // Euler with a genuine truncation cap and no floor, so its return value already meant
+  // what it said.)
   pkg->AddParam<>("chem_trunc_total", 0.0, Params::Mutability::Mutable);
 
   const int nscalars = pin->GetOrAddInteger("hydro", "nscalars", 0);
@@ -300,10 +310,13 @@ TaskStatus ReactScalars(MeshData<Real> *md, const Real dt) {
     pkg->UpdateParam("chem_trunc_total", prev + static_cast<Real>(ntrunc));
     if (prev == 0.0) {
       std::cout << "### WARNING Chemistry: " << ntrunc
-                << " cell(s) hit nsub_max before covering the full dt; abundances in "
-                   "those cells are under-integrated. Consider raising "
-                   "chemistry/nsub_max or cfl_cool. (Warning printed once per run; "
-                   "total truncations accumulate in the chem_trunc_total param.)"
+                << " cell(s) had their reaction sub-step LIMITED BY nsub_max rather than by "
+                   "chemistry/cfl_cool, so cfl_cool is not the binding tolerance there and "
+                   "abundances are under-integrated. RAISE chemistry/nsub_max (tightening "
+                   "cfl_cool alone will NOT help once this fires). WP-10 measured x_CO "
+                   "moving 2.1e-2 between nsub_max 400 and 3200 at fixed cfl_cool, at no "
+                   "measurable wall-time cost. (Warning printed once per run; the running "
+                   "total accumulates in the chem_trunc_total param.)"
                 << std::endl;
     }
   }

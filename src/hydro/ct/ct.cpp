@@ -1633,6 +1633,10 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
   const bool three_d = ndim > 2;
   const auto &hall_diff = hydro_pkg->Param<HallDiffusivity>("hall_diff");
   const Real eta_floor = hall_diff.GetOhmicFloor();
+  // B11: per-cell Ohmic stabilizer = max(absolute floor, ratio*|eta_H|). CT forbids RKL2, so
+  // eta_h is always evaluated on these edges and the effective floor is available directly.
+  // ratio = 0 reproduces the constant floor exactly.
+  const Real hall_floor_ratio = hall_diff.GetOhmicFloorRatio();
   const bool use_cache = hydro_pkg->Param<bool>("nonideal_eta_cache");
 
   auto prim = md->PackVariables(std::vector<std::string>{"prim"});
@@ -1688,7 +1692,10 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
           const Real eta_h = HallEdgeEta(hall_diff, prim, eta_pack, use_cache, bmag, b, k, j,
                                          i, k, j, i - 1, k, j - 1, i, k, j - 1, i - 1);
           Real e1, e2, e3;
-          HallEMFLocal(eta_h, eta_floor, bmag, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
+          HallEMFLocal(eta_h,
+                       (hall_floor_ratio > 0.0) ? hall_diff.EffectiveOhmicFloor(eta_h)
+                                                : eta_floor,
+                       bmag, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
           pack.flux(b, TE::E3, Bf(), k, j, i) += e3;
         });
   }
@@ -1730,7 +1737,10 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
                 HallEdgeEta(hall_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k,
                             j - 1, i, k - 1, j, i, k - 1, j - 1, i);
             Real e1, e2, e3;
-            HallEMFLocal(eta_h, eta_floor, bmag, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
+            HallEMFLocal(eta_h,
+                       (hall_floor_ratio > 0.0) ? hall_diff.EffectiveOhmicFloor(eta_h)
+                                                : eta_floor,
+                       bmag, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
             pack.flux(b, TE::E1, Bf(), k, j, i) += e1;
           });
     }
@@ -1770,7 +1780,10 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
                 HallEdgeEta(hall_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k, j,
                             i - 1, k - 1, j, i, k - 1, j, i - 1);
             Real e1, e2, e3;
-            HallEMFLocal(eta_h, eta_floor, bmag, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
+            HallEMFLocal(eta_h,
+                       (hall_floor_ratio > 0.0) ? hall_diff.EffectiveOhmicFloor(eta_h)
+                                                : eta_floor,
+                       bmag, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
             pack.flux(b, TE::E2, Bf(), k, j, i) += e2;
           });
     }

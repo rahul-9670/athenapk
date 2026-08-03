@@ -142,12 +142,21 @@ struct Gow17ReducedNetwork {
 
   // Operator-split per-cell integration over code-time dt_code at fixed rho & T.
   // y[] abundances modified in place; T_code is the code-unit temperature, T_unit K/code.
-  // Returns 1 if the integration was TRUNCATED (nsub_max sub-steps exhausted before
-  // reaching dt_code, leaving the abundances under-integrated), else 0.
+  //
+  // Returns 1 if this cell's integration was ACCURACY-DEGRADED, else 0. Two ways that happens:
+  //   (i)  the sub-cycler failed to cover dt_code (nsub_max exhausted) -- the classical
+  //        truncation, and by construction UNREACHABLE here (see the dt_floor note below);
+  //   (ii) at least one sub-step was RAISED to dt_floor because the accuracy criterion asked
+  //        for a smaller one. That is the real degradation mode of this integrator and it was
+  //        previously invisible: the old return value reported only (i), so `nsub_max` could
+  //        silently override `cfl_cool` with the diagnostic reading zero. WP-10 measured that
+  //        happening -- at fixed cfl_cool, lifting nsub_max 400 -> 3200 moved x_CO by 2.1e-2
+  //        while the truncation counter stayed at 0 in every leg.
   CHEMG_FN int integrate_cell(double *y, double rho_code, double T_K, double dt_code) const {
     const double n_H = nH(rho_code);
     double t = 0.0;
     int nsub = 0;
+    int nfloored = 0;
     // Semi-implicit (production/loss-split) sub-cycler. Each species is advanced by
     //     y_new = (y + dt*P) / (1 + dt*L),
     // the linearized-implicit (asymptotic) update, which is unconditionally stable and
@@ -176,7 +185,10 @@ struct Gow17ReducedNetwork {
       }
       // Floor the step so stiffness can't stall progress: semi-implicit stability makes
       // these larger steps safe (they relax toward the local P/L equilibrium).
-      if (dt_chem < dt_floor) dt_chem = dt_floor;
+      if (dt_chem < dt_floor) {
+        dt_chem = dt_floor;
+        ++nfloored; // the accuracy criterion was OVERRIDDEN by nsub_max -- report it
+      }
       if (t + dt_chem > dt_code) dt_chem = dt_code - t;
       for (int s = 0; s < gCO + 1; ++s) {
         y[s] = (y[s] + dt_chem * P[s]) / (1.0 + dt_chem * L[s]);
@@ -212,10 +224,11 @@ struct Gow17ReducedNetwork {
     double xe = y[gHp] + y[gCp];
     if (xe < xe_floor) xe = xe_floor;
     y[ge] = xe;
-    // Truncated only if the sub-cycler genuinely failed to cover dt_code; a small
-    // relative tolerance absorbs the floating-point undershoot from summing nsub_max
-    // floored steps (which still fully integrate the abundances).
-    return (t < dt_code * (1.0 - 1.0e-9)) ? 1 : 0;
+    // Degraded if the sub-cycler genuinely failed to cover dt_code (a small relative
+    // tolerance absorbs the floating-point undershoot from summing nsub_max floored steps),
+    // OR if any sub-step had to be raised to dt_floor. The second is the one that actually
+    // fires; see the note on the signature.
+    return ((t < dt_code * (1.0 - 1.0e-9)) || nfloored > 0) ? 1 : 0;
   }
 };
 

@@ -1,0 +1,87 @@
+<comment>
+problem = M1 transport benchmark #1: optically-thick radiative diffusion. A Gaussian Er pulse in
+# a static uniform medium with LARGE scattering opacity (kappa_s=100, kappa_a=0 => pure radiation
+# diffusion, no gas energy exchange, total Er conserved). The implicit flux drag Fr->Fr/(1+a)
+# drives Fr to the Fick's-law equilibrium Fr = -(chat/3 rho kappa) grad Er, so Er spreads as a
+# diffusion Gaussian: Var(t) = Var0 + 2 D t, D = chat/(3 rho kappa_s). tau_domain = kappa_s*rho*L
+# = 100. This is the NONLINEAR-diffusion counterpart to the sig_diff.in f=0 characteristic test.
+
+<job>
+problem_id = rad_pulse
+
+<problem/rad_pulse>
+rho0  = 1.0
+p0    = 1.0
+E0    = 1.0e-10
+Eamp  = 1.0
+x0    = 0.0
+width = 0.05
+reduced_flux = 0.0
+
+<parthenon/mesh>
+refinement = none
+nghost = 2
+nx1 = 256
+x1min = -0.5
+x1max =  0.5
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 1
+x2min = -0.5
+x2max =  0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max =  0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 256
+nx2 = 1
+nx3 = 1
+
+<parthenon/time>
+integrator = vl2
+cfl        = 0.3
+tlim       = 0.3
+nlim       = 2000000
+ncycle_out = 500
+
+<hydro>
+fluid          = euler
+eos            = adiabatic
+gamma          = 1.6666667
+riemann        = hllc
+reconstruction = plm
+dfloor         = 1.0e-10
+pfloor         = 1.0e-12
+
+<physics>
+self_gravity = false
+radiation = true
+
+<radiation>
+closure = M1
+reconstruction = plm
+mu = 2.33
+rho_unit_cgs = 5.467e-19
+v_unit_cgs = 1.9e4
+length_unit_cgs = 2.81e16
+creduc = 2.0e5
+opacity_model = constant
+kappa_a_code = 0.0
+kappa_s_code = 100.0
+matter_coupling = true
+cfl = 0.3
+efloor = 1.0e-30
+
+<parthenon/output0>
+file_type = hdf5
+dt        = 0.025
+variables = prim, rad.Er, rad.Fr1
+
+<parthenon/output1>
+file_type = hst
+dt        = 1000

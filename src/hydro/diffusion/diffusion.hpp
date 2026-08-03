@@ -376,16 +376,22 @@ struct HallDiffusivity {
   // strict whistler dt (~dx^2/|eta_H|) to zero. eta_H is SIGNED: the cap clamps the
   // magnitude and preserves the sign. Disabled by default (huge value).
   Real eta_cap_;
+  // B11 (WP-16 part 3): the Ohmic stabilizer expressed as a FRACTION of the local |eta_H|,
+  // so the floor tracks the term it stabilizes instead of being a fixed number that merely
+  // happens to be large enough. 0 = disabled => EffectiveOhmicFloor() returns ohmic_floor_
+  // exactly, and every consumer is bit-identical to the pre-B11 code.
+  Real ohmic_floor_ratio_;
 
  public:
   KOKKOS_INLINE_FUNCTION
   HallDiffusivity(Hall hall, HallCoeff hall_coeff_type, Real coeff, Real ohmic_floor,
                   Real mbar, Real me, Real kb,
                   Ionization::IonizationModel ion = Ionization::IonizationModel(),
-                  int i_xe = -1, Real eta_cap = std::numeric_limits<Real>::max())
+                  int i_xe = -1, Real eta_cap = std::numeric_limits<Real>::max(),
+                  Real ohmic_floor_ratio = 0.0)
       : hall_(hall), hall_coeff_type_(hall_coeff_type), coeff_(coeff),
         ohmic_floor_(ohmic_floor), mbar_(mbar), me_(me), kb_(kb), ion_(ion), i_xe_(i_xe),
-        eta_cap_(eta_cap) {}
+        eta_cap_(eta_cap), ohmic_floor_ratio_(ohmic_floor_ratio) {}
 
   // temp (= code-unit T = p/rho) is used only for the ionization model; ignored for
   // HallCoeff::fixed.
@@ -399,6 +405,36 @@ struct HallDiffusivity {
 
   KOKKOS_INLINE_FUNCTION
   Real GetOhmicFloor() const { return ohmic_floor_; }
+
+  KOKKOS_INLINE_FUNCTION
+  Real GetOhmicFloorRatio() const { return ohmic_floor_ratio_; }
+
+  //! B11: the Ohmic stabilizer ACTUALLY applied in a cell whose Hall diffusivity is eta_h.
+  //!
+  //! WHY A RATIO. `hall_ohmic_floor_code` alone is an absolute number applied regardless of
+  //! the local eta_H, which is safe only while eta_H happens to stay small. Measured on the
+  //! analytic Hall eigenmode (src/pgen/diffusion.cpp iprob=60 -- a circularly polarized mode
+  //! the non-dissipative Hall term must conserve EXACTLY): in 3D the scheme AMPLIFIES rather
+  //! than damps once eta_floor/|eta_H| falls below ~0.11. The onset is sharp -- crossing it
+  //! takes the amplitude error from +1.6 % to +2.65e5, and 256^3 crashes outright -- and it
+  //! is a RATIO, not a resolution-dependent number: above threshold, 64^3 and 128^3 agree to
+  //! ~5 %. That is what theory predicts, since Hall (eta_H k^2) and Ohmic (eta_O k^2) damping
+  //! carry the same power of k. 1D is unaffected at every resolution to 1024, which is why
+  //! this went unnoticed: the historical Hall validation was 1D-only.
+  //!
+  //! max(), NOT replace: the absolute floor still applies where it is the larger of the two,
+  //! so raising the ratio can only ever ADD dissipation, never remove it. That one-sided
+  //! property is what makes the switch safe to enable on a run whose absolute floor already
+  //! dominates -- it is then a provable no-op (see docs/validation/WP16b_hall_3d_instability.md).
+  //!
+  //! NOT FREE: the stabilizer is a real resistivity in the dispersion relation, so a larger
+  //! ratio buys stability at the cost of Hall fidelity (measured omega error 6.6e-3 at ratio
+  //! 0.125 rising to 4.7e-2 at 1.0). Sit just above threshold, not far above it.
+  KOKKOS_INLINE_FUNCTION
+  Real EffectiveOhmicFloor(const Real eta_h) const {
+    const Real from_ratio = ohmic_floor_ratio_ * (eta_h < 0.0 ? -eta_h : eta_h);
+    return (from_ratio > ohmic_floor_) ? from_ratio : ohmic_floor_;
+  }
 
   KOKKOS_INLINE_FUNCTION
   Hall GetType() const { return hall_; }

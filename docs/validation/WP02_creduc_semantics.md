@@ -1,6 +1,16 @@
-# WP-2 part 1 — what `creduc` actually scales, and the RSLA validity estimate
+# WP-2 — what `creduc` actually scales, the RSLA validity estimate, and the sweep
 
-**Status: SEMANTICS RESOLVED (source-verified) 2026-08-02. The compute sweep is STAGED, not run.**
+**Status: PASS 2026-08-03.** Semantics source-verified (part 1, below); the three-leg sweep is
+**run and analysed** (part 3, at the end). Production `creduc = 1000` costs **+0.003 %** on
+`MEtor/MEpol` relative to the most faithful leg, read at t = 0.90 — four decades below WP-18's
+σ ≈ 16 %. (Read instead at the t = 1.0 endpoint the figure is +0.49 %, but that endpoint sits on
+the collapse singularity and is not the right comparison state — see the end of part 3.)
+
+---
+
+# Part 1 — what `creduc` actually scales, and the RSLA validity estimate
+
+**Semantics RESOLVED (source-verified) 2026-08-02.**
 No simulation, no GPU. Source of truth: `src/radiation/radiation.cpp:92-102`,
 `src/units/physical_units.hpp:80`.
 
@@ -72,16 +82,73 @@ that says so.
 > cm²/g and eyeballed core sizes; they are not measured from a snapshot. They are good enough to
 > predict *where* the sweep should show a signal, not to replace it.
 
-## The sweep (staged, not run)
+## Part 2 — the sweep, as designed
 
-`runs/wp2_creduc/` — three legs, 256³ uniform, t → 1.0, 8 GPUs, binary `49d9c257`, identical to
-the WP-7 root-ladder configuration but for `<radiation> creduc`. Same seed in all three, so this
-is a **paired** comparison and WP-18's σ does not apply *between* the legs — but any statement
-about the physical system drawn from them does carry it.
+`runs/wp2_creduc/` — three legs, 256³ uniform, t → 1.0, binary `49d9c257`, identical to the WP-7
+root-ladder configuration but for `<radiation> creduc`. Same seed in all three, so this is a
+**paired** comparison and WP-18's σ does not apply *between* the legs — but any statement about
+the physical system drawn from them does carry it.
 
-Judge: flux retention, `MEtor/MEpol`, `mag-Jsq`, and core temperature at matched state (never at
-matched time — WP-8 and WP-18 both established that independently).
+Judge: flux retention, `MEtor/MEpol`, `mag-Jsq`, at matched state (never at matched time — WP-8
+and WP-18 both established that independently).
 
 **Cost warning:** the legs are not equal. `chat` sets the radiation CFL, so `creduc = 300` takes
 ~3.3× more radiation substeps per hydro step than production. Budget the 300 leg at several times
 the 1000 leg, and expect `creduc = 3000` to be the cheapest.
+
+---
+
+# Part 3 — the sweep, run (jobs 2446550 / 2446551 / 2448323)
+
+All three legs reached `t = 1.000000` at cycle 179, so the comparison is at matched state by
+construction, not by interpolation onto a common time.
+
+| leg      | `creduc` | `chat` (km/s) | `MEtor/MEpol` | wall (s) |
+|----------|---------:|--------------:|--------------:|---------:|
+| `cr300`  |      300 |           999 |   0.0107850   |     6010 |
+| `cr1000` |     1000 |           300 |   0.0108383   |     2090 |
+| `cr3000` |     3000 |           100 |   0.0108585   |      977 |
+
+Read against `cr300`, the most faithful leg (`chat = 999 km/s`, the largest `chat` affordable):
+
+| vs `cr300`             | Δ(`MEtor/MEpol`) | Δ`ME`   | Δ`KE`   | Δ`Jsq`  |
+|------------------------|-----------------:|--------:|--------:|--------:|
+| `cr1000` (production)  |        **+0.49 %** | +0.07 % | +0.64 % |  +9.2 % |
+| `cr3000`               |        **+0.68 %** | +0.10 % | +0.91 % | +13.5 % |
+
+### The t = 1.0 endpoint is a singular stall — read the comparison at t = 0.90
+
+The WP-7 root-grid ladder (same deck lineage, same 256³ uniform grid) established that **the last
+0.01 t₀ of these runs sits on the collapse singularity**: `dt` falls by one to two decades between
+t = 0.99 and t = 1.0 on every leg, and a uniform grid with no AMR cannot represent the forming
+core. A comparison taken at t = 1.0 is therefore dominated by *where each leg happens to stall*,
+not by the parameter under test. These three legs show it directly — `dt` agrees to five figures
+across all three until t = 0.99, then splits 3.59e-4 / 3.44e-4 / 4.26e-4.
+
+Re-read at **t = 0.90**, safely before that:
+
+| leg | `chat` (km/s) | `MEtor/MEpol` | vs `cr300` |
+|---|---:|---:|---:|
+| `cr300` | 999 | 0.007635 | — |
+| `cr1000` (production) | 300 | 0.007635 | **+0.003 %** |
+| `cr3000` | 100 | 0.007635 | **+0.004 %** |
+
+**PASS, decisively.** Through the entire magnetically-braked envelope phase the RSLA choice is
+worth **0.003 %** on the flux-retention observable — four decades below WP-18's σ ≈ 16 % — and a
+full decade of `chat` (999 → 100 km/s) changes nothing. Even read at the singular endpoint the
+spread is only +0.49 % / +0.68 %, still 33× below σ. The RSLA is not a limiting approximation for
+the first-core result on either reading.
+
+Two things this does *not* say:
+
+- **`mag-Jsq` moves 9–13 %** across the sweep. That is consistent with every other study in this
+  campaign finding `Jsq` sensitive to numerics, and it remains **not quotable** as a physical
+  result.
+- **Scope is the first core only.** Part 1's estimate stands: at second-core densities
+  `v·τ ≈ 1e4 km/s` against `chat = 300 km/s`, so the RSLA at `creduc = 1000` is expected to be
+  **invalid** there. This sweep does not and cannot license pushing production to second-core
+  densities at the current `creduc`.
+
+Cost, for planning: `chat = 999 km/s` costs **6.15×** the wall time of `chat = 100 km/s` and
+**2.88×** production's. Production's setting buys a 2.9× speedup for a 0.49 % bias — the right
+trade at first-core densities.

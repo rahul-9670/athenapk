@@ -74,6 +74,12 @@ Real EstimateHallTimestep(MeshData<Real> *md, const bool whistler_on,
 
   const auto &hall_diff = hydro_pkg->Param<HallDiffusivity>("hall_diff");
   const Real eta_floor = hall_diff.GetOhmicFloor();
+  // B11: with a per-cell floor the stability limit dx^2/eta_floor is also per-cell, and it
+  // is the LARGEST floor in the mesh that binds -- so eta_H has to be evaluated here too,
+  // even when the whistler part is switched off (mixed rkl2 mode). Gated on the ratio so
+  // the ratio=0 path does no extra work and is bit-identical.
+  const Real floor_ratio = hall_diff.GetOhmicFloorRatio();
+  const bool need_eta_h = whistler_on || (floor_on && floor_ratio > 0.0);
 
   // The two constraints carry different stability factors, so fold them into the
   // reduction (only cfl_diff is applied outside).
@@ -93,17 +99,27 @@ Real EstimateHallTimestep(MeshData<Real> *md, const bool whistler_on,
         if (ndim >= 3) {
           mindx2 = fmin(mindx2, SQR(coords.Dxc<3>(k, j, i)));
         }
-        if (whistler_on) {
+        Real eta_h_cell = 0.0;
+        if (need_eta_h) {
           const auto bmag = std::sqrt(SQR(prim(IB1, k, j, i)) + SQR(prim(IB2, k, j, i)) +
                                       SQR(prim(IB3, k, j, i)));
           const auto temp = prim(IPR, k, j, i) / prim(IDN, k, j, i); // code T (p = rho*T)
           const int i_xe = hall_diff.XeIndex();
           const Real xe = (i_xe >= 0) ? prim(i_xe, k, j, i) : -1.0;
-          const auto eta = std::abs(hall_diff.Get(bmag, prim(IDN, k, j, i), temp, xe));
+          eta_h_cell = hall_diff.Get(bmag, prim(IDN, k, j, i), temp, xe);
+        }
+        if (whistler_on) {
+          const auto eta = std::abs(eta_h_cell);
           min_dt = fmin(min_dt, fac_whistler * mindx2 / (eta + TINY_NUMBER));
         }
-        if (floor_on && eta_floor > 0.0) {
-          min_dt = fmin(min_dt, fac_par * mindx2 / (eta_floor + TINY_NUMBER));
+        if (floor_on) {
+          // B11: per-cell floor => per-cell parabolic constraint.
+          const Real eta_f = (floor_ratio > 0.0)
+                                 ? hall_diff.EffectiveOhmicFloor(eta_h_cell)
+                                 : eta_floor;
+          if (eta_f > 0.0) {
+            min_dt = fmin(min_dt, fac_par * mindx2 / (eta_f + TINY_NUMBER));
+          }
         }
       },
       Kokkos::Min<Real>(min_dt_hall));
@@ -142,7 +158,15 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
   const auto &hall_diff = hydro_pkg->Param<HallDiffusivity>("hall_diff");
   // A disabled part contributes exactly zero to the EMF: the floor via eta_floor = 0,
   // the dispersive part by skipping the eta_H evaluation (eta_h = 0) in the kernels.
-  const auto eta_floor = floor_on ? hall_diff.GetOhmicFloor() : 0.0;
+  const auto eta_floor_abs = floor_on ? hall_diff.GetOhmicFloor() : 0.0;
+  // B11: with a ratio set, the floor is per-cell (max of the absolute floor and
+  // ratio*|eta_H|), so eta_H must be evaluated for the FLOOR as well -- including in the
+  // mixed rkl2 mode, where this kernel is called once with (eta_h_on=true, floor_on=false)
+  // for the dispersive part and again with (eta_h_on=false, floor_on=true) for the floor.
+  // Without `need_eta_h` that second call would see eta_h = 0 and silently fall back to the
+  // absolute floor -- i.e. the fix would be inert in exactly the production integrator.
+  const Real floor_ratio = floor_on ? hall_diff.GetOhmicFloorRatio() : 0.0;
+  const bool need_eta_h = eta_h_on || (floor_ratio > 0.0);
 
   // Cell-centered eta cache (PrecomputeNonidealEta): face eta_H = arithmetic average of
   // the two adjacent cached values. When the cache is off, "prim" is packed as a dummy
@@ -193,11 +217,15 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
         const Real b2 = 0.5 * (prim(IB2, k, j, i - 1) + prim(IB2, k, j, i));
         const Real b3 = 0.5 * (prim(IB3, k, j, i - 1) + prim(IB3, k, j, i));
         const Real bmag = std::sqrt(SQR(b1) + SQR(b2) + SQR(b3));
+        // B11: `need_eta_h` (not `eta_h_on`) gates the evaluation, so the per-cell floor
+        // gets a real eta_H even on the floor-only call of the mixed rkl2 mode. The
+        // DISPERSIVE coefficient is still gated on eta_h_on, so that mode's split is
+        // preserved exactly.
         Real eta_h = 0.0;
-        if (eta_h_on && use_cache) {
+        if (need_eta_h && use_cache) {
           eta_h = 0.5 * (eta_pack(b, NonidealEtaIdx::H, k, j, i - 1) +
                          eta_pack(b, NonidealEtaIdx::H, k, j, i));
-        } else if (eta_h_on) {
+        } else if (need_eta_h) {
           const Real rho = 0.5 * (prim(IDN, k, j, i - 1) + prim(IDN, k, j, i));
           const Real prs = 0.5 * (prim(IPR, k, j, i - 1) + prim(IPR, k, j, i));
           const int i_xe = hall_diff.XeIndex();
@@ -206,9 +234,12 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
                               : -1.0;
           eta_h = hall_diff.Get(bmag, rho, prs / rho, xe);
         }
+        const Real eta_floor_c =
+            (floor_ratio > 0.0) ? hall_diff.EffectiveOhmicFloor(eta_h) : eta_floor_abs;
 
         Real e1, e2, e3;
-        HallEMF(eta_h, eta_floor, bmag, j1, j2, j3, b1, b2, b3, e1, e2, e3);
+        HallEMF(eta_h_on ? eta_h : 0.0, eta_floor_c, bmag, j1, j2, j3, b1, b2, b3, e1, e2,
+                e3);
 
         if (!ct_induction) {
           cons.flux(X1DIR, IB2, k, j, i) += -e3;
@@ -259,11 +290,15 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
         const Real b2 = 0.5 * (prim(IB2, k, j - 1, i) + prim(IB2, k, j, i));
         const Real b3 = 0.5 * (prim(IB3, k, j - 1, i) + prim(IB3, k, j, i));
         const Real bmag = std::sqrt(SQR(b1) + SQR(b2) + SQR(b3));
+        // B11: `need_eta_h` (not `eta_h_on`) gates the evaluation, so the per-cell floor
+        // gets a real eta_H even on the floor-only call of the mixed rkl2 mode. The
+        // DISPERSIVE coefficient is still gated on eta_h_on, so that mode's split is
+        // preserved exactly.
         Real eta_h = 0.0;
-        if (eta_h_on && use_cache) {
+        if (need_eta_h && use_cache) {
           eta_h = 0.5 * (eta_pack(b, NonidealEtaIdx::H, k, j - 1, i) +
                          eta_pack(b, NonidealEtaIdx::H, k, j, i));
-        } else if (eta_h_on) {
+        } else if (need_eta_h) {
           const Real rho = 0.5 * (prim(IDN, k, j - 1, i) + prim(IDN, k, j, i));
           const Real prs = 0.5 * (prim(IPR, k, j - 1, i) + prim(IPR, k, j, i));
           const int i_xe = hall_diff.XeIndex();
@@ -272,9 +307,12 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
                               : -1.0;
           eta_h = hall_diff.Get(bmag, rho, prs / rho, xe);
         }
+        const Real eta_floor_c =
+            (floor_ratio > 0.0) ? hall_diff.EffectiveOhmicFloor(eta_h) : eta_floor_abs;
 
         Real e1, e2, e3;
-        HallEMF(eta_h, eta_floor, bmag, j1, j2, j3, b1, b2, b3, e1, e2, e3);
+        HallEMF(eta_h_on ? eta_h : 0.0, eta_floor_c, bmag, j1, j2, j3, b1, b2, b3, e1, e2,
+                e3);
 
         if (!ct_induction) {
           cons.flux(X2DIR, IB1, k, j, i) += e3;
@@ -321,11 +359,15 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
         const Real b2 = 0.5 * (prim(IB2, k - 1, j, i) + prim(IB2, k, j, i));
         const Real b3 = 0.5 * (prim(IB3, k - 1, j, i) + prim(IB3, k, j, i));
         const Real bmag = std::sqrt(SQR(b1) + SQR(b2) + SQR(b3));
+        // B11: `need_eta_h` (not `eta_h_on`) gates the evaluation, so the per-cell floor
+        // gets a real eta_H even on the floor-only call of the mixed rkl2 mode. The
+        // DISPERSIVE coefficient is still gated on eta_h_on, so that mode's split is
+        // preserved exactly.
         Real eta_h = 0.0;
-        if (eta_h_on && use_cache) {
+        if (need_eta_h && use_cache) {
           eta_h = 0.5 * (eta_pack(b, NonidealEtaIdx::H, k - 1, j, i) +
                          eta_pack(b, NonidealEtaIdx::H, k, j, i));
-        } else if (eta_h_on) {
+        } else if (need_eta_h) {
           const Real rho = 0.5 * (prim(IDN, k - 1, j, i) + prim(IDN, k, j, i));
           const Real prs = 0.5 * (prim(IPR, k - 1, j, i) + prim(IPR, k, j, i));
           const int i_xe = hall_diff.XeIndex();
@@ -334,9 +376,12 @@ void HallDiffFluxIsoFixed(MeshData<Real> *md, const bool eta_h_on, const bool fl
                               : -1.0;
           eta_h = hall_diff.Get(bmag, rho, prs / rho, xe);
         }
+        const Real eta_floor_c =
+            (floor_ratio > 0.0) ? hall_diff.EffectiveOhmicFloor(eta_h) : eta_floor_abs;
 
         Real e1, e2, e3;
-        HallEMF(eta_h, eta_floor, bmag, j1, j2, j3, b1, b2, b3, e1, e2, e3);
+        HallEMF(eta_h_on ? eta_h : 0.0, eta_floor_c, bmag, j1, j2, j3, b1, b2, b3, e1, e2,
+                e3);
 
         if (!ct_induction) {
           cons.flux(X3DIR, IB1, k, j, i) += -e2;

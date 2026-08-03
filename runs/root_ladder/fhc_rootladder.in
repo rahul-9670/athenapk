@@ -1,0 +1,307 @@
+<comment>
+# 2026-07-31 ROOT-GRID CONVERGENCE LADDER (option "a", pre-collapse leg).
+# Byte-copy of runs/convergence_ladder/fhc_ladder.in (md5 65451669 = the flagship deck) with
+# exactly THREE changes, all marked "ROOTLADDER" below:
+#   (1) parthenon/mesh/refinement = none   -- uniform grid, so base resolution is the ONLY
+#       variable. Legitimate here because the 256^3 production run fires its first refinement
+#       at t=0.9994 (measured, njeans=8), i.e. AFTER this study's tlim.
+#   (2) tlim = 1.0                         -- the pre-collapse / magnetic-braking phase, which
+#       is 92% of the evolved time but only 6% of the wall cost, and which the njeans ladder
+#       holds at ONE resolution (all three of its legs run the identical 512-block root grid
+#       until t=0.91-1.05).
+#   (3) output1 dn=50 -> dt=0.05           -- cycle-based output gives non-matched times across
+#       resolutions; a convergence comparison needs snapshots at MATCHED PHYSICAL TIME.
+# nx1/nx2/nx3 are overridden on the command line (128 / 256 / 512); everything else -- physics,
+# units, IC, non-ideal terms, radiation, chemistry, dust, diagnostics -- is identical to the
+# flagship deck by construction.
+problem = FHC production ladder TIER 4 FRONTIER (AthenaPK): glmMHD + self-gravity + M1 RT
+# (dust) + ionization + gow17 chemistry (semi-implicit) + ALL THREE non-ideal MHD terms --
+# AMBIPOLAR (chem-coupled x_e, capped at equilibrium), OHMIC (equilibrium Wardle tensor),
+# and HALL (signed, equilibrium tensor). Hall is dispersive => UNSPLIT integrator only, with
+# an Ohmic floor (0.05) for cell-centered stability. Most complete physics; NO Athena++
+# counterpart (no Hall, no ionization model there). B0z=0.15.
+# 2026-07-21 prod_t5_smallbox: MATCHED BOX L=16 (was 52) + MULTIPOLE gravity BCs (WS-5a,
+# isolated exterior potential; replaces the padded zero-Dirichlet box) + binary v7
+# (audit fixes F1 EOS-T chemistry / F2 / F3 / flux-kernel named-pack hardening). Sinks OFF.
+# Fresh from t=0. Supersedes prod_t4_full (stopped at cycle 85500, kept restartable).
+
+<job>
+problem_id = collapse_be
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 1.0        # ROOTLADDER (2): pre-collapse stop; flagship value was 1.5
+nlim = -1
+ncycle_out = 1
+
+<parthenon/mesh>
+# ROOTLADDER (1): uniform grid. <refinement> type=jeans below is still parsed and its
+# njeans>0 REQUIRE still passes (hydro.cpp:1697-1702), but Parthenon never calls
+# CheckRefinementBlock when mesh/refinement=none, so the criterion is inert.
+refinement = none
+# L=16 box: dx_root = 16/256 = 0.0625 code = 117 AU (3.25x finer than the old L=52).
+# numlevel=20 => 19 levels above root, finest dx = 0.0625/2^19 = 1.2e-7 code = 0.048 Rsun,
+# comfortably below the 0.16 Rsun 2nd-core Truelove target (njeans=8) with headroom.
+# The matched box reaches each physical scale ~1.7 levels shallower than L=52 => fewer
+# envelope blocks. t1 showed too-few levels Truelove-violates the first core -> bounce.
+numlevel = 20
+# t1's OOM was AMR-churn buffer growth at STABLE block count, not resident memory:
+# damp refine/derefine flapping (default 10 consecutive tags).
+derefine_count = 50
+multigrid = true
+nx1 = 256
+x1min = -8.0
+x1max = 8.0
+# 2026-08-03 (B1): outflow -> diode. Parthenon's `outflow` is a plain zero-gradient ghost copy
+# with NO inflow suppression, so mass flowed IN through nominally-outflow faces. `diode` is the
+# standard fix: identical to outflow except the face-normal momentum in the ghost is zeroed when
+# it points inward. Measured on the production smoke deck: cons-Mout-solver (the APPLIED boundary
+# flux under vl2 -- cons-Mout is the wrong column, see WP-6) -1108.9 -> -524.5, a 53 % cut, with
+# the mass drift falling 0.828 % -> 0.392 % in exact proportion. It does NOT eliminate inflow:
+# zeroing the ghost momentum cannot stop a gravity-accelerated interior cell advecting ghost
+# density across the face. The complete fix is a boundary FACE-FLUX clamp after the Riemann solve
+# (B1-remainder + B6, to be done together).
+ix1_bc = diode
+ox1_bc = diode
+nx2 = 256
+x2min = -8.0
+x2max = 8.0
+ix2_bc = diode
+ox2_bc = diode
+nx3 = 256
+x3min = -8.0
+x3max = 8.0
+ix3_bc = diode
+ox3_bc = diode
+
+<parthenon/meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<hydro>
+fluid = glmmhd
+eos = hydrogen
+eos_table_file = /beegfs/u/bbg6470/athenapk/src/eos/eos_table_hires.bin
+gamma = 1.4
+riemann = hlld
+reconstruction = plm
+mag_diag = true  # item 2: J^2, current helicity, toroidal/poloidal ME, eta-weighted dissipation
+glmmhd_source = dedner_extended
+dfloor = 1.0e-6
+pfloor = 1.0e-8
+nscalars = 7   # 5 gow17 species + 2 WS-4 dust (f_dg, a_c) at scalar_index 5
+
+<refinement>
+type = jeans
+njeans = 8
+
+<diffusion>
+# 2026-07-10: mixed integrator (parabolic Ohm/AD via RKL2 STS; dispersive Hall EMF
+# unsplit at its whistler dt; Ohmic floor super-time-stepped too). Lifts the step off
+# the Ohmic-decoupling wall (dt 4.5e-9 -> whistler/cap); see DEV_LOG 2026-07-10.
+# 2026-07-12: rkl2_freeze_eta=true (eta cache refreshed per Strang half, not per RKL2
+# stage; 2.18x wsec_step, DEV_LOG 2026-07-11) and rkl2_max_dt_ratio 400 -> 1000 (cap
+# was pinned every cycle at level 12; whistler binds near 1000; sweep net +31%).
+# 2026-07-12 night: eta_ohm_cap_code=0.1 (PHYSICS, user signed off) caps the ionization
+# eta_O in the diffusion-decoupled first-core interior; probe 2344652 at cycle 73000:
+# STS ratio unpins (1000 -> ~50), dt 2.5e-8 -> 6.8e-8, wsec_step 34.1 -> 15.1 s (6.1x).
+# 2026-07-16: binary athenaPK_eos_v6 (STS named-pack fix: rkl2 was zeroing rad.Er/Fr
+# outputs + grav.phi initial guess since cycle 71000; gas bit-identical, DEV_LOG
+# 2026-07-15) + eta_hall_cap_code feature available (key NOT set here yet — value
+# pends the hallcap probe + sign-off; when set, mirror submit.sh).
+# Mirrors the CLI overrides in submit.sh.
+integrator = rkl2
+hall_floor_integrator = rkl2
+rkl2_max_dt_ratio = 1000
+rkl2_freeze_eta = true
+eta_ohm_cap_code = 0.1
+cfl = 0.3
+ambipolar = ambipolar
+ambipolar_coeff = ionization_chem
+ambipolar_coeff_code = 0.0
+xe_scalar_index = 4
+resistivity = ohmic
+resistivity_coeff = ionization
+# --- flagship audit items 1 + 5 (2026-07-30) ---
+cap_diag = true       # item 1: report how much volume/mass sits ON the eta caps
+dust_coupling = true  # item 5: evolved (f_dg,a_c) rescale the ionization grain bins
+hall = hall
+hall_coeff = ionization
+hall_ohmic_floor_code = 0.05
+# 2026-08-03 (B11 / WP-16 part 3): the line above is an ABSOLUTE stabilizer applied regardless of
+# the local eta_H, and 3D Hall AMPLIFIES rather than damps once eta_floor/|eta_H| drops below
+# ~0.11 (measured: at 128^3 the analytic eigenmode grows 2.65e5, at 256^3 it crashes). The line
+# below makes the applied stabilizer per-cell max(0.05, 0.2*|eta_H|), so it tracks the term it
+# stabilizes. 0.2 sits ~2x above the measured onset; larger costs Hall fidelity (omega error
+# 6.6e-3 at 0.125 -> 4.7e-2 at 1.0).
+# BYTE-IDENTICAL TODAY, deliberately: max|eta_H| = 4.3e-2 over 78.7M cells of prod_v9, so
+# 0.2*|eta_H| <= 8.6e-3 < 0.05 and max() picks the absolute floor in EVERY cell. Gated on GPU
+# through both the unsplit and mixed-RKL2 paths (job 2450087). What it buys is that the run is
+# stable BY CONSTRUCTION at any density it subsequently reaches, not by the accident that
+# |eta_H| happens to sit below 0.05 today.
+# NOTE: a RESTARTED run takes parameters from the rhdf + CLI, not from this file -- mirror this
+# key in submit_root.sh's override list before restarting an existing chain.
+hall_ohmic_floor_ratio = 0.2
+# Audit fix #1: unify the cosmic-ray ionization rate across chemistry (x_e -> AD) and the
+# equilibrium ionization model (Ohm/Hall). Must equal <chemistry> zeta_cr_cgs or the code
+# hard-fails at init. 1e-16 = the gow17/AD value (was silently 1e-17 here, 1e-16 in chem).
+ion_zeta = 1.0e-16
+
+<physics>
+self_gravity = true
+radiation = true
+chemistry = true
+dust = true      # WS-4 grain growth/sublimation (feeds RT opacity AND, below, conductivity)
+
+<chemistry>
+network = gow17_reduced
+zeta_cr_cgs = 1.0e-16   # audit #1: single CR-rate source of truth (== <diffusion> ion_zeta)
+# 2026-08-03 (B10 / WP-10): 400 -> 4000. `nsub_max` is NOT a truncation cap, it is a MINIMUM
+# SUB-STEP FLOOR (dt_floor = dt/nsub_max, network_gow17_reduced.hpp:159): when the accuracy
+# criterion asks for a smaller step the integrator takes the larger one anyway. At 400 that
+# floor bound in **100 % of cells** on this exact deck (measured: 2097152 of 2097152 at 128^3),
+# i.e. `cfl_cool` below was INERT -- it had no effect on the answer at all.
+#
+# Measured on the production config, three legs BACK TO BACK on the same 2 GPUs (job 2450198):
+#   nsub_max     wall      cells still floored     max |rel diff| vs 400
+#      400       278 s          2097152 (100 %)          --
+#     4000       280 s            39977 (1.9 %)          2.06e-05  (in mag-dissA)
+#    40000       279 s              267 (0.013 %)        2.06e-05  (BYTE-IDENTICAL to 4000)
+# So: the cost is ZERO (0.8 % spread is noise, and the raised legs were marginally faster), the
+# result is CONVERGED at 4000 (40000 adds literally nothing), and fixing it moves the answer by
+# 2e-5 -- which also retro-certifies that the earlier flux-retention numbers were not
+# compromised by running with an inert cfl_cool.
+#
+# 40000 was not chosen over 4000 only because it buys nothing; 4000 is the converged value.
+nsub_max = 4000
+cfl_cool = 0.1
+
+<radiation>
+closure = M1
+mu = 2.33
+rho_unit_cgs = 5.467e-19
+v_unit_cgs = 1.9e4
+length_unit_cgs = 2.81e16
+creduc = 1000.0
+opacity_model = tabulated
+dust_kappa0_cgs = 2.0e-4
+dust_Tmax_K = 1.5e3
+matter_coupling = true
+n_group = 3
+opacity_table_file = /beegfs/u/bbg6470/athenapk/src/radiation/opacity_table.bin
+opacity_nu_break_hz = 1.0e14
+opacity_T_sub_lo_K = 1400.0
+opacity_T_sub_hi_K = 1600.0
+cfl = 0.4
+efloor = 1.0e-15
+tfloor_code = 1.0e-3
+
+<self_gravity>
+units_override = true
+four_pi_G = 1.0
+use_swindle = false
+# MULTIPOLE (isolated) gravity BCs — WS-5a validated (0.54% analytic error; matched box
+# collapses freely vs the old zero-Dirichlet freeze). packed_bc applies BCs per-MeshData.
+packed_bc = true
+ix1_bc = multipole
+ox1_bc = multipole
+ix2_bc = multipole
+ox2_bc = multipole
+ix3_bc = multipole
+ox3_bc = multipole
+
+<self_gravity/solver_params>
+solver = BiCGSTAB
+max_iterations = 200
+residual_tolerance = 1.0e-6
+# 2026-08-03 (B3): switch the convergence test from ABSOLUTE to RELATIVE. Note these are
+# MUTUALLY EXCLUSIVE in Parthenon (bicgstab_solver.hpp:56-66 zeroes whichever is unselected;
+# the accept test at :411 is an OR, so there is no way to demand both) -- with this true, the
+# criterion becomes rms_res < 1e-6 * rms(rhs).
+#
+# WHY. Measured on a static uniform sphere with the source scanned over TEN decades
+# (docs/validation/B3_gravity_tolerance.md): the relative rule holds a constant fractional
+# accuracy res/rms(rhs) = 4.4257e-14 to five figures at every scale, while the absolute rule's
+# fractional accuracy wanders over eight decades (4.4e-11 at rho=1 -> 3.1e-19 at rho=1e10)
+# purely as an artifact of what "1e-6" means at a given density. phi's GRADIENT drives the
+# collapse, so a fractional demand is the one that means the same thing at every depth.
+# The absolute rule does NOT fail to converge (grav-nonconv = 0 in all 18 legs) -- but its
+# measured margin at production-like AMR depth is grav-res = 9.98e-7, i.e. 99.8 % of the
+# ceiling, with no headroom for a deeper run than has already been done.
+# Cost: 4.92 -> 7.50 mean BiCGSTAB iterations on the smoke deck, against max_iterations = 200.
+# Result shift: 1.8e-5 relative -- four decades below WP-18's sigma ~ 16 %.
+relative_residual = true
+do_FAS = true
+max_coarsenings = 20
+smoother = SRJ1
+presmoother = SRJ1
+postsmoother = SRJ1
+preconditioner = Multigrid
+
+<problem/collapse_be>
+mass = 6.0
+temperature = 10.0
+f = 5.0
+rhocrit = 1.0e-13
+amp = 0.0
+omegatff = 0.02
+B0z = 0.15
+turb_mach = 0.5
+# 2026-07-31 WP-20: the turbulence IC was corrected. REQUIRES a binary with turb_ksample
+# (post-5ebddce0); on an older binary the key is silently ignored and you get the OLD IC.
+#
+# turb_ksample=k2 draws |k| so that dN/dk ~ k^2, i.e. uniformly over the 3D k-space VOLUME,
+# which is what a real periodic box contains. Under that sampler turb_alpha IS the 3D PSD
+# slope, so 3.667 = 11/3 finally means what it always claimed: E(k) ~ k^2 * k^-11/3 =
+# k^-5/3, Kolmogorov. Under the previous "flat" sampler the SAME 3.667 gave E(k) ~ k^-11/3
+# -- 84.6% of the energy in k=1-2 and the k=8 mode at 1/45 of k=1, i.e. a large-scale
+# distortion, not a cascade.
+turb_alpha = 3.667
+turb_ksample = k2
+turb_seed = 42
+turb_kmin = 1
+turb_kmax = 8
+# 128 was tuned for the flat sampler. Correct k^2 weighting puts only ~1.8 of 128 modes below
+# k=2 while those modes carry ~49% of the energy => realization scatter DOUBLES (23.3% vs
+# 11.7%, measured by MC on vrms_analytic). 2048 matches the 2108 integer lattice modes a real
+# box actually holds in 1<=|k|<=8 -- one sampled mode per real mode, the natural saturation
+# point -- and gives ~28 modes at k<=2 against the lattice's ~34. Scatter falls to 6.0%.
+# Cost is one-off IC generation only: measured ~3 min at 256^3, ~26 min at 512^3 on 8 ranks.
+turb_nmodes = 2048
+# Natural mixing for an isotropic 3D vector field: 2 transverse + 1 longitudinal polarization
+# => solenoidal energy fraction 2/3. turb_zeta IS the solenoidal fraction (w_sol=sqrt(zeta),
+# w_comp=sqrt(1-zeta), collapse_be.cpp:390-393). The old 0.5 was more compressive than
+# natural, which biases toward prompt collapse.
+turb_zeta = 0.6667
+turb_region = sphere
+
+<parthenon/output0>
+file_type = hst
+dt = 0.005
+
+<parthenon/output1>
+file_type = hdf5
+# ROOTLADDER (3): time-based, so the three resolutions are comparable snapshot-for-snapshot.
+dt = 0.05
+variables = prim, grav.phi, rad.Er, rad.Er_g1, rad.Er_g2, rad.Fr1, rad.Fr2, rad.Fr3
+single_precision_output = 1
+hdf5_compression_level = 0
+
+<parthenon/output2>
+file_type = rst
+# 2026-07-12 night: 500 -> 250 (restart every ~1h at post-cap speed; CLI-mirrored in
+# submit.sh because restarted runs take parameters from the rhdf + CLI, not this file).
+dn = 250
+
+<dust>
+# WS-4 dust. scalar_index=5 puts (f_dg, a_c) past the 5 gow17 species (F3 guard requires it).
+# The collapse_be pgen seeds f_dg=f_dg_ref and a_c=a_ref_cm (fix 2026-07-30); before that fix
+# these scalars were identically ZERO, which made DustFactor=0 => zero dust opacity in the RT
+# and a silent no-op in the conductivity coupling.
+evolve = true
+scalar_index = 5
+a_ref_cm = 1.0e-5
+f_dg_ref = 0.01
+T_subl_K = 1.5e3

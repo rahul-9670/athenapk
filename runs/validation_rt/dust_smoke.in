@@ -1,0 +1,82 @@
+<comment>
+problem = WS-4 inc2 smoke: dust package runtime. Uniform dense gas, dust evolve on, 2 scalars
+# (f_dg, a_c). Confirms the package runs in-code without crash and a_c grows from a_floor.
+
+<job>
+problem_id = rad_pulse
+
+<problem/rad_pulse>
+rho0  = 100.0
+p0    = 40.0
+E0    = 1.0e-10
+Eamp  = 0.0
+reduced_flux = 0.0
+
+<parthenon/mesh>
+refinement = none
+nx1 = 8
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 8
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 8
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 20.0
+nlim = 200
+ncycle_out = 50
+
+<hydro>
+fluid = euler
+eos = adiabatic
+gamma = 1.6666667
+riemann = hllc
+reconstruction = plm
+dfloor = 1.0e-10
+pfloor = 1.0e-14
+nscalars = 2
+
+<physics>
+self_gravity = false
+radiation = true
+dust = true
+
+<radiation>
+closure = M1
+mu = 2.33
+rho_unit_cgs = 5.467e-19
+v_unit_cgs = 1.9e4
+length_unit_cgs = 2.81e16
+creduc = 1.0e5
+opacity_model = constant
+kappa_a_code = 0.0
+matter_coupling = false
+efloor = 1.0e-20
+
+<dust>
+evolve = true
+scalar_index = 0
+alpha_turb = 1.0e-2
+omega_ref_cgs = 1.0e-11
+a_ref_cm = 1.0e-5
+
+<parthenon/output0>
+file_type = hdf5
+dt = 5.0
+variables = prim

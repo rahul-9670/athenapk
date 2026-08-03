@@ -24,6 +24,19 @@ if [ ! -f "$BIN" ]; then
   echo "freeze.sh: no binary at $BIN -- nothing to freeze (build probably failed)"; exit 0
 fi
 
+# GIT MUST BE ON PATH, and it is NOT there by default on this cluster -- `git` lives in the
+# pkgsrc bin that ~/athenapk_env.sh adds (or `module load git/2.48.1`). Every git call below
+# redirects stderr to /dev/null, so without this check a git-less shell writes SIX EMPTY FILES
+# and the archive looks complete while carrying no source state at all. That is exactly the
+# failure the whole freeze mechanism exists to prevent, and it happened to binary f181c0a1
+# (2026-08-03) when freeze.sh was run by hand from a shell that had not sourced the env.
+if ! command -v git >/dev/null 2>&1; then
+  echo "freeze.sh: **GIT NOT ON PATH** -- refusing to write an archive with empty git state."
+  echo "freeze.sh: run 'source ~/athenapk_env.sh' (or 'module load git/2.48.1') and retry:"
+  echo "freeze.sh:   bash $REPO/docs/provenance/freeze.sh $BUILD"
+  exit 0
+fi
+
 MD5=$(md5sum "$BIN" | awk '{print $1}')
 SHORT=${MD5:0:8}
 A=$REPO/docs/provenance/binary_$SHORT

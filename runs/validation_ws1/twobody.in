@@ -1,0 +1,86 @@
+<comment>
+problem = WS-1 increment 3: two-sink circular orbit (N-body only, no gas forces).
+# G=1 (four_pi_G=4pi), m1=m2=1, separation d=2 -> omega=sqrt(G Mtot/d^3)=0.5, T=4pi=12.566,
+# each orbits COM at radius 1 with speed v=0.5. soft_sink=0 (Kepler). Gate: energy drift
+# < 1e-6 per orbit over 100 orbits (symplectic leapfrog). Gas is uniform, at rest, inert
+# (gas_gravity=false so gas and sinks do not interact).
+
+<job>
+problem_id = poisson_test
+
+<problem/poisson_test>
+radius   = 1.0e6
+rho_in   = 1.0
+rho_out  = 1.0
+pressure = 0.02
+
+<parthenon/mesh>
+# Coarse gas grid: the N-body sink accuracy is grid-independent (subcycled leapfrog); the
+# gas only sets the outer dt and provides blocks for sink migration (boundary at x=0).
+refinement = none
+nx1 = 16
+x1min = -4.0
+x1max =  4.0
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 16
+x2min = -4.0
+x2max =  4.0
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 16
+x3min = -4.0
+x3max =  4.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<parthenon/meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<parthenon/time>
+integrator = vl2
+cfl        = 0.3
+tlim       = 1256.6370614359172
+nlim       = -1
+
+<hydro>
+fluid          = euler
+eos            = adiabatic
+gamma          = 1.4
+riemann        = hllc
+reconstruction = plm
+
+<physics>
+self_gravity = false
+
+<sinks>
+enabled      = true
+four_pi_G    = 12.566370614359172
+gas_gravity  = false
+sink_gravity = true
+soft_sink    = 0.0
+subcycle_cfl = 0.02
+nseed        = 2
+seed0_x = 1.0
+seed0_y = 0.0
+seed0_z = 0.0
+seed0_vx = 0.0
+seed0_vy = 0.5
+seed0_vz = 0.0
+seed0_mass = 1.0
+seed1_x = -1.0
+seed1_y = 0.0
+seed1_z = 0.0
+seed1_vx = 0.0
+seed1_vy = -0.5
+seed1_vz = 0.0
+seed1_mass = 1.0
+
+<parthenon/output0>
+file_type = hdf5
+dt        = 12.566370614359172
+variables = prim
+swarms    = sinks
+sinks_variables = mass, vx, vy, vz

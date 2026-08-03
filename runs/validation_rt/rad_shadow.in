@@ -1,0 +1,90 @@
+<comment>
+problem = M1 transport benchmark #2: 2D shadow test. A steady free-streaming beam is injected
+# from the -x boundary into a thin static medium containing a dense circular SCATTERING clump
+# (kappa_s only, kappa_a=0 => no thermal re-emission to pollute the shadow). tau_clump =
+# kappa_s*rho_clump*2r ~ 200 (opaque), tau_bg = kappa_s*rho_bg*L ~ 0.1 (thin). The M1 closure
+# must cast a shadow behind the clump (Er directly behind << Er on the illuminated flanks).
+# A single beam + single obstacle is the regime where M1 behaves well; the known M1 failure
+# (two crossing beams merging) is NOT exercised here.
+
+<job>
+problem_id = rad_shadow
+
+<problem/rad_shadow>
+E_beam       = 1.0
+rho_bg       = 1.0
+p_bg         = 1.0
+rho_clump    = 1.0e4
+xc           = -0.1
+yc           = 0.0
+r_clump      = 0.1
+steepness    = 40.0
+E_floor_init = 1.0e-6
+
+<parthenon/mesh>
+refinement = none
+nghost = 2
+nx1 = 200
+x1min = -0.5
+x1max =  0.5
+ix1_bc = rad_shadow_beam_x1
+ox1_bc = outflow
+nx2 = 120
+x2min = -0.3
+x2max =  0.3
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 1
+x3min = -0.5
+x3max =  0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 200
+nx2 = 120
+nx3 = 1
+
+<parthenon/time>
+integrator = vl2
+cfl        = 0.3
+tlim       = 0.6
+nlim       = 2000000
+ncycle_out = 500
+
+<hydro>
+fluid          = euler
+eos            = adiabatic
+gamma          = 1.6666667
+riemann        = hllc
+reconstruction = plm
+dfloor         = 1.0e-10
+pfloor         = 1.0e-12
+
+<physics>
+self_gravity = false
+radiation = true
+
+<radiation>
+closure = M1
+reconstruction = plm
+mu = 2.33
+rho_unit_cgs = 5.467e-19
+v_unit_cgs = 1.9e4
+length_unit_cgs = 2.81e16
+creduc = 2.0e5
+opacity_model = constant
+kappa_a_code = 0.0
+kappa_s_code = 0.1
+matter_coupling = true
+cfl = 0.3
+efloor = 1.0e-30
+
+<parthenon/output0>
+file_type = hdf5
+dt        = 0.05
+variables = prim, rad.Er, rad.Fr1, rad.Fr2
+
+<parthenon/output1>
+file_type = hst
+dt        = 1000

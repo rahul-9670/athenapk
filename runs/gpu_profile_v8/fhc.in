@@ -1,0 +1,190 @@
+<comment>
+problem = FHC production ladder TIER 4 FRONTIER (AthenaPK): glmMHD + self-gravity + M1 RT
+# (dust) + ionization + gow17 chemistry (semi-implicit) + ALL THREE non-ideal MHD terms --
+# AMBIPOLAR (chem-coupled x_e, capped at equilibrium), OHMIC (equilibrium Wardle tensor),
+# and HALL (signed, equilibrium tensor). Hall is dispersive => UNSPLIT integrator only, with
+# an Ohmic floor (0.05) for cell-centered stability. Most complete physics; NO Athena++
+# counterpart (no Hall, no ionization model there). B0z=0.15.
+# 2026-07-21 prod_t5_smallbox: MATCHED BOX L=16 (was 52) + MULTIPOLE gravity BCs (WS-5a,
+# isolated exterior potential; replaces the padded zero-Dirichlet box) + binary v7
+# (audit fixes F1 EOS-T chemistry / F2 / F3 / flux-kernel named-pack hardening). Sinks OFF.
+# Fresh from t=0. Supersedes prod_t4_full (stopped at cycle 85500, kept restartable).
+
+<job>
+problem_id = collapse_be
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 1.5
+nlim = -1
+ncycle_out = 1
+
+<parthenon/mesh>
+refinement = adaptive
+# L=16 box: dx_root = 16/256 = 0.0625 code = 117 AU (3.25x finer than the old L=52).
+# numlevel=20 => 19 levels above root, finest dx = 0.0625/2^19 = 1.2e-7 code = 0.048 Rsun,
+# comfortably below the 0.16 Rsun 2nd-core Truelove target (njeans=8) with headroom.
+# The matched box reaches each physical scale ~1.7 levels shallower than L=52 => fewer
+# envelope blocks. t1 showed too-few levels Truelove-violates the first core -> bounce.
+numlevel = 20
+# t1's OOM was AMR-churn buffer growth at STABLE block count, not resident memory:
+# damp refine/derefine flapping (default 10 consecutive tags).
+derefine_count = 50
+multigrid = true
+nx1 = 256
+x1min = -8.0
+x1max = 8.0
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 256
+x2min = -8.0
+x2max = 8.0
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 256
+x3min = -8.0
+x3max = 8.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<parthenon/meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<hydro>
+fluid = glmmhd
+eos = hydrogen
+eos_table_file = /beegfs/u/bbg6470/athenapk/src/eos/eos_table.bin
+gamma = 1.4
+riemann = hlld
+reconstruction = plm
+glmmhd_source = dedner_extended
+dfloor = 1.0e-6
+pfloor = 1.0e-8
+nscalars = 5
+
+<refinement>
+type = jeans
+njeans = 8
+
+<diffusion>
+# 2026-07-10: mixed integrator (parabolic Ohm/AD via RKL2 STS; dispersive Hall EMF
+# unsplit at its whistler dt; Ohmic floor super-time-stepped too). Lifts the step off
+# the Ohmic-decoupling wall (dt 4.5e-9 -> whistler/cap); see DEV_LOG 2026-07-10.
+# 2026-07-12: rkl2_freeze_eta=true (eta cache refreshed per Strang half, not per RKL2
+# stage; 2.18x wsec_step, DEV_LOG 2026-07-11) and rkl2_max_dt_ratio 400 -> 1000 (cap
+# was pinned every cycle at level 12; whistler binds near 1000; sweep net +31%).
+# 2026-07-12 night: eta_ohm_cap_code=0.1 (PHYSICS, user signed off) caps the ionization
+# eta_O in the diffusion-decoupled first-core interior; probe 2344652 at cycle 73000:
+# STS ratio unpins (1000 -> ~50), dt 2.5e-8 -> 6.8e-8, wsec_step 34.1 -> 15.1 s (6.1x).
+# 2026-07-16: binary athenaPK_eos_v6 (STS named-pack fix: rkl2 was zeroing rad.Er/Fr
+# outputs + grav.phi initial guess since cycle 71000; gas bit-identical, DEV_LOG
+# 2026-07-15) + eta_hall_cap_code feature available (key NOT set here yet — value
+# pends the hallcap probe + sign-off; when set, mirror submit.sh).
+# Mirrors the CLI overrides in submit.sh.
+integrator = rkl2
+hall_floor_integrator = rkl2
+rkl2_max_dt_ratio = 1000
+rkl2_freeze_eta = true
+eta_ohm_cap_code = 0.1
+cfl = 0.3
+ambipolar = ambipolar
+ambipolar_coeff = ionization_chem
+ambipolar_coeff_code = 0.0
+xe_scalar_index = 4
+resistivity = ohmic
+resistivity_coeff = ionization
+hall = hall
+hall_coeff = ionization
+hall_ohmic_floor_code = 0.05
+# Audit fix #1: unify the cosmic-ray ionization rate across chemistry (x_e -> AD) and the
+# equilibrium ionization model (Ohm/Hall). Must equal <chemistry> zeta_cr_cgs or the code
+# hard-fails at init. 1e-16 = the gow17/AD value (was silently 1e-17 here, 1e-16 in chem).
+ion_zeta = 1.0e-16
+
+<physics>
+self_gravity = true
+radiation = true
+chemistry = true
+
+<chemistry>
+network = gow17_reduced
+zeta_cr_cgs = 1.0e-16   # audit #1: single CR-rate source of truth (== <diffusion> ion_zeta)
+nsub_max = 400
+cfl_cool = 0.1
+
+<radiation>
+closure = M1
+mu = 2.33
+rho_unit_cgs = 5.467e-19
+v_unit_cgs = 1.9e4
+length_unit_cgs = 2.81e16
+creduc = 1000.0
+opacity_model = belllin
+dust_kappa0_cgs = 2.0e-4
+dust_Tmax_K = 1.5e3
+matter_coupling = true
+cfl = 0.4
+efloor = 1.0e-15
+tfloor_code = 1.0e-3
+
+<self_gravity>
+units_override = true
+four_pi_G = 1.0
+use_swindle = false
+# MULTIPOLE (isolated) gravity BCs — WS-5a validated (0.54% analytic error; matched box
+# collapses freely vs the old zero-Dirichlet freeze). packed_bc applies BCs per-MeshData.
+packed_bc = true
+ix1_bc = multipole
+ox1_bc = multipole
+ix2_bc = multipole
+ox2_bc = multipole
+ix3_bc = multipole
+ox3_bc = multipole
+
+<self_gravity/solver_params>
+solver = BiCGSTAB
+max_iterations = 200
+residual_tolerance = 1.0e-6
+do_FAS = true
+max_coarsenings = 20
+smoother = SRJ1
+presmoother = SRJ1
+postsmoother = SRJ1
+preconditioner = Multigrid
+
+<problem/collapse_be>
+mass = 6.0
+temperature = 10.0
+f = 5.0
+rhocrit = 1.0e-13
+amp = 0.0
+omegatff = 0.02
+B0z = 0.15
+turb_mach = 0.5
+turb_alpha = 3.667
+turb_seed = 42
+turb_kmin = 1
+turb_kmax = 8
+turb_nmodes = 128
+turb_zeta = 0.5
+turb_region = sphere
+
+<parthenon/output0>
+file_type = hst
+dt = 0.005
+
+<parthenon/output1>
+file_type = hdf5
+dn = 50
+variables = prim, grav.phi, rad.Er, rad.Fr1, rad.Fr2, rad.Fr3
+single_precision_output = 1
+hdf5_compression_level = 0
+
+<parthenon/output2>
+file_type = rst
+# 2026-07-12 night: 500 -> 250 (restart every ~1h at post-cap speed; CLI-mirrored in
+# submit.sh because restarted runs take parameters from the rhdf + CLI, not this file).
+dn = 250

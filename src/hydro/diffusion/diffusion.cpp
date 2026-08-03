@@ -122,6 +122,10 @@ Real EstimateNonidealTimestepIonizationFused(MeshData<Real> *md) {
   // constraint summed with eta_O.
   const Real eta_floor_hall =
       have_hall ? hydro_pkg->Param<HallDiffusivity>("hall_diff").GetOhmicFloor() : 0.0;
+  // B11: the Hall Ohmic stabilizer may be a per-cell RATIO of |eta_H| rather than a
+  // constant, in which case the parabolic constraint it imposes is also per-cell.
+  const Real hall_floor_ratio =
+      have_hall ? hydro_pkg->Param<HallDiffusivity>("hall_diff").GetOhmicFloorRatio() : 0.0;
 
   // Fused per-cell evaluator (shared ionization model + coefficient-family flags); the
   // caller's "nonideal_dt_fused" gate guarantees the mix is fusable.
@@ -169,7 +173,11 @@ Real EstimateNonidealTimestepIonizationFused(MeshData<Real> *md) {
         // Total Ohmic-like diffusivity: the Ohmic term (if active) plus Hall's Ohmic
         // floor -- the flux kernels apply them additively, so the stability limit is
         // set by their sum.
-        const Real eta_O_tot = (have_ohm ? eta_O : 0.0) + eta_floor_hall;
+        const Real eta_floor_c =
+            (hall_floor_ratio > 0.0)
+                ? fmax(eta_floor_hall, hall_floor_ratio * std::abs(eta_H))
+                : eta_floor_hall;
+        const Real eta_O_tot = (have_ohm ? eta_O : 0.0) + eta_floor_c;
         if (eta_O_tot > 0.0) {
           ldt = fmin(ldt, cfl_diff * fac_par * mindx2 / (eta_O_tot + TINY_NUMBER));
         }
@@ -223,6 +231,9 @@ void EstimateNonidealTimestepIonizationFusedMixed(MeshData<Real> *md,
   // parabolic Ohmic diffusivity in dt_par.
   const Real eta_floor_par = floor_strict ? 0.0 : eta_floor_hall;
   const Real eta_floor_strict = floor_strict ? eta_floor_hall : 0.0;
+  // B11: per-cell floor (0 = the pre-B11 constant path, bit-identical).
+  const Real hall_floor_ratio =
+      have_hall ? hydro_pkg->Param<HallDiffusivity>("hall_diff").GetOhmicFloorRatio() : 0.0;
 
   // Fused per-cell evaluator (shared ionization model + coefficient-family flags); the
   // caller's "nonideal_dt_fused" gate guarantees the mix is fusable.
@@ -276,9 +287,13 @@ void EstimateNonidealTimestepIonizationFusedMixed(MeshData<Real> *md,
         if (have_ohm) {
           ldt_par = fmin(ldt_par, cfl_diff * fac_par * mindx2 / (eta_O + TINY_NUMBER));
         }
-        if (eta_floor_par > 0.0) {
+        const Real eta_floor_par_c =
+            (hall_floor_ratio > 0.0 && !floor_strict)
+                ? fmax(eta_floor_par, hall_floor_ratio * std::abs(eta_H))
+                : eta_floor_par;
+        if (eta_floor_par_c > 0.0) {
           ldt_par =
-              fmin(ldt_par, cfl_diff * fac_par * mindx2 / (eta_floor_par + TINY_NUMBER));
+              fmin(ldt_par, cfl_diff * fac_par * mindx2 / (eta_floor_par_c + TINY_NUMBER));
         }
         if (have_ad) {
           ldt_par = fmin(ldt_par, cfl_diff * fac_par * mindx2 / (eta_A + TINY_NUMBER));
@@ -287,9 +302,13 @@ void EstimateNonidealTimestepIonizationFusedMixed(MeshData<Real> *md,
           ldt_strict =
               fmin(ldt_strict, cfl_diff * fac_hall * mindx2 / (std::abs(eta_H) + TINY_NUMBER));
         }
-        if (eta_floor_strict > 0.0) {
-          ldt_strict =
-              fmin(ldt_strict, cfl_diff * fac_par * mindx2 / (eta_floor_strict + TINY_NUMBER));
+        const Real eta_floor_strict_c =
+            (hall_floor_ratio > 0.0 && floor_strict)
+                ? fmax(eta_floor_strict, hall_floor_ratio * std::abs(eta_H))
+                : eta_floor_strict;
+        if (eta_floor_strict_c > 0.0) {
+          ldt_strict = fmin(ldt_strict,
+                            cfl_diff * fac_par * mindx2 / (eta_floor_strict_c + TINY_NUMBER));
         }
       },
       Kokkos::Min<Real>(min_dt_par), Kokkos::Min<Real>(min_dt_strict));

@@ -113,9 +113,11 @@ CHEMT_FN double NetHeatCool(const ThermoParams &p, double n_H, double T, double 
 //! (numerical-Jacobian backward Euler): e_new = e + dt*R/(1 - dt*dR/de) with dR/de < 0 (the
 //! cooling self-stabilizes), so it is unconditionally stable and relaxes toward T_eq without
 //! overshoot. Sub-step is accuracy-limited (|de| <= cfl*e) and floored at dt/nsub_max so the
-//! full dt is always covered in <= nsub_max steps. Conversions: T_K = gm1*e/rho * T_unit;
+//! full dt is always covered in <= nsub_max steps -- which means the sub-step can be RAISED
+//! above what the accuracy criterion asked for. Conversions: T_K = gm1*e/rho * T_unit;
 //! rate_to_code converts Gamma-Lambda [erg cm^-3 s^-1] to code energy-density rate
-//! (= t_unit / (rho_unit*v_unit^2)). Returns new e_code; *ntrunc += 1 if nsub_max exhausted.
+//! (= t_unit / (rho_unit*v_unit^2)). Returns new e_code; *ntrunc += 1 if the cell's
+//! integration was accuracy-degraded (sub-step floored, or -- unreachable here -- truncated).
 CHEMT_FN double AdvanceThermoEnergy(const ThermoParams &p, double rho_code, double e_code,
                                     double n_H, double x_H, double x_Cp, double x_CO,
                                     double T_dust, double gm1, double T_unit,
@@ -125,6 +127,7 @@ CHEMT_FN double AdvanceThermoEnergy(const ThermoParams &p, double rho_code, doub
   const double dt_floor = dt_code / static_cast<double>(nsub_max);
   double t = 0.0;
   int nsub = 0;
+  int nfloored = 0;
   while (t < dt_code && nsub < nsub_max) {
     double T_K = gm1 * e / rho_code * T_unit;
     if (T_K < 1.0e-4) T_K = 1.0e-4;
@@ -144,14 +147,22 @@ CHEMT_FN double AdvanceThermoEnergy(const ThermoParams &p, double rho_code, doub
       const double dt_acc = cfl * e / absR;
       if (dt_acc < dt_sub) dt_sub = dt_acc;
     }
-    if (dt_sub < dt_floor) dt_sub = dt_floor;
+    if (dt_sub < dt_floor) {
+      dt_sub = dt_floor;
+      nfloored += 1; // accuracy criterion OVERRIDDEN by nsub_max -- report it (see *ntrunc)
+    }
     if (t + dt_sub > dt_code) dt_sub = dt_code - t;
     e += dt_sub * R / (1.0 - dt_sub * dRde);
     if (e < e_floor) e = e_floor;
     t += dt_sub;
     ++nsub;
   }
-  if (t < dt_code && ntrunc != nullptr) *ntrunc += 1;
+  // Report the cell as ACCURACY-DEGRADED if the sub-cycler failed to cover dt_code OR if any
+  // sub-step had to be raised to dt_floor. Only the second can actually happen -- the floor
+  // guarantees coverage -- so before this change the counter was structurally always zero and
+  // `nsub_max` could silently override `cfl_cool`. See network_gow17_reduced.hpp for the
+  // WP-10 measurement that exposed it.
+  if ((t < dt_code || nfloored > 0) && ntrunc != nullptr) *ntrunc += 1;
   return e;
 }
 

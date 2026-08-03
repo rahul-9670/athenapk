@@ -1,0 +1,22 @@
+ M docs/provenance/freeze.sh
+ M docs/validation/WP02_creduc_semantics.md
+ M docs/validation/WP14_order_of_accuracy.md
+ M src/chemistry/chemistry.cpp
+ M src/chemistry/network_gow17_reduced.hpp
+ M src/chemistry/thermo.hpp
+ M src/hydro/ct/ct.cpp
+ M src/hydro/diffusion/diffusion.cpp
+ M src/hydro/diffusion/diffusion.hpp
+ M src/hydro/diffusion/hall.cpp
+ M src/hydro/hydro.cpp
+?? docs/provenance/binary_6b1fe753/
+?? docs/provenance/binary_f181c0a1/
+?? docs/validation/B3_gravity_tolerance.md
+?? docs/validation/PRODUCTION_SWITCH_2026-08-03.md
+?? docs/validation/WP07_root_grid_ladder.md
+?? docs/validation/WP10_chemistry_integrator.md
+?? docs/validation/WP16_ambipolar_convergence.md
+?? docs/validation/WP16b_hall_3d_instability.md
+?? docs/validation/WP22_numerical_vs_physical_resistivity.md
+?? docs/validation/scripts/wp22_eta_applied.py
+?? docs/validation/scripts/wp22_eta_physical.py

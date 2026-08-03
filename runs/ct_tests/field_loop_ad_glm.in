@@ -1,0 +1,63 @@
+# Resistive field-loop -- CT increment-4 div(B) stress test. A static (vflow=0) 2D field
+# loop (B_x,B_y both vary in x,y) is diffused by ambipolar perp-current re-routed to the CT edge
+# EMF. Because div(curl E)=0 for ANY single-valued edge EMF (including eta*J), ct_maxAbsDivB
+# must stay at round-off while the loop's magnetic energy decays. Matched GLM run diffuses
+# the same loop but its cell-centered div B grows at truncation level.
+
+<job>
+problem_id = field_loop
+
+<problem/field_loop>
+rad        = 0.3
+amp        = 1.0e-3
+vflow      = 0.0
+iprob      = 1
+
+<parthenon/mesh>
+refinement = none
+nghost = 2
+nx1 = 128
+x1min = -1.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 64
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 64
+nx2 = 64
+nx3 = 1
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 2.0
+nlim = 2000
+ncycle_out = 200
+
+<hydro>
+fluid = glmmhd
+eos = adiabatic
+riemann = hlld
+reconstruction = plm
+gamma = 1.666666666666667
+divergence_control = glm
+
+<diffusion>
+integrator = unsplit
+ambipolar = ambipolar
+ambipolar_coeff = fixed
+ambipolar_coeff_code = 2.0e4
+
+<parthenon/output1>
+file_type = hst
+dt = 0.05
