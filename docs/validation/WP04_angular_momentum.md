@@ -1,5 +1,29 @@
 # WP-4 — Angular-momentum diagnostic
 
+> **PRODUCTION-CONDITION DRIFT MEASURED 2026-08-04 (also closes B7's production leg).** From the
+> deep AMR run (job 2453201, 204 rows, t = 0 → 1.01503, blocks 64 → 792, diode BCs, B ≠ 0,
+> self-gravity + AMR on, `hydro/angmom_diag=true`):
+>
+> | axis | L(0) → L(end) | drift |
+> |---|---|---:|
+> | L_x | −1.6105e+02 → −1.5754e+02 | **+2.18 %** |
+> | L_y | +2.2290e+01 → +2.0107e+01 | **−9.79 %** |
+> | L_z | −1.1023e+02 → −1.0754e+02 | **+2.44 %** |
+>
+> **B7 context:** the previously quoted 11.7 / 10.0 / 7.9 % at 32/64/128 were from a *smoke* deck.
+> Under production conditions the drift is **2–10 %** over a full t_ff — same order, and better on
+> two of three axes. Angular momentum is still not conserved by Cartesian finite volume; this is
+> now quantified where it matters.
+>
+> **The budget does not close, but the sampling cannot settle it.** Integrating
+> −am-FT + am-Tgrav + am-Tmag over the history rows accounts for −1.13e-01 of L_x's actual
+> +3.51e+00 change, leaving >100 % unexplained (and the wrong sign). That is *consistent* with
+> B7 — but the history spacing is **1.78e-03**, far coarser than the timescale on which the
+> surface flux varies, so a trapezoid over these rows is not an adequate budget integral. The
+> honest claim is the **drift magnitudes above**; a closure statement would need per-cycle output.
+> (Note B6 separately established that on this deck |dL/dt| exceeds every accounted term by ~10⁴,
+> which is the same fact seen from the other side.)
+
 **Status: instrument IMPLEMENTED, gated, and validated three independent ways.
 Acceptance criterion in `VALIDATION_PLAN.md` CORRECTED (it was unachievable as written).
 Two findings that change how L must be reported. 2026-07-31.**

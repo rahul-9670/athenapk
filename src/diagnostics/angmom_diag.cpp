@@ -28,6 +28,15 @@ Real AngMomReduce(MeshData<Real> *md, AngMom which) {
 
   const bool is_flux = (which == AngMom::FLx || which == AngMom::FLy || which == AngMom::FLz);
   const bool is_tflux = (which == AngMom::FTx || which == AngMom::FTy || which == AngMom::FTz);
+  // B6: the stage-consistent variant reads the SOLVER's momentum fluxes instead of rebuilding
+  // the stress from end-of-step primitives.
+  const bool is_sflux = (which == AngMom::FTsolverX || which == AngMom::FTsolverY ||
+                         which == AngMom::FTsolverZ);
+  // Packed BY NAME, not by the {Independent} metadata flag: grav::phi is also
+  // Independent+WithFluxes, so a flag-based pack could put phi's flux at the flat IM1 index.
+  // Same trap cons_diag and SelfGravity::ApplyGravitySource both document.
+  auto cons_flx = md->PackVariablesAndFluxes(std::vector<std::string>{"cons"},
+                                             std::vector<std::string>{"cons"});
   const bool is_torque =
       (which == AngMom::TmagX || which == AngMom::TmagY || which == AngMom::TmagZ);
   const bool is_grav =
@@ -138,6 +147,41 @@ Real AngMomReduce(MeshData<Real> *md, AngMom which) {
           const bool want_hi =
               (which == AngMom::Lxhi || which == AngMom::Lyhi || which == AngMom::Lzhi);
           if (hi == want_hi) lsum += rho * l * dV;
+          return;
+        }
+
+        if (is_sflux) {
+          // B6 -- STAGE-CONSISTENT angular-momentum flux. cons.flux(dir, IM1+c) is the momentum
+          // flux the Riemann solver actually applied on that face; it already carries the
+          // pressure and Maxwell stress, so nothing is reconstructed here and the two cannot
+          // drift apart. Sign convention matches FT*: outward-positive, hence the minus on the
+          // lower faces (where the outward normal is -e_dir).
+          const auto &cfb = cons_flx(b);
+          auto face = [&](const int dir, const int kk, const int jj, const int ii,
+                          const Real sgn, const Real dA) {
+            const Real tx = cfb.flux(dir, IM1, kk, jj, ii);
+            const Real ty = cfb.flux(dir, IM2, kk, jj, ii);
+            const Real tz = cfb.flux(dir, IM3, kk, jj, ii);
+            Real t;
+            if (which == AngMom::FTsolverX) t = y * tz - z * ty;
+            else if (which == AngMom::FTsolverY) t = z * tx - x * tz;
+            else t = x * ty - y * tx;
+            return sgn * t * dA;
+          };
+          Real f = 0.0;
+          if (std::fabs(coords.Xf<1>(i) - xlo) < 1.0e-9 * dx)
+            f += face(X1DIR, k, j, i, -1.0, dV / dx);
+          if (std::fabs(coords.Xf<1>(i + 1) - xhi) < 1.0e-9 * dx)
+            f += face(X1DIR, k, j, i + 1, 1.0, dV / dx);
+          if (std::fabs(coords.Xf<2>(j) - ylo) < 1.0e-9 * dy)
+            f += face(X2DIR, k, j, i, -1.0, dV / dy);
+          if (std::fabs(coords.Xf<2>(j + 1) - yhi) < 1.0e-9 * dy)
+            f += face(X2DIR, k, j + 1, i, 1.0, dV / dy);
+          if (std::fabs(coords.Xf<3>(k) - zlo) < 1.0e-9 * dz)
+            f += face(X3DIR, k, j, i, -1.0, dV / dz);
+          if (std::fabs(coords.Xf<3>(k + 1) - zhi) < 1.0e-9 * dz)
+            f += face(X3DIR, k + 1, j, i, 1.0, dV / dz);
+          lsum += f;
           return;
         }
 

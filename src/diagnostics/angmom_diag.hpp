@@ -35,6 +35,12 @@
 //
 //     d/dt (am-Lx) = -am-FTx + am-Tgravx
 //
+// B6 (2026-08-03): under a MULTISTAGE integrator use am-FTsolver* instead of am-FT* to close
+// this budget. am-FT* is built from end-of-step primitives and is stage-inconsistent with the
+// applied flux by the same beta[nstages-1]/beta[nstages-2] factor WP-6 measured for mass
+// (2.0000 under vl2). am-FT* stays the physical surface integral; am-FTsolver* is the budget
+// term. See the enum comment on FTsolverX.
+//
 // The sign convention on the flux columns is OUTWARD-POSITIVE: am-FT* > 0 means angular
 // momentum is LEAVING the box, hence the minus sign above.
 //
@@ -130,6 +136,23 @@ enum class AngMom {
   FTx, // surf (r x (T.nhat))_x dA, outward-positive -- THE budget flux term
   FTy,
   FTz,
+  // ---- B6: STAGE-CONSISTENT surface flux, read from the SOLVER's flux array ---------------
+  // FT*/FL* above are built from END-OF-STEP primitives, so under a multistage integrator they
+  // sample u^{n+1} while the applied flux was computed from the state entering the LAST stage.
+  // WP-6 measured that mismatch exactly for mass: cons-Mout (primitives) and cons-Mout-solver
+  // (flux array) differ by beta[nstages-1]/beta[nstages-2] = 2.0000 under vl2, constant in time
+  // and to five digits. The same factor applies here, for the same reason.
+  //
+  // FTsolver* integrates r x (T.nhat) using the SOLVER's momentum fluxes on the domain faces:
+  //     (r x F_mom)_i  with  F_mom_j = cons.flux(dir, IM1+j)
+  // which already contains the pressure and Maxwell stress the Riemann solver applied -- no
+  // separate ptot/Maxwell reconstruction, and therefore no possibility of the two drifting
+  // apart. Under vl2 (production, gam0 = 0 on the final stage) this IS the applied flux and the
+  // angular-momentum budget closes with it; FT* remains the physical surface integral and the
+  // interpretive column.
+  FTsolverX,
+  FTsolverY,
+  FTsolverZ,
   TgravX, // int rho (r x (-grad Phi))_x dV
   TgravY,
   TgravZ,

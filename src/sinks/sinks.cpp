@@ -40,6 +40,9 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // Parthenon checkpoint/restore the swarm (positions + values) in the .rhdf restart.
   Metadata swarm_metadata({Metadata::Provides, Metadata::None, Metadata::Restart});
   pkg->AddSwarm(swarm_name, swarm_metadata);
+  // NB: .phdf dumps carry only the built-in {id,x,y,z} unless the output block asks for more --
+  // set `swarm_variables = mass,vx,vy,vz,Lx,Ly,Lz,t_created` there. There is no Metadata::Output
+  // flag for swarm values in this Parthenon; WP-17 lost its accretion-rate reader to this.
   Metadata real_value({Metadata::Real, Metadata::Restart});
   for (const auto &v : {"mass", "vx", "vy", "vz", "Lx", "Ly", "Lz", "t_created"}) {
     pkg->AddSwarmValue(v, swarm_name, real_value);

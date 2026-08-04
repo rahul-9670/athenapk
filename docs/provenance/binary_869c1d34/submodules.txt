@@ -1,0 +1,5 @@
+ 6739bc623081648af9e752b616d9671527922cbf external/Kokkos (4.7.02)
+ b1dcdc5032f09cab0a5834476d85e999bb608ce6 external/catch2 (v2.12.1-4-gb1dcdc50)
+ 264a5e48d4930381ba05df2adc1c9b050f61c323 external/parthenon (v25.12-195-g264a5e48d)
+ 216713a4066b79d9803d374f261ccb30c0fb451f external/parthenon/external/Catch2 (v2.13.8)
+ 3ec81abe1816109f6f62ac48cef41921f91a4d00 external/parthenon/external/Kokkos (5.1.0)

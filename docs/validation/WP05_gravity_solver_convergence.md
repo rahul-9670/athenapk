@@ -1,5 +1,24 @@
 # WP-5 — Gravity-solver convergence reporting
 
+> **PRODUCTION-DEPTH MEASUREMENT ADDED 2026-08-04 — PASS, CLEAN.** From the deep AMR run
+> (job 2453201, 204 history rows, t = 0 → 1.01503, blocks 64 → **792**, production deck verbatim
+> with diode BCs + relative residual, `self_gravity/solver_diag=true`):
+>
+> | quantity | value |
+> |---|---|
+> | `grav-nonconv` events | **0** over 202 real solves |
+> | `grav-iters` | min 8, median **9**, max **12** |
+> | `grav-res` | median 3.07e-08, max 7.02e-05 |
+> | iteration budget used | **6 %** (12 of the 200 cap) — 188 headroom |
+>
+> The multigrid solver is nowhere near its iteration limit at production depth, and never failed
+> to converge. This is the deep-hierarchy measurement the section below lists as outstanding;
+> B3's concern about the relative criterion does not bite here.
+>
+> *Two rows carry `grav-iters = -1` / `grav-res = -1.0` — the sentinel for "no solve this row"
+> (t = 0 and one restart row). They must be filtered; including them makes the reported minimum
+> nonsensical, which the first pass of this analysis did.*
+
 **Status: instrument IMPLEMENTED + gated; invariance sweep PASSED at smoke scale.
 Deep-leg measurement still open (GPU-blocked). 2026-07-31.**
 Source pair: `docs/provenance/binary_5ebddce0/` + the WP-5 diff (uncommitted, see below).

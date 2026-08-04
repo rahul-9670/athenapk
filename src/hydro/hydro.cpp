@@ -288,6 +288,75 @@ void ConsToPrim(MeshData<Real> *md) {
 // respective source in active.
 // Note 2: Directly update the "cons" variables based on the "prim" variables
 // as the "cons" variables have already been updated when this function is called.
+//----------------------------------------------------------------------------------------
+//! B1-remainder: zero the inward part of the domain-boundary face fluxes. See hydro.hpp for
+//! the rationale and the scope limits (hydro + scalars only, magnetic fluxes untouched).
+TaskStatus ClampBoundaryFluxes(MeshData<Real> *md) {
+  auto pmb = md->GetBlockData(0)->GetBlockPointer();
+  auto hydro_pkg = pmb->packages.Get("Hydro");
+  auto *pm = pmb->pmy_mesh;
+
+  // Physical extent of the WHOLE mesh. A meshblock face coincides with it only on the domain
+  // boundary; interior block faces must not be touched (they are genuine internal fluxes).
+  // Same float-tolerance test cons_diag uses to identify surface cells.
+  const Real xlo = pm->mesh_size.xmin(X1DIR), xhi = pm->mesh_size.xmax(X1DIR);
+  const Real ylo = pm->mesh_size.xmin(X2DIR), yhi = pm->mesh_size.xmax(X2DIR);
+  const Real zlo = pm->mesh_size.xmin(X3DIR), zhi = pm->mesh_size.xmax(X3DIR);
+  const int ndim = pm->ndim;
+
+  const int nhydro = hydro_pkg->Param<int>("nhydro");
+  const int nscalars = hydro_pkg->Param<int>("nscalars");
+
+  // Packed BY NAME: grav::phi is also Independent+WithFluxes, so a metadata-flag pack could put
+  // phi's flux at the flat IDN index. Same trap cons_diag and SelfGravity::ApplyGravitySource
+  // both document.
+  auto cf = md->PackVariablesAndFluxes(std::vector<std::string>{"cons"},
+                                       std::vector<std::string>{"cons"});
+
+  IndexRange ib = md->GetBlockData(0)->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBlockData(0)->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBlockData(0)->GetBoundsK(IndexDomain::interior);
+
+  parthenon::par_for(
+      DEFAULT_LOOP_PATTERN, "ClampBoundaryFluxes", DevExecSpace(), 0, cf.GetDim(5) - 1, kb.s,
+      kb.e, jb.s, jb.e, ib.s, ib.e,
+      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+        auto &cfb = cf(b);
+        const auto &coords = cf.GetCoords(b);
+        const Real dx = coords.Dxc<1>(k, j, i);
+        const Real dy = (ndim > 1) ? coords.Dxc<2>(k, j, i) : 1.0;
+        const Real dz = (ndim > 2) ? coords.Dxc<3>(k, j, i) : 1.0;
+
+        // Zero every hydro+scalar component of one face's flux. `sign` is +1 when a POSITIVE
+        // flux points OUT of the domain (upper faces) and -1 on lower faces; the flux is
+        // cleared only when it points IN, so genuine outflow is never touched.
+        auto clamp = [&](const int dir, const int kk, const int jj, const int ii,
+                         const Real sign) {
+          const Real fm = cfb.flux(dir, IDN, kk, jj, ii);
+          if (sign * fm >= 0.0) return; // outflow (or exactly zero) -- leave it alone
+          cfb.flux(dir, IDN, kk, jj, ii) = 0.0;
+          cfb.flux(dir, IM1, kk, jj, ii) = 0.0;
+          cfb.flux(dir, IM2, kk, jj, ii) = 0.0;
+          cfb.flux(dir, IM3, kk, jj, ii) = 0.0;
+          cfb.flux(dir, IEN, kk, jj, ii) = 0.0;
+          for (int n = 0; n < nscalars; ++n)
+            cfb.flux(dir, nhydro + n, kk, jj, ii) = 0.0;
+        };
+
+        if (fabs(coords.Xf<1>(i) - xlo) < 1.0e-9 * dx) clamp(X1DIR, k, j, i, -1.0);
+        if (fabs(coords.Xf<1>(i + 1) - xhi) < 1.0e-9 * dx) clamp(X1DIR, k, j, i + 1, 1.0);
+        if (ndim > 1) {
+          if (fabs(coords.Xf<2>(j) - ylo) < 1.0e-9 * dy) clamp(X2DIR, k, j, i, -1.0);
+          if (fabs(coords.Xf<2>(j + 1) - yhi) < 1.0e-9 * dy) clamp(X2DIR, k, j + 1, i, 1.0);
+        }
+        if (ndim > 2) {
+          if (fabs(coords.Xf<3>(k) - zlo) < 1.0e-9 * dz) clamp(X3DIR, k, j, i, -1.0);
+          if (fabs(coords.Xf<3>(k + 1) - zhi) < 1.0e-9 * dz) clamp(X3DIR, k + 1, j, i, 1.0);
+        }
+      });
+  return TaskStatus::complete;
+}
+
 TaskStatus AddUnsplitSources(MeshData<Real> *md, const SimTime &tm, const Real beta_dt) {
   auto hydro_pkg = md->GetBlockData(0)->GetBlockPointer()->packages.Get("Hydro");
 
@@ -465,6 +534,18 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   }
   pkg->AddParam<>("fluid", fluid);
   pkg->AddParam<>("nhydro", nhydro);
+
+  // B1-remainder: opt-in clamp on the domain-boundary face fluxes (see ClampBoundaryFluxes).
+  // Default false => the task is never added to the driver and the OFF state is bit-identical.
+  const bool bflux_clamp = pin->GetOrAddBoolean("hydro", "boundary_flux_clamp", false);
+  pkg->AddParam<>("boundary_flux_clamp", bflux_clamp);
+  if (bflux_clamp && parthenon::Globals::my_rank == 0) {
+    std::cout << "## Boundary flux clamp ON (hydro/boundary_flux_clamp): inward mass/momentum/"
+                 "energy/scalar fluxes on the physical domain faces are zeroed after the "
+                 "Riemann solve. Magnetic fluxes are NOT clamped (that would inject div(B); "
+                 "see hydro.hpp). This is the B1 remainder the `diode` BC cannot reach."
+              << std::endl;
+  }
   pkg->AddParam<>("calc_c_h", calc_c_h);
 
   // Divergence control (Phase 2). "glm" = current GLM/Dedner path (default, bit-identical
@@ -1808,6 +1889,13 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     add_am(AngMom::FTx, "am-FTx");
     add_am(AngMom::FTy, "am-FTy");
     add_am(AngMom::FTz, "am-FTz");
+    // B6: stage-consistent counterparts, read from the solver's momentum-flux array rather than
+    // rebuilt from end-of-step primitives. Under a multistage integrator THESE are the budget
+    // terms; am-FT* above stay as the physical surface integral. WP-6 measured the mismatch for
+    // mass at exactly beta[nstages-1]/beta[nstages-2] = 2.0000 under vl2.
+    add_am(AngMom::FTsolverX, "am-FTsolverx");
+    add_am(AngMom::FTsolverY, "am-FTsolvery");
+    add_am(AngMom::FTsolverZ, "am-FTsolverz");
     // Advective part alone -- kept because it separates "L was carried off by outflowing
     // gas" from "L was removed by a surface stress", which are different physical claims.
     add_am(AngMom::FLx, "am-FLx");

@@ -1059,9 +1059,20 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     auto set_flx = tl.AddTask(recv_flx | first_order_flux_correct,
                               parthenon::SetFluxCorrections, mu0);
 
+    // B1-remainder: clamp inward domain-boundary fluxes. MUST sit after SetFluxCorrections (so
+    // the AMR flux-correction cannot reintroduce an inward flux the clamp already removed) and
+    // before the divergence (so the clamped values are what is actually applied). Applied only
+    // on the MAIN hydro update, not on the RKL2 M(Y0) evaluations upstream: those carry the
+    // parabolic fluxes, whose IDN component is identically zero, so clamping there would be a
+    // no-op that only added a kernel launch per stage.
+    auto flx_ready = set_flx;
+    if (hydro_pkg->Param<bool>("boundary_flux_clamp")) {
+      flx_ready = tl.AddTask(set_flx, Hydro::ClampBoundaryFluxes, mu0.get());
+    }
+
     // compute the divergence of fluxes of conserved variables
     auto update = tl.AddTask(
-        set_flx, parthenon::Update::UpdateWithFluxDivergence<MeshData<Real>>, mu0.get(),
+        flx_ready, parthenon::Update::UpdateWithFluxDivergence<MeshData<Real>>, mu0.get(),
         mu1.get(), integrator->gam0[stage - 1], integrator->gam1[stage - 1],
         integrator->beta[stage - 1] * integrator->dt);
 
