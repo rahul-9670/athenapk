@@ -19,6 +19,11 @@
 set -o pipefail
 HERE=/beegfs/u/bbg6470/athenapk/runs/root_ladder
 WRAPSRC=/beegfs/u/bbg6470/athenapk/runs/wrap_mod.sh
+# CLAMP=false: B1's boundary-flux clamp defaults ON in submit_root.sh from 2026-08-04, but the
+# WP-7 root-grid ladder must stay a MATCHED comparison and r128_sw / r256_sw already ran without
+# it. Do not "modernise" this line -- flipping it silently makes the 512 rung incomparable to the
+# other two, which is exactly the class of error rule 6 (paired artifacts stay paired) exists for.
+export CLAMP=false
 BIN=/beegfs/u/bbg6470/athenapk/build_gpu_v2/bin/athenaPK
 [ -r "$WRAPSRC" ] || { echo "FATAL: no GPU-pinning wrapper at $WRAPSRC"; exit 1; }
 [ -x "$BIN" ]     || { echo "FATAL: no binary at $BIN"; exit 1; }

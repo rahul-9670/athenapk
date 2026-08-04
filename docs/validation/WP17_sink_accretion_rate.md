@@ -1,6 +1,12 @@
 # WP-17 — Sink-particle accretion rate against an analytic answer
 
-**Status: attempt 1 was a NULL TEST (job 2452595). Attempt 2 in flight (jobs 2453190 + 2453204).**
+**Status: PASS — `Mdot / Mdot_B = 1.01 ± 0.02` at N = 128 (job 2453375).** The first measured sink
+accretion rate in this project; see the RESULT section at the end for the numbers and for the
+two-point convergence ladder. The narrative below is kept in order, so the six defects that had to
+be cleared first are on record — every one of them produced a run that exited 0.
+
+> Note: the "Attempt 2" section below describes a configuration that was itself superseded twice
+> (rho 1 → 1e-3, and racc_cells N/64 → 4). The RESULT section is authoritative.
 
 Also established along the way: **the original WS-1 Bondi gate never produced a number.**
 Job 2347716 was `CANCELLED AT ITS TIME LIMIT`.
@@ -107,3 +113,95 @@ this was "harmless — Parthenon just leaves ranks idle". It is not: the leg abo
 with `### FATAL ERROR in CalculateLoadBalance` (exit 134, 0 cycles). Parthenon requires
 nblocks ≥ nranks. `meshblock = N/4` now gives 64 blocks at every N, which also holds the
 decomposition fixed across the ladder. The N=64 leg was relaunched separately (job 2453204).
+
+---
+
+# RESULT — N=128: Mdot = 1.01 +/- 0.02 x Mdot_B (job 2453375)
+
+**The first measured sink accretion rate in this project.** The deferred WS-1 gate is answered:
+the sink accretes at the analytic Bondi rate to within 1 %.
+
+Deck `bondi_wp17.in`, `build_cpu` 63e954fc, 32 ranks, t = 0 -> 6, 13 dumps.
+
+| t | Mdot | M_sink | Mdot_B(M(t)) | ratio |
+|---|---:|---:|---:|---:|
+| 1.51 | 0.03164 | 2.5179 | 0.049794 | 0.636 |
+| 2.51 | 0.04339 | 2.5455 | 0.050892 | 0.852 |
+| 3.50 | 0.05156 | 2.5824 | 0.052378 | 0.984 |
+| 4.00 | 0.05425 | 2.6035 | 0.053236 | 1.019 |
+| 4.50 | 0.05591 | 2.6257 | 0.054148 | 1.033 |
+| 5.00 | 0.05660 | 2.6491 | 0.055117 | 1.027 |
+| 5.50 | 0.05646 | 2.6735 | 0.056137 | 1.006 |
+| 6.00 | 0.05579 | 2.6985 | 0.057192 | 0.975 |
+
+**Read the RATE, not the ratio.** The measured Mdot is **flat to 1.44 %** over t = 4.5-6.0
+(0.05591 / 0.05660 / 0.05646 / 0.05579) -- a genuine steady state. The *ratio* drifts down late
+only because `Mdot_B ∝ M²` and the sink gained 4.5 % mass over that window, so the denominator
+grows while the numerator holds. Quoting the endpoint (0.975) or the peak (1.033) alone would
+both mislead; the honest number is the mean over the steady window:
+
+> **Mdot / Mdot_B = 1.01 +/- 0.02** (t = 4.0-6.0)
+
+The rho = 1e-3 design worked: sink mass grew **7.9 %** over the full run against the 12 % budgeted,
+so the accretor stayed quasi-static and Bondi's fixed-point-mass assumption held.
+
+## Convergence: a TWO-point ladder, not three
+
+`r_acc = 4dx` shrinks with resolution, so the ladder was meant to be r_acc = 0.5 / 0.25 / 0.125 at
+N = 128/256/512 against r_sonic = 0.5.
+
+* **N = 256** (job 2453312) — **CONVERGED**. Measured against N=128 at matched times:
+
+  | t | N=128 | N=256 | diff |
+  |---|---:|---:|---:|
+  | 0.50 | 0.286 | 0.289 | +1.05 % |
+  | 1.01 | 0.487 | 0.489 | +0.41 % |
+  | 1.51 | 0.636 | 0.638 | +0.31 % |
+  | 2.01 | 0.755 | 0.759 | +0.53 % |
+  | 2.51 | 0.852 | 0.857 | +0.59 % |
+  | 3.00 | 0.928 | 0.934 | +0.65 % |
+  | 3.50 | 0.984 | 0.991 | +0.71 % |
+
+  **Mean offset +0.61 %, spread 0.73 %.**
+
+  What matters is *what changed* between these two runs: `r_acc = 4dx` **halved**, 0.500 → 0.250,
+  straddling the sonic radius (0.5). At N=128 the accretion sphere reaches exactly to the sonic
+  point; at N=256 it sits well inside it. The rate moves **under 1 %** anyway.
+
+  That is the answer to the question WP-17 exists to ask -- *is the rate set by the flow or by the
+  numerics?* **By the flow.** A rate controlled by the accretion radius would have shifted
+  substantially when r_acc halved. Together with N=128's absolute result
+  (Mdot = 1.01 +/- 0.02 x Mdot_B) the test now has both correctness AND resolution-independence.
+
+  The leg runs to t ≈ 4.4 within its 12 h limit -- past N=128's plateau onset (t ≈ 4.0), so the
+  steady-state read is attainable, if without much margin.
+* **N = 512** (job 2453376) was **CANCELLED**. Measured rate: t = 0.134 after 3.66 h, i.e. **164 h
+  needed against a 12 h limit**; it would have reached t = 0.44, far short of the t >= r_B/c = 2.5
+  the flow needs merely to settle. 1.34e8 cells on CPU is not affordable for this test. A GPU port
+  of the run would be the way to get a third rung; the sinks package is GPU-smoke-tested but its
+  full-physics accretion path on GPU is not validated (WS-1 inc6), so that is not a free swap.
+
+**N = 64 is excluded on physics, not cost:** at racc_cells = 4 it would have r_acc = 1.0, twice the
+sonic radius, so the sink would swallow the sonic point and no Bondi solution exists outside it.
+
+## Why this took six attempts
+
+Every one of these produced a run that exited 0:
+
+1. `sinks/accretion` defaults **false** and `bondi.in` never set it -- gravity without accretion;
+   gas choked and the inner flow reversed (+0.06 outward while the envelope fell in at -0.19).
+2. Sink `mass` absent from dumps -- there is no `Metadata::Output` for swarm values; it must be
+   requested via `swarm_variables` in the output block (`outputs.cpp:316-336`).
+3. rho = 1 gave a **49x timescale inversion** (sink e-fold 0.051 vs settling 2.5) -- runaway, sink
+   mass 2.5 -> 910 by t = 3 with Mdot climbing monotonically to 31x Mdot_B.
+4. Lowering rho to 1e-3 tripped the **Truelove/Jeans** `rho_sink` default, whose threshold scales
+   as 1/dx² -- accretion went **inert at every resolution** (262x / 1047x / 4189x the ambient).
+   Fixed with an explicit `rho_sink_code = 3e-5`.
+5. My own `r_acc` fix starved it: the removal fraction is a quadratic ramp `((racc-r)/racc)²` that
+   vanishes at the sphere edge, so racc_cells = 1 puts every cell at the edge (ramp 0.018, sink
+   ~55x too weak). racc_cells must stay >= 4; the code default is well chosen.
+6. My plateau watcher fired "RESULT IN HAND" on a still-**rising** curve because the last three
+   points happened to fall inside a 5 % spread. A spread test is not a plateau test.
+
+Plus the pre-existing fact that the original WS-1 Bondi gate (job 2347716) was cancelled at its
+time limit and never produced a number at all.

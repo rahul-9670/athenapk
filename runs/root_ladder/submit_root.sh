@@ -59,7 +59,13 @@ export LD_LIBRARY_PATH=/sw/env/gcc-13.3.0_openmpi-5.0.7/pkgsrc/2025Q1/lib:$LD_LI
 # turb_ksample=k2, which binary 5ebddce0 does NOT know and silently ignores -- running the
 # old binary against the new deck yields the OLD IC with no warning. The banner check below
 # is the guard: it aborts rather than quietly producing a superseded initial condition.
-BIN="${BIN:-/beegfs/u/bbg6470/athenapk/build_gpu_wp20/bin/athenaPK}"
+# 2026-08-04: default swapped build_gpu_wp20 -> build_gpu_v4 (869c1d34 = v3 + B1 + B6).
+# OFF-state gate-verified byte-identical to v3 on all 11 STATE columns; see submit_deep.sh for the
+# full reasoning and the last-printed-digit diagnostic caveat. B1's clamp is DEFAULT OFF.
+# NOTE this is only the FALLBACK default -- stage_switches.sh exports BIN explicitly and is
+# deliberately still pinned to build_gpu_v2 (f181c0a1), because r128_sw and r256_sw already ran on
+# that binary and the WP-7 root-grid ladder must stay a matched comparison. Do not "modernise" it.
+BIN="${BIN:-/beegfs/u/bbg6470/athenapk/build_gpu_v4/bin/athenaPK}"
 DECK=/beegfs/u/bbg6470/athenapk/runs/root_ladder/fhc_rootladder.in
 WRAP=$RUNDIR/wrap_mod.sh
 MCA="--mca mtl ^psm2 --mca btl tcp,self,sm -x LD_LIBRARY_PATH -x PMIX_MCA_gds -x OMP_NUM_THREADS -x OMPI_MCA_io -x TMPDIR"
@@ -83,11 +89,27 @@ stdbuf -oL -eL mpirun -n $NRANK $MCA $WRAP $BIN $RA -t 05:30:00 \
   diffusion/eta_ohm_cap_code=0.1 diffusion/ion_zeta=1.0e-16 parthenon/output2/dn=250 \
   diffusion/cap_diag=true hydro/mag_diag=true \
   diffusion/hall_ohmic_floor_ratio=0.2 \
+  hydro/boundary_flux_clamp=${CLAMP:-true} \
   ${OV:-} \
   >> $RUNDIR/run.log 2>&1
 # OV = optional extra CLI overrides, appended LAST so they win. Empty when unset, so every
 # existing caller (the root ladder, stage_gfix.sh) is unaffected. Used by WP-2's creduc sweep
 # (runs/wp2_creduc/stage_wp2.sh) to reuse this exact configuration with one key varied.
+#
+# CLAMP (2026-08-04): B1's boundary-flux clamp is now ON BY DEFAULT for new production runs.
+# Rationale -- production already uses DIODE boundaries, which block inflow VELOCITY, yet mass
+# still climbs **+0.0975 %** over a full pre-collapse run (deep_amr, t = 0 -> 1.015, 204 rows)
+# because the Riemann solver still yields an inward FLUX from the pressure/density gradient.
+# Diode does not cover that; the clamp does, driving the drift to exactly 0.000000 % (GPU gate
+# job 2452598). It is gated OFF-state byte-identical and falsified against a uniform wind, which
+# confirmed OUTWARD flux passes untouched at exactly rho*v*A.
+#
+# NOT applied retroactively. Completed work (WP-7 ladder, WP-18 ensemble, WP-8) is internally
+# consistent with the clamp OFF, and +0.0975 % mass is ~150x below WP-18's sigma = 16 % on the
+# flux-retention observable, so re-running would cost thousands of GPU-hours to move nothing.
+# `stage_switches.sh` therefore exports CLAMP=false to keep the WP-7 root-grid ladder matched --
+# r128_sw and r256_sw already ran without it. Job 2449283 (root512sw) is unaffected either way:
+# sbatch copies the batch script at submission, so it runs the pre-edit version.
 echo "RUN_EXIT $? $(date)"
 
 # GUARD: the corrected turbulence IC must actually have been used. If the binary predates

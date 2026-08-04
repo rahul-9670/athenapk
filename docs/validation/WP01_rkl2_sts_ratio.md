@@ -7,11 +7,12 @@ plus a fifth at cap = 2 (job 2453562) as a check on the one loose end. Productio
 dominant dissipation channel by **≤0.08 %**. The only quantity that responds is the Ohmic
 dissipation — **0.106 %** of the magnetic dissipation budget — which moves ~17 % non-monotonically.
 
-**Verdict: production needs no change, and the level-13 scope limit is CLOSED** (final section).
-The cap-binding regime the DEV_LOG documented turned out to be a property of the **old
-`ion_zeta = 1e-17` default**, not of depth: re-probing that exact level-13 state under current
-settings gives an achieved ratio of **51.2, not 1000**. Production's cap therefore carries
-**~10–20× headroom and has never bound** in any current-configuration run.
+**Verdict: production needs no change.** The scope limit stands as originally written and is
+**not** closed: the cap-binding epoch (`prod_t4_full` near cycle 72410) was never checkpointed
+among the surviving restarts, so it cannot be probed. Two rounds of probing established only that
+the reachable states are not that state — the achieved ratios of 36.7 and 51.2 said so directly.
+Crucially, at the one state where old and current CAN be compared, they **agree** (old 43–83,
+current 51.2), so there is no regression and no anomaly to explain.
 
 ## Why this took three attempts to become testable at all
 
@@ -176,7 +177,91 @@ factor of ~20 lower. The cap does not bind there any more.
 This also **falsifies a prediction made in this document**: I argued B11's `hall_ohmic_floor_ratio`
 raises η_O and would therefore push the required ratio *up* at equal depth. It went sharply down.
 
-## Mechanism: `ion_zeta`, confirmed at the configuration level
+## RESOLVED: there was never an old-vs-new discrepancy — I compared two different states
+
+The whole "current settings give 51.2 where the old run gave 1000" framing is **wrong**, and the
+error was mine. Reading `prod_t4_full/run.log` at the **same cycle as the restart** (85500):
+
+```
+cycle=85500  t=1.0846417004626012  dt=1.3213e-08     STS ratio: 4.30e+01   (45 stages)
+cycle=85501                        dt=2.5558e-08     STS ratio: 8.31e+01
+```
+
+The old run at that state achieved **43–83**. The current-binary probe at that identical state
+achieved **51.2**. **They agree.** The current binary reproduces the old behaviour exactly where
+it can be compared; there is no physics regression, no ionization mystery, nothing to explain.
+
+**Where the 1000-pinning actually happened:** near **cycle 72410, t = 1.0839142** — a
+*different, earlier epoch*, ~13 000 cycles before the restart I probed.
+
+**Why it cannot be probed:** every surviving restart post-dates that epoch —
+
+| restart | cycle | t |
+|---|---:|---:|
+| `out2.final` | 84576 | 1.0846231 |
+| `out2.00199` | 85250 | 1.0846366 |
+| `out2.00200` | 85500 | 1.0846417 |
+
+The pinning-epoch checkpoints were destroyed when `prod_t4_full` was pruned 6.7 TB → 399 GB.
+**So the original scope limit was correct**: the cap-binding state was never checkpointed and
+remains unreachable. Two rounds of probing established only that the state I *could* reach is not
+that state — which the achieved ratio of 36.7/51.2 said from the start.
+
+## What DOES set the ratio (this part is established)
+
+`hydro_driver.cpp:566-573` defines `ratio = 2·tau / mindt_diff`, i.e. **global dt ÷ diffusive dt**.
+Decomposing the two ζ legs at fixed state:
+
+| leg | dt | ratio | ⇒ dt_diff |
+|---|---:|---:|---:|
+| ζ = 1e-16 | 1.571894e-08 | 51.20 | **3.070106e-10** |
+| ζ = 1e-17 | 1.571894e-09 | 5.12 | **3.070106e-10** |
+
+`dt_diff` is **identical to 7 digits**, and the two dt values share the mantissa `1.5718943`
+differing by exactly 10×. The cap diagnostics say why:
+
+```
+cap-VO/MO/DO  nonzero  -> the OHMIC cap engages
+cap-VH/MH/DH  0.0      -> the Hall cap NEVER engages
+cap-VA/MA/DA  0.0      -> the ambipolar cap NEVER engages
+```
+
+So η_O is pinned at `eta_ohm_cap_code = 0.1` and `dt_diff` is therefore **independent of ζ**,
+while η_H is *uncapped* and scales as 1/x_e ∝ 1/ζ, making the Hall-limited global dt ∝ ζ.
+Hence **ratio ∝ ζ at fixed state** — confirmed to 8 significant figures.
+
+That is also why my prediction failed: I reasoned that lower ζ raises η and shortens the parabolic
+timestep, but the parabolic timestep is *capped* and cannot respond. Lower ζ only shortens the
+Hall-limited global dt, dragging the ratio down with it.
+
+### Superseded: the ionization-inconsistency hypothesis
+
+> **Read this before the subsection below, which is kept only as a record of a wrong turn.**
+> The `ion_zeta` explanation was tested directly (job 2453604: the same probe with **both**
+> `diffusion/ion_zeta` and `chemistry/zeta_cr_cgs` set to 1.0e-17, self-consistently) and it
+> **FAILED**:
+>
+> | ζ | achieved max STS | dt |
+> |---|---:|---:|
+> | 1e-16 (current production) | 51.2 | 1.57e-08 |
+> | **1e-17 (the old default)** | **5.12** | **1.57e-09** |
+> | old `prod_t4_full` at the same state | **1000** | — |
+>
+> The prediction was that lowering ζ raises η, shortens the parabolic timestep and drives the
+> required ratio back up toward 1000. Instead the ratio fell by exactly **10×**, *away* from the
+> old behaviour, with dt falling by exactly 10× alongside it. That proportionality is a clue, but
+> no mechanism here explains it, and none is asserted.
+>
+> **What stands empirically:** at the level-13 state, current settings give an achieved ratio of
+> **51.2**, nowhere near the 1000 cap, and no configuration tried reproduces the old pinning.
+> **What is NOT established:** why the July run pinned at 1000. The ionization inconsistency
+> below is real and was really fixed, but it is *not* demonstrated to be the cause.
+>
+> This is the third premature mechanism claim in this document (see the two Ohmic-trend
+> corrections). The pattern is the same each time: a plausible story written up before the
+> decisive single-variable test was run.
+
+### The (real, but not causally demonstrated) ionization inconsistency
 
 `ionization_environment.hpp:60` — `ion_zeta` defaults to **1.0e-17**. The old `prod_t4_full`
 submit sets only `eta_ohm_cap_code`, so it ran at that default. Current production sets
@@ -185,10 +270,11 @@ a **10× higher cosmic-ray ionization rate**, which raises x_e, lowers the non-i
 diffusivities, lengthens the parabolic timestep and so reduces the required STS ratio. A 10×
 change in ζ against a ~20× drop in achieved ratio is the right order.
 
-*Single-variable falsification test running as job 2453602: the same probe with
-`ion_zeta = 1.0e-17` and nothing else changed. If the mechanism is right the achieved ratio should
-climb back toward ~1000. If it does not, this explanation is wrong and the drop is due to
-something else in the B10/B11 batch.*
+*That falsification test was run (job 2453602 blocked by the consistency guard, then 2453604 with
+both keys at 1e-17) and the explanation **did not survive** — see the box above. The guard itself
+is worth recording: `ion_zeta` cannot now be set inconsistently with `chemistry/zeta_cr_cgs`, so
+the old mixed state is unreachable by configuration. That is a real hardening, independent of
+whether it explains the STS ratio.*
 
 ## Consequence for WP-1
 
