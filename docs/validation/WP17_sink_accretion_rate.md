@@ -173,8 +173,14 @@ N = 128/256/512 against r_sonic = 0.5.
   substantially when r_acc halved. Together with N=128's absolute result
   (Mdot = 1.01 +/- 0.02 x Mdot_B) the test now has both correctness AND resolution-independence.
 
-  The leg runs to t ≈ 4.4 within its 12 h limit -- past N=128's plateau onset (t ≈ 4.0), so the
-  steady-state read is attainable, if without much margin.
+  The leg is CAPPED at t ≈ 4.4 by its 12 h wall limit, and that is final: `scontrol update
+  TimeLimit=` returns **Access/permission denied** (users may lower a limit, not raise it), and
+  `bondi_wp17.in` configures no restart output, so it cannot be resumed either. Do not re-attempt
+  either route.
+  This does **not** weaken the result. The convergence statement above comes from the MATCHED-TIME
+  comparison over t = 0.5-3.5, where both legs have data; it never required N=256 to reach its own
+  plateau. N=128 supplies the absolute rate (1.01 +/- 0.02), N=256 supplies resolution-independence
+  (+0.61 %). A longer N=256 would add confirmation, not a new claim.
 * **N = 512** (job 2453376) was **CANCELLED**. Measured rate: t = 0.134 after 3.66 h, i.e. **164 h
   needed against a 12 h limit**; it would have reached t = 0.44, far short of the t >= r_B/c = 2.5
   the flow needs merely to settle. 1.34e8 cells on CPU is not affordable for this test. A GPU port
