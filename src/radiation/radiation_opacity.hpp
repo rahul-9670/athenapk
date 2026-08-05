@@ -26,7 +26,8 @@
 #include <basic_types.hpp>      // parthenon::Real
 #include <parthenon_arrays.hpp> // parthenon::ParArray2D (tabulated opacity, device)
 
-#include "radiation_closure.hpp" // parthenon::Real alias, RadFuzz
+#include "opacity_table_format.hpp" // shared table header parser (audit N13)
+#include "radiation_closure.hpp"    // parthenon::Real alias, RadFuzz
 
 namespace Radiation {
 
@@ -84,21 +85,33 @@ struct OpacityTable {
     return bilin(ks_, std::log10(rho_code * rho_unit), std::log10(T_code * T_unit));
   }
 
-  //! Load the gray magnitude tables (host). Binary layout (gen_opacity_table.py): int64
-  //! [ng,nr,nT]; double [lr0,dlr,lT0,dlT]; float64 kP[nr,nT], kR, ks, then mP[ng,nT], mR
-  //! (the multipliers are read separately by GroupOpacityTable). ru,tu = rho_unit,T_unit.
-  void Load(const std::string &path, const Real ru, const Real tu) {
+  //! Load the gray magnitude tables (host). Header is parsed by ReadOpacityHeader (see
+  //! opacity_table_format.hpp); the payload is float64 kP[nr,nT], kR, ks, then mP[ng,nT], mR
+  //! (the multipliers are read separately by GroupOpacityTable).
+  //!   ru, tu  = rho_unit, T_unit -- used ONLY to map code (rho,T) onto the file's cgs axes.
+  //!   kappa_u = the run's opacity_unit (rho_unit*length_unit).
+  //!
+  //! AUDIT N13: a v2 file stores kappa in cgs and is scaled by `kappa_u` here, so it is
+  //! correct for ANY normalization. A legacy v1 file stores kappa already in the generator's
+  //! code units and is used verbatim -- bit-identical to the historical behaviour, and
+  //! carrying the historical +0.135 % bias, which the caller reports.
+  //! `used_legacy_code_units` lets the caller warn without re-parsing the file.
+  bool used_legacy_code_units = false;
+  void Load(const std::string &path, const Real ru, const Real tu, const Real kappa_u) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("OpacityTable: cannot open " + path);
-    std::int64_t hdr[3];
-    f.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
-    ng_ = static_cast<int>(hdr[0]);
-    nr_ = static_cast<int>(hdr[1]);
-    nT_ = static_cast<int>(hdr[2]);
-    double g[4];
-    f.read(reinterpret_cast<char *>(g), sizeof(g));
-    lr0_ = g[0]; dlr_ = g[1]; lT0_ = g[2]; dlT_ = g[3];
+    const auto hdr = ReadOpacityHeader(f, path);
+    ng_ = hdr.ng;
+    nr_ = hdr.nr;
+    nT_ = hdr.nT;
+    lr0_ = hdr.lr0; dlr_ = hdr.dlr; lT0_ = hdr.lT0; dlT_ = hdr.dlT;
     rho_unit = ru; T_unit = tu;
+    if (nr_ < 2 || nT_ < 2 || !(dlr_ > 0.0) || !(dlT_ > 0.0))
+      throw std::runtime_error("OpacityTable: bad (rho,T) grid in " + path);
+    // cgs table => convert to code units with THIS run's opacity unit (the N13 fix).
+    // Legacy table => already in the generator's code units; use verbatim.
+    used_legacy_code_units = !hdr.kappa_in_cgs;
+    const Real scale = hdr.kappa_in_cgs ? kappa_u : static_cast<Real>(1.0);
     auto load2d = [&](ParArray2D<Real> &view, const char *name) {
       view = ParArray2D<Real>(name, nr_, nT_);
       auto h = Kokkos::create_mirror_view(view);
@@ -106,7 +119,8 @@ struct OpacityTable {
       f.read(reinterpret_cast<char *>(buf.data()),
              static_cast<std::streamsize>(buf.size() * sizeof(double)));
       for (int i = 0; i < nr_; ++i)
-        for (int j = 0; j < nT_; ++j) h(i, j) = static_cast<Real>(buf[i * nT_ + j]);
+        for (int j = 0; j < nT_; ++j)
+          h(i, j) = static_cast<Real>(buf[i * nT_ + j]) * scale;
       Kokkos::deep_copy(view, h);
     };
     load2d(kP_, "opac_kP");

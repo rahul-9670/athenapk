@@ -1,15 +1,29 @@
 <comment>
-problem = AUDIT N1 POSITIVE TEST -- hall_whistler_ct.in forced to 2D (nx3 = 1).
-# This is EXACTLY the configuration the comments in pgen/diffusion.cpp and the two
-# hall_whistler decks warn about: an iprob=60 whistler sets B_z = h*amp*sin(kx) != 0, and in
-# 2D this CT implementation never evolves B_z (E1/E2 are only assembled when ndim > 2 and
-# every F3 update is behind `if (three_d)`), so the mode would silently return zero Hall
-# evolution in B_z and report a bogus dispersion error.
+problem = AUDIT N1 -- hall_whistler_ct.in forced to 2D (nx3 = 1).
 #
-# EXPECTED RESULT: the run ABORTS at the first step with the ct_2d_outofplane guard
-# (hydro.cpp, PreStepMeshUserWorkInLoop). Before the guard it ran to completion and lied.
+# 2026-08-05: THE EXPECTED RESULT OF THIS DECK HAS CHANGED. Read this before using it.
+#
+# History. An iprob=60 whistler sets B_z = h*amp*sin(kx) != 0, and 2D CT used never to evolve
+# B_z (E1/E2 assembled only when ndim > 2, every F3 update behind `if (three_d)`), so the mode
+# silently returned zero Hall evolution in B_z and reported a bogus dispersion error. Round 2
+# of the audit made that ABORT: this deck was the positive test for the guard.
+#
+# Now. B_z IS evolved in 2D (audit N1 fixed 2026-08-05: 2D E1/E2 for the ideal Balsara-Spicer
+# and GS05 assemblers and for all three non-ideal edge EMFs; F3 updates gated on ndim > 1).
+# So this deck RUNS TO COMPLETION and its answer is meaningful, where before the guard it ran
+# to completion and LIED.
+#
+# EXPECTED RESULT: completes; the log carries the one-shot line
+#   "## CT 2D out-of-plane check (audit N1): max(|B_z|,|v_z|) = ...  -> out-of-plane ...
+#    B_z is EVOLVED in 2D"
+# with a NON-ZERO value. An abort here means the N1 fix was reverted; a ZERO value means the
+# deck stopped exercising the out-of-plane path and is no longer testing anything.
+#
+# The quantitative check is NOT here -- it is runs/ct_tests/n1_2d/, which runs this same
+# eigenmode in 2D and in 3D and requires them to agree cell for cell against the already-
+# validated 3D CT path, with a falsifier that fails if B_z has not moved.
 # The paired negative test is runs/ct_tests/field_loop_ct.in -- also 2D CT, but B_z = v_z = 0,
-# so the guard passes and the deck is bit-identical.
+# so the closed in-plane invariant holds and the deck is bit-identical across the fix.
 
 <job>
 problem_id = diffusion

@@ -24,6 +24,8 @@
 #include "basic_types.hpp"       // parthenon::Real
 #include "parthenon_arrays.hpp"  // parthenon::ParArray2D
 
+#include "eos_table_format.hpp"  // shared table header parser (audit N14)
+
 namespace EOSTable {
 using parthenon::ParArray2D;
 using parthenon::Real;
@@ -116,33 +118,59 @@ struct EosTable {
            rho;
   }
 
+  //! True when the file was a legacy (v1) table, i.e. its axes and arrays were baked in the
+  //! GENERATOR's code units rather than this run's. Lets the caller warn without re-parsing.
+  bool used_legacy_code_units = false;
+
   // ---- host-side loader (reads the flat binary from gen_eos_table.py) ----
-  void Load(const std::string &path) {
+  //! `rho_unit` [g/cm^3] and `v_unit` [cm/s] are this run's authoritative scales. A v2 (cgs)
+  //! table is converted into code units with them here, so the file is independent of any
+  //! particular IC (audit N14). A legacy table is consumed verbatim -- bit-identical to the
+  //! historical behaviour, and carrying the historical bias, which the caller reports.
+  void Load(const std::string &path, const Real rho_unit, const Real v_unit) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("EosTable: cannot open table file " + path);
-    std::int64_t hdr[3];
-    f.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
-    nr_ = static_cast<int>(hdr[0]);
-    ne_ = static_cast<int>(hdr[1]);
-    nT_ = static_cast<int>(hdr[2]);
-    double g[6];
-    f.read(reinterpret_cast<char *>(g), sizeof(g));
-    lr0_ = g[0]; dlr_ = g[1]; le0_ = g[2]; dle_ = g[3]; lT0_ = g[4]; dlT_ = g[5];
+    const auto hdr = ReadEosHeader(f, path);
+    nr_ = hdr.nr;
+    ne_ = hdr.ne;
+    nT_ = hdr.nT;
+    lr0_ = hdr.lr0; dlr_ = hdr.dlr;
+    le0_ = hdr.le0; dle_ = hdr.dle;
+    lT0_ = hdr.lT0; dlT_ = hdr.dlT;
+    if (nr_ < 2 || ne_ < 2 || nT_ < 2 || !(dlr_ > 0.0) || !(dle_ > 0.0) || !(dlT_ > 0.0))
+      throw std::runtime_error("EosTable: bad grid in " + path);
 
-    auto load2d = [&](ParArray2D<Real> &view, const char *name, int n1, int n2) {
+    used_legacy_code_units = !hdr.in_cgs;
+    // cgs -> code. The axes are log10-spaced, so this is a pure shift of the ORIGIN and the
+    // SPACING is invariant; the payload arrays scale by fixed factors. log10 T[K] is
+    // unit-free and is left alone. All factors are 1 / no-op for a legacy table.
+    const Real esp_unit = v_unit * v_unit;         // erg/g
+    const Real e_unit = rho_unit * esp_unit;       // erg/cm^3
+    Real scale_P = 1.0, scale_cs2 = 1.0, scale_esp = 1.0;
+    if (hdr.in_cgs) {
+      lr0_ -= static_cast<Real>(std::log10(static_cast<double>(rho_unit)));
+      le0_ -= static_cast<Real>(std::log10(static_cast<double>(esp_unit)));
+      scale_P = 1.0 / e_unit;
+      scale_cs2 = 1.0 / esp_unit;
+      scale_esp = 1.0 / esp_unit;
+    }
+
+    auto load2d = [&](ParArray2D<Real> &view, const char *name, int n1, int n2,
+                      const Real scale) {
       view = ParArray2D<Real>(name, n1, n2);
       auto h = Kokkos::create_mirror_view(view);
       std::vector<double> buf(static_cast<size_t>(n1) * n2);
       f.read(reinterpret_cast<char *>(buf.data()),
              static_cast<std::streamsize>(buf.size() * sizeof(double)));
       for (int i = 0; i < n1; ++i)
-        for (int j = 0; j < n2; ++j) h(i, j) = static_cast<Real>(buf[i * n2 + j]);
+        for (int j = 0; j < n2; ++j)
+          h(i, j) = static_cast<Real>(buf[i * n2 + j]) * scale;
       Kokkos::deep_copy(view, h);
     };
-    load2d(P_, "eos_P", nr_, ne_);
-    load2d(cs2_, "eos_cs2", nr_, ne_);
-    load2d(logT_, "eos_logT", nr_, ne_);
-    load2d(espT_, "eos_espT", nr_, nT_);
+    load2d(P_, "eos_P", nr_, ne_, scale_P);
+    load2d(cs2_, "eos_cs2", nr_, ne_, scale_cs2);
+    load2d(logT_, "eos_logT", nr_, ne_, 1.0); // log10 T[K]: unit-free
+    load2d(espT_, "eos_espT", nr_, nT_, scale_esp);
     if (!f) throw std::runtime_error("EosTable: truncated table file " + path);
     loaded_ = true;
   }

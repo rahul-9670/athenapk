@@ -128,13 +128,16 @@ Real CalculateGlobalMinDx(MeshData<Real> *md) {
 void PreStepMeshUserWorkInLoop(Mesh *pmesh, ParameterInput *pin, SimTime &tm) {
   auto hydro_pkg = pmesh->packages.Get("Hydro");
 
-  // AUDIT 2026-08-05 (N1): 2D + CT silently freezes B_z. That is EXACT while B_z == v_z == 0
-  // (a closed invariant in 2D -- see the note on CT_Max2DOutOfPlane) and wrong otherwise, so
-  // check the corner once, on the first step, instead of returning a plausible wrong answer.
-  // Every 2D CT deck in the tree satisfies it, so this is bit-identical for all of them; the
-  // combination it rejects is the one pgen/diffusion.cpp and the hall_whistler decks already
-  // avoid by hand (nx3 = 4). 3D is untouched and pays nothing.
-  if (hydro_pkg->Param<bool>("use_ct") && pmesh->ndim < 3 &&
+  // AUDIT 2026-08-05 (N1), FIXED 2026-08-05. 2D + CT used to freeze B_z; the earlier guard here
+  // ABORTED whenever max(|B_z|,|v_z|) != 0, because outside that corner the answer was wrong.
+  // B_z now evolves in 2D (E1/E2 assembled, F3 updated, non-ideal EMFs included -- see the long
+  // note on CT_Max2DOutOfPlane in ct/ct.cpp), so the abort is gone. What remains is a one-shot
+  // REPORT of the same reduction: it costs one pass on the first step of a 2D CT run only, and
+  // it tells the reader which regime they are in -- 0 means the run sits in the closed
+  // in-plane invariant where the OLD scheme was already exact (so results are comparable to
+  // pre-fix runs), non-zero means the newly-live B_z evolution is actually doing work.
+  // Bit-identical either way: this only prints. 3D never enters.
+  if (hydro_pkg->Param<bool>("use_ct") && pmesh->ndim == 2 &&
       !hydro_pkg->Param<bool>("ct_2d_outofplane_checked")) {
     Real maxop = 0.0;
     const int num_partitions = pmesh->DefaultNumPartitions();
@@ -146,17 +149,14 @@ void PreStepMeshUserWorkInLoop(Mesh *pmesh, ParameterInput *pin, SimTime &tm) {
     PARTHENON_MPI_CHECK(
         MPI_Allreduce(MPI_IN_PLACE, &maxop, 1, MPI_PARTHENON_REAL, MPI_MAX, MPI_COMM_WORLD));
 #endif
-    PARTHENON_REQUIRE_THROWS(
-        maxop == 0.0,
-        "divergence_control=ct in " + std::to_string(pmesh->ndim) +
-            "D requires B_z == 0 AND v_z == 0 everywhere: this CT implementation assembles "
-            "the E1/E2 edge EMFs only when ndim > 2 (they average over k and k-1, which a 2D "
-            "mesh has no x3 ghosts for) and gates every B_z (F3) update on `three_d`, so B_z "
-            "is FROZEN -- dB_z/dt = div(v_z B_pol) is simply dropped, and the face->cell "
-            "projection then copies the frozen value onto cons(IB3). max(|B_z|,|v_z|) = " +
-            std::to_string(maxop) +
-            ". Use a 3D box (nx3 >= 4 is enough for an x-propagating mode -- see "
-            "runs/ct_tests/hall_whistler_ct.in), or divergence_control=glm.");
+    if (parthenon::Globals::my_rank == 0) {
+      std::cout << "## CT 2D out-of-plane check (audit N1): max(|B_z|,|v_z|) = " << maxop
+                << (maxop == 0.0
+                        ? "  -> purely in-plane; B_z stays 0 (closed invariant)."
+                        : "  -> out-of-plane field/flow present; B_z is EVOLVED in 2D "
+                          "(fixed 2026-08-05, was frozen).")
+                << std::endl;
+    }
     hydro_pkg->UpdateParam("ct_2d_outofplane_checked", true);
   }
 
@@ -963,32 +963,32 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
             "vs eos_table_hires.bin: 8.3% p99 / 37.6% max in cs^2. This is FINE for smoke tests "
             "and NOT fine for production -- set eos_table_file=.../src/eos/eos_table_hires.bin.");
       }
-      eos_tab.Load(tabfile);
-      // AUDIT N14 (2026-08-05): gen_eos_table.py builds its rho/e code-unit grids from its OWN
-      // hardcoded, ROUNDED scales (rho0 = 5.467e-19, v0 = 1.9e4) and the .bin that Load() reads
-      // carries NO unit field -- it is exactly int64[3] + double[6] + four raw arrays, with no
-      // spare byte where a unit could hide (verified: eos_table.bin is 1,238,472 B = the exact
-      // packed size). So a run whose authoritative PhysUnits scales differ from the generator's
-      // silently indexes the table at slightly wrong (rho, e). This is warn-only by design:
-      // regenerating the table changes numbers on the production path. The correct fix is to
-      // stamp the assumed units into the .bin header and regenerate at a slot boundary.
-      // Mirrors the N13 guard in radiation.cpp for the opacity table.
+      // AUDIT N14 (2026-08-05), FIXED. A v2 table stores axes and arrays in cgs and Load()
+      // converts them with THIS run's units, so the file is independent of any particular IC.
+      // A legacy v1 table was built in the generator's own rounded code units and is consumed
+      // verbatim -- bit-identical to the historical behaviour, and carrying the historical
+      // bias. Warn in that case, quantifying it, so an old table cannot pass for a fixed one.
       {
         const auto Ueos = PhysUnits::BuildPhysicalUnits(pin);
-        constexpr Real kGenEosRho0 = 5.467e-19; // gen_eos_table.py rho0 [g/cm^3]
-        constexpr Real kGenEosV0 = 1.9e4;       // gen_eos_table.py v0   [cm/s]
-        const Real drho = kGenEosRho0 / Ueos.rho_unit - 1.0;
-        const Real dv = kGenEosV0 / Ueos.v_unit - 1.0;
-        if (parthenon::Globals::my_rank == 0 &&
-            (std::abs(drho) > 1.0e-6 || std::abs(dv) > 1.0e-6)) {
-          std::cout << "### WARNING Hydro (audit N14): " << tabfile
-                    << " was generated assuming rho0 = " << kGenEosRho0 << ", v0 = " << kGenEosV0
-                    << " but this run's PhysUnits give rho_unit = " << Ueos.rho_unit
-                    << ", velocity_unit = " << Ueos.v_unit << " (rel diff " << drho
-                    << ", " << dv
-                    << "). The table grids are indexed AS IS; regenerate the table against the "
-                       "run's units to remove this bias."
-                    << std::endl;
+        eos_tab.Load(tabfile, Ueos.rho_unit, Ueos.v_unit);
+        if (parthenon::Globals::my_rank == 0 && eos_tab.used_legacy_code_units) {
+          constexpr Real kGenEosRho0 = 5.467e-19; // gen_eos_table.py rho0, format v1
+          constexpr Real kGenEosV0 = 1.9e4;       // gen_eos_table.py v0,   format v1
+          const Real drho = kGenEosRho0 / Ueos.rho_unit - 1.0;
+          const Real dv = kGenEosV0 / Ueos.v_unit - 1.0;
+          if (std::abs(drho) > 1.0e-6 || std::abs(dv) > 1.0e-6) {
+            std::cout << "### WARNING Hydro (audit N14): " << tabfile
+                      << " is a LEGACY (v1) EOS table: its axes and arrays are in the "
+                         "generator's own code units (rho0 = "
+                      << kGenEosRho0 << ", v0 = " << kGenEosV0
+                      << ") and are used verbatim. This run's PhysUnits give rho_unit = "
+                      << Ueos.rho_unit << ", v_unit = " << Ueos.v_unit << " (rel diff " << drho
+                      << ", " << dv
+                      << "), so the table is consulted at slightly wrong (rho, esp). "
+                         "Regenerate with gen_eos_table.py (which now emits cgs) to remove "
+                         "the bias; the v2 file is correct for any normalization."
+                      << std::endl;
+          }
         }
       }
       const auto riem = pin->GetOrAddString("hydro", "riemann", "hlld");

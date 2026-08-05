@@ -13,6 +13,7 @@
 
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -326,6 +327,15 @@ TaskStatus ReactScalars(MeshData<Real> *md, const Real dt) {
   }
 
   if (ntrunc > 0) {
+    // AUDIT N6 (2026-08-05), FIXED. ReactScalars runs once per MeshData partition inside a
+    // TaskRegion, so this read-modify-write of a package Param is not safe against concurrent
+    // task lists when DefaultNumPartitions() > 1: two partitions can read the same `prev` and
+    // one increment is silently lost, and the "print once" test below can fire twice. The
+    // lock is taken once per partition per step -- not per cell -- so it is free at this
+    // granularity, and it is correct whether Parthenon runs the lists serially or threaded
+    // (which is a framework detail this package should not have to depend on).
+    static std::mutex chem_trunc_mutex;
+    std::lock_guard<std::mutex> chem_trunc_lock(chem_trunc_mutex);
     const Real prev = pkg->Param<Real>("chem_trunc_total");
     pkg->UpdateParam("chem_trunc_total", prev + static_cast<Real>(ntrunc));
     if (prev == 0.0) {

@@ -795,21 +795,28 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
   // add each sink's softened point-mass force as an operator-split source on the final stage.
   if (stage == integrator->nstages &&
       pmesh->packages.Get("sinks")->Param<bool>("enabled")) {
-    // AUDIT 2026-08-05 (A3). Every task below contains collective MPI: GatherSinks and
-    // AccreteSinks do MPI_Allgather/Allgatherv, CreateSinks does an MPI_Allreduce with
-    // MPI_MAXLOC, AccreteSinks another MPI_Allreduce. Inside a TaskRegion(num_partitions)
-    // each of those is entered once PER PARTITION -- and DefaultNumPartitions() can differ
-    // between ranks (min(default_num_packs_, block_list.size())), so the ranks would reach
-    // the collectives a different number of times and DEADLOCK. Same guard, same wording as
-    // the tracers region below; unreachable while no deck sets pack_size/packs_per_rank.
-    PARTHENON_REQUIRE_THROWS(
-        num_partitions == 1,
-        "Only packs_per_rank=1 currently supported for sinks (the sink tasks contain "
-        "collective MPI and are invoked once per MeshData partition).");
-    TaskRegion &sk_grav_region = tc.AddRegion(num_partitions);
-    for (int i = 0; i < num_partitions; i++) {
-      auto &tl = sk_grav_region[i];
-      auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
+    // AUDIT 2026-08-05 (A3), FIXED 2026-08-05. Every task below contains collective MPI:
+    // GatherSinks and AccreteSinks do MPI_Allgather/Allgatherv, CreateSinks does an
+    // MPI_Allreduce with MPI_MAXLOC, AccreteSinks another MPI_Allreduce. In the original
+    // TaskRegion(num_partitions) each of those was entered once PER PARTITION -- and
+    // DefaultNumPartitions() is min(default_num_packs_, block_list.size()) in the
+    // packs_per_rank branch (parthenon/src/mesh/mesh.hpp:178), so it is NOT rank-uniform: a
+    // rank holding 1 block gets 1 partition while a neighbour gets N. The ranks would reach
+    // the collectives a different number of times and DEADLOCK. CreateSinks' MAXLOC is worse
+    // than a hang -- run per partition it would pick the densest cell of a FRACTION of the
+    // mesh and could seed a sink in the wrong place.
+    //
+    // THE FIX: one task list over a MeshData spanning the rank's ENTIRE block list, so each
+    // collective is entered exactly once per rank per step whatever the partitioning is.
+    // Mesh::GetBasePartition() is that whole-block-list partition; Parthenon rebuilds it on
+    // every mesh change (mesh.cpp:452), so this stays correct across AMR and load balance.
+    // mesh_data.Add is get-or-add and keys on the block gids, so when num_partitions == 1 it
+    // returns the very same container the old GetOrAdd("base", 0) returned -- bit-identical
+    // for every deck in the tree, none of which sets pack_size / packs_per_rank.
+    TaskRegion &sk_grav_region = tc.AddRegion(1);
+    {
+      auto &tl = sk_grav_region[0];
+      auto &mu0 = pmesh->mesh_data.Add("base", pmesh->GetBasePartition());
       auto gather = tl.AddTask(none, Sinks::GatherSinks, mu0.get());
       auto grav = tl.AddTask(gather, Sinks::ApplySinkGravity, mu0.get(), tm, integrator->dt);
       // Creation runs after the gather (needs the existing-sink list for the 2*r_acc test);

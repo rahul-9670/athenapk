@@ -167,27 +167,24 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       bn, "opacity_table_file",
       "/beegfs/u/bbg6470/athenapk/src/radiation/opacity_table.bin");
   if (op.model == OpacityModel::tabulated) {
-    op.table.Load(opac_table_file, rho_unit, T_unit);
-    // AUDIT N13 (2026-08-05): gen_opacity_table.py writes kappa already converted to CODE
-    // units, using its OWN hardcoded, ROUNDED unit scales -- and Load() reads those numbers
-    // verbatim (ru,tu are used only for grid indexing, never to rescale kappa). If the run's
-    // authoritative scales from PhysUnits differ from the generator's assumption, every
-    // tabulated kappa is off by exactly that ratio. This block does NOT correct the table
-    // (regenerating changes production numbers); it makes the discrepancy visible in the log.
-    // Proper fix: emit kappa in cgs, multiply by the runtime opacity_unit here, and stamp the
-    // assumed unit into the table header so this check can be exact instead of hardcoded.
-    constexpr Real kGenRhoUnit = 5.467e-19;   // gen_opacity_table.py RHO_UNIT
-    constexpr Real kGenLenUnit = 2.81e16;     // gen_opacity_table.py LEN_UNIT
-    const Real gen_opacity_unit = kGenRhoUnit * kGenLenUnit; // its OPACITY_UNIT
-    const Real unit_ratio = gen_opacity_unit / kappa_conv;
-    if (parthenon::Globals::my_rank == 0 && std::abs(unit_ratio - 1.0) > 1.0e-4) {
-      std::cout << "### WARNING Radiation (audit N13): tabulated opacity was generated "
-                   "assuming opacity_unit = "
-                << gen_opacity_unit << " but this run's PhysUnits opacity_unit = "
-                << kappa_conv << " (ratio " << unit_ratio << ", i.e. kappa is "
-                << 100.0 * (unit_ratio - 1.0)
-                << "% off). The table is used AS IS -- regenerate it against the run's "
-                   "units to remove this bias." << std::endl;
+    // AUDIT N13 (2026-08-05), FIXED. A v2 table stores kappa in cgs and Load() converts it
+    // with THIS run's opacity_unit, so the file is independent of any particular IC. A legacy
+    // v1 table stores kappa already in the generator's own rounded code units and is used
+    // verbatim -- bit-identical to the historical behaviour, and carrying the historical bias.
+    // Warn in that case, quantifying it, so an old table can never be mistaken for a fixed one.
+    op.table.Load(opac_table_file, rho_unit, T_unit, kappa_conv);
+    if (parthenon::Globals::my_rank == 0 && op.table.used_legacy_code_units) {
+      constexpr Real kGenRhoUnit = 5.467e-19; // gen_opacity_table.py RHO_UNIT, format v1
+      constexpr Real kGenLenUnit = 2.81e16;   // gen_opacity_table.py LEN_UNIT, format v1
+      const Real unit_ratio = kGenRhoUnit * kGenLenUnit / kappa_conv;
+      std::cout << "### WARNING Radiation (audit N13): " << opac_table_file
+                << " is a LEGACY (v1) opacity table: kappa is stored in the generator's own "
+                   "code units and is used verbatim. This run's opacity_unit = "
+                << kappa_conv << " vs the generator's " << kGenRhoUnit * kGenLenUnit
+                << " => kappa is " << 100.0 * (unit_ratio - 1.0)
+                << "% off. Regenerate with gen_opacity_table.py (which now emits cgs) to "
+                   "remove the bias; the v2 file is correct for any normalization."
+                << std::endl;
     }
   }
   pkg->AddParam("opacity", op);
@@ -290,8 +287,11 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   pkg->AddParam("use_h2diss", use_h2diss);
   EOSTable::EosTable eos_tab;
   if (use_h2diss) {
+    // Same units as the hydro package's load (audit N14): a v2 cgs table is converted with
+    // this run's scales, a legacy table is consumed verbatim. hydro.cpp does the warning.
     eos_tab.Load(pin->GetOrAddString("hydro", "eos_table_file",
-                                     "/beegfs/u/bbg6470/athenapk/src/eos/eos_table.bin"));
+                                     "/beegfs/u/bbg6470/athenapk/src/eos/eos_table.bin"),
+                 U.rho_unit, U.v_unit);
   }
   pkg->AddParam("eos_tab", eos_tab);
   pkg->AddParam("tfloor", pin->GetOrAddReal(bn, "tfloor_code", 1.0e-3)); // T floor (code)

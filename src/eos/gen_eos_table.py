@@ -37,6 +37,18 @@ theta_vib = 5987.0          # H2 vibrational temperature [K]
 X = 0.716; Y = 1.0 - X
 
 # ---- FHC code units ----
+# --- table file format (see eos_table_format.hpp; both must agree) ---
+EOS_MAGIC = 0x454F535441424C31   # ASCII "EOSTABL1"; cannot collide with a legacy file, whose
+                                 # first int64 is nr (a modest positive grid count)
+EOS_VERSION = 2
+EOS_FLAG_CGS = 1                 # bit 0: axes + arrays stored in cgs, converted at load
+
+# rho0/v0 below set the code units the physics is COMPUTED in. They are rounded copies of
+# scales the run derives exactly (units/be_normalization.hpp), which used to leak into the
+# emitted file and bias every lookup by +0.00315 % (audit N14). Since v2 writes CGS and the
+# loader converts with the run's own units, they no longer reach the output -- they only set
+# the internal working scale, and the conversion back out is exact. Do not use them to
+# normalize anything that is written.
 rho0 = 5.467e-19            # g/cm^3
 v0   = 1.9e4               # cm/s
 e_unit = rho0 * v0 * v0    # erg/cm^3
@@ -187,17 +199,34 @@ def build_table(path, nr=180, ne=220, nT=200,
         f.create_dataset("log10_T_grid", data=log10T)
         f.create_dataset("esp_code_of_rhoT", data=esp_rhoT)
     # flat binary for the C++ device loader (no HDF5-C-API dependency).
-    # header: int64 nr, ne, nT ; double lr0,dlr,le0,dle,lT0,dlT ; then row-major float64
-    # arrays P[nr,ne], cs2[nr,ne], logT[nr,ne], esp_rhoT[nr,nT].
+    #
+    # AUDIT N14 (2026-08-05). Format v2. The v1 file was headerless and stored everything in
+    # CODE units built from this script's own rounded rho0/v0, which the loader had no way to
+    # detect -- there was not one spare byte in the file for a unit. v2 stamps a magic +
+    # version + flags header and stores everything in CGS; the loader converts with the
+    # RUNNING simulation's units, so the file is correct for any normalization.
+    #
+    # header: int64 [MAGIC, VERSION, FLAGS, nr, ne, nT]
+    #         double [lr0, dlr, le0, dle, lT0, dlT, gen_rho0, gen_v0]
+    #           axes in CGS: log10(rho_cgs), log10(esp_cgs [erg/g]), log10(T[K])
+    #           gen_* are provenance and are 0 for a cgs table -- it assumes no units
+    # payload: row-major float64 P[nr,ne] (erg/cm^3), cs2[nr,ne] (cm^2/s^2),
+    #          logT[nr,ne] (log10 K, unit-free), esp_rhoT[nr,nT] (erg/g).
+    #
+    # The physics is computed in code units exactly as before and converted only here, so a
+    # v2 file is the v1 file times exact unit factors and nothing else.
+    esp_unit = v0 * v0                 # erg/g
     binpath = path.replace(".h5", ".bin")
     with open(binpath, "wb") as fb:
-        np.array([nr, ne, nT], dtype=np.int64).tofile(fb)
-        np.array([lr[0], lr[1]-lr[0], le[0], le[1]-le[0],
-                  log10T[0], log10T[1]-log10T[0]], dtype=np.float64).tofile(fb)
-        P_re.astype(np.float64).tofile(fb)
-        cs2_re.astype(np.float64).tofile(fb)
-        logT_re.astype(np.float64).tofile(fb)
-        esp_rhoT.astype(np.float64).tofile(fb)
+        np.array([EOS_MAGIC, EOS_VERSION, EOS_FLAG_CGS, nr, ne, nT], dtype=np.int64).tofile(fb)
+        np.array([lr[0] + np.log10(rho0), lr[1]-lr[0],
+                  le[0] + np.log10(esp_unit), le[1]-le[0],
+                  log10T[0], log10T[1]-log10T[0],
+                  0.0, 0.0], dtype=np.float64).tofile(fb)
+        (P_re * e_unit).astype(np.float64).tofile(fb)
+        (cs2_re * esp_unit).astype(np.float64).tofile(fb)
+        logT_re.astype(np.float64).tofile(fb)          # log10 T[K]: unit-free
+        (esp_rhoT * esp_unit).astype(np.float64).tofile(fb)
     print("wrote %s (%d bytes)" % (binpath, __import__('os').path.getsize(binpath)))
     print("wrote %s  hydro grid %dx%d  RT grid %dx%d" % (path, nr, ne, nr, nT))
     print("  log10 rho_code in [%.2f, %.2f]  log10 esp_code in [%.2f, %.2f]" %

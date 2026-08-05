@@ -28,6 +28,8 @@
 #include <basic_types.hpp>      // parthenon::Real
 #include <parthenon_arrays.hpp> // parthenon::ParArray2D (device tables)
 
+#include "opacity_table_format.hpp" // shared table header parser (audit N13)
+
 namespace Radiation {
 
 using parthenon::ParArray2D;
@@ -251,25 +253,27 @@ inline GroupOpacityTable BuildGroupOpacityTable(const DustOpacityModel &m, const
 //! gray kP[nr,nT], kR, ks (skipped here); then multipliers mP[ng,nT], mR[ng,nT] (T-only,
 //! rho-independent). This REPLACES the analytic DustOpacityModel band means with the tabulated
 //! frequency-resolved values. n_group must match the file's ng.
+//!
+//! The multipliers are RATIOS of opacities, so they are dimensionless and carry no unit
+//! error in either format version -- this reader only needs the header to know where the
+//! payload starts. It parses it through the SAME helper as OpacityTable::Load (audit N13);
+//! the two used to carry independent copies of the layout.
 inline GroupOpacityTable BuildGroupOpacityTableFromFile(const std::string &path,
                                                         const int n_group) {
   GroupOpacityTable tab;
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("GroupOpacityTable: cannot open " + path);
-  std::int64_t hdr[3];
-  f.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
-  const int ng = static_cast<int>(hdr[0]);
-  const int nr = static_cast<int>(hdr[1]);
-  const int nT = static_cast<int>(hdr[2]);
+  const auto hdr = ReadOpacityHeader(f, path);
+  const int ng = hdr.ng;
+  const int nr = hdr.nr;
+  const int nT = hdr.nT;
   if (ng != n_group)
     throw std::runtime_error("GroupOpacityTable: file n_group mismatch (" +
                              std::to_string(ng) + " != " + std::to_string(n_group) + ")");
-  double g[4];
-  f.read(reinterpret_cast<char *>(g), sizeof(g));
   tab.ng_ = ng;
   tab.nT_ = nT;
-  tab.lT0_ = g[2];
-  tab.dlT_ = g[3];
+  tab.lT0_ = hdr.lT0;
+  tab.dlT_ = hdr.dlT;
   if (ng == 1) return tab; // gray => inactive (Lookup returns 1)
   // audit N10: the T grid comes straight out of a binary header here, so it is even less
   // checked than the analytic path. Same three conditions, same reasons.

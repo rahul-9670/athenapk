@@ -7,6 +7,7 @@
 #include <limits>
 #include <array>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -184,6 +185,19 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   pkg->AddParam("grav_multipole_moments", mm0, /*is_mutable=*/true);
   pkg->AddParam("grav_has_multipole", has_multipole);
 
+  // AUDIT A2 (2026-08-05), FIXED. The global reductions in FillPoissonRHS (Jeans-swindle mean
+  // density, multipole moments) now run ONCE PER FillDerived SWEEP over the WHOLE local block
+  // list, instead of once per MeshData partition over that partition's blocks only. The two
+  // Params below carry the published result from the sweep's leading call to the trailing ones.
+  //   grav_reduction_tick counts calls within a sweep, modulo the rank's partition count; the
+  //   call that sees tick == 0 is the one that reduces and Allreduces. Every FillDerivedMesh
+  //   invocation in the code base is "for each default block partition" (Mesh::FillDerived,
+  //   and TaskRegion(num_partitions) at hydro_driver.cpp:357/445/863), so the tick returns to 0
+  //   exactly at sweep boundaries and every rank enters the collective exactly once per sweep --
+  //   which is what removes the deadlock, since DefaultNumPartitions() itself is NOT rank-uniform.
+  pkg->AddParam<int>("grav_reduction_tick", 0, /*is_mutable=*/true);
+  pkg->AddParam<Real>("grav_mean_rho", 0.0, /*is_mutable=*/true);
+
   // --- Fields ----------------------------------------------------------------
   // phi: solution variable. Needs ghost fill, fluxes, GMG prolong/restrict for AMR MG.
   {
@@ -326,6 +340,86 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   return pkg;
 }
 
+// AUDIT A2 (2026-08-05). Local (this-partition) partial sums feeding the two global gravity
+// reductions. Split out of FillPoissonRHS so the same kernels can be run over several MeshData
+// partitions and summed before the single MPI_Allreduce -- see FillPoissonRHS for the full
+// argument. `acc` is ACCUMULATED into, never zeroed here.
+//   acc[0]      total mass          (swindle)
+//   acc[1]      total volume        (swindle)
+//   acc[2..11]  the ten raw multipole moments about the coordinate origin
+namespace {
+constexpr int kNGravSums = 12;
+
+void AccumulateGravSums(MeshData<Real> *md, const bool need_swindle,
+                        const bool need_moments, const Real rho_floor,
+                        Real (&acc)[kNGravSums]) {
+  const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
+  IndexRange ib = md->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBoundsK(IndexDomain::interior);
+  const int nblocks = md->NumBlocks();
+  if (nblocks == 0) return;
+
+  if (need_swindle) {
+    Real total_mass = 0.0, total_volume = 0.0;
+    parthenon::par_reduce(
+        parthenon::loop_pattern_mdrange_tag, "SG::TotalMass", parthenon::DevExecSpace(), 0,
+        nblocks - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &lmass,
+                      Real &lvol) {
+          const auto &coords = cons_pack.GetCoords(b);
+          const Real vv = coords.CellVolume(k, j, i);
+          lvol += vv;
+          lmass += (cons_pack(b, IDN, k, j, i) > rho_floor ? cons_pack(b, IDN, k, j, i)
+                                                           : rho_floor) *
+                   vv;
+        },
+        Kokkos::Sum<Real>(total_mass), Kokkos::Sum<Real>(total_volume));
+    Kokkos::fence();
+    acc[0] += total_mass;
+    acc[1] += total_volume;
+  }
+
+  if (need_moments) {
+    Kokkos::View<Real *> mom("SG::moments", 10);
+    Kokkos::deep_copy(mom, 0.0);
+    parthenon::par_for(
+        DEFAULT_LOOP_PATTERN, "SG::Moments", parthenon::DevExecSpace(), 0, nblocks - 1,
+        kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+          const auto &coords = cons_pack.GetCoords(b);
+          const Real vv = coords.CellVolume(k, j, i);
+          const Real dm = (cons_pack(b, IDN, k, j, i) > rho_floor
+                               ? cons_pack(b, IDN, k, j, i)
+                               : rho_floor) *
+                          vv;
+          const Real x = coords.Xc<parthenon::X1DIR>(k, j, i);
+          const Real y = coords.Xc<parthenon::X2DIR>(k, j, i);
+          const Real z = coords.Xc<parthenon::X3DIR>(k, j, i);
+          Kokkos::atomic_add(&mom(0), dm);
+          Kokkos::atomic_add(&mom(1), dm * x);
+          Kokkos::atomic_add(&mom(2), dm * y);
+          Kokkos::atomic_add(&mom(3), dm * z);
+          Kokkos::atomic_add(&mom(4), dm * x * x);
+          Kokkos::atomic_add(&mom(5), dm * y * y);
+          Kokkos::atomic_add(&mom(6), dm * z * z);
+          Kokkos::atomic_add(&mom(7), dm * x * y);
+          Kokkos::atomic_add(&mom(8), dm * x * z);
+          Kokkos::atomic_add(&mom(9), dm * y * z);
+        });
+    Kokkos::fence();
+    auto mom_h = Kokkos::create_mirror_view(mom);
+    Kokkos::deep_copy(mom_h, mom);
+    for (int t = 0; t < 10; ++t) acc[2 + t] += mom_h(t);
+  }
+}
+
+// Serializes the tick read-modify-write. Parthenon's default task execution is single-threaded,
+// but nothing in the API forbids a threaded TaskRegion, and getting this wrong reintroduces
+// exactly the mismatched-collective-count deadlock the fix exists to remove.
+std::mutex grav_reduction_mutex;
+} // namespace
+
 // FillPoissonRHS: assemble rhs = 4 pi G (rho - rho_mean) from gas density.
 // Runs over ENTIRE (including ghosts) so solver sees consistent ghost values.
 void FillPoissonRHS(MeshData<Real> *md) {
@@ -373,123 +467,114 @@ void FillPoissonRHS(MeshData<Real> *md) {
   IndexRange kbe = md->GetBoundsK(IndexDomain::entire);
   const int nblocks = md->NumBlocks();
 
-  // AUDIT 2026-08-05 (A2). Both reductions below are GLOBAL quantities -- the Jeans-swindle
-  // mean density and the multipole moments of the WHOLE mass distribution. They are computed
-  // by summing over `md`'s blocks and then MPI_Allreduce'ing across ranks.
+  // AUDIT 2026-08-05 (A2), FIXED 2026-08-05. Both reductions below are GLOBAL quantities -- the
+  // Jeans-swindle mean density and the multipole moments of the WHOLE mass distribution.
   //
-  // But FillPoissonRHS is registered as FillDerivedMesh, which Parthenon invokes ONCE PER
-  // MeshData PARTITION. With more than one partition per rank the sum is over "partition i
-  // across all ranks" -- a FRACTION of the mesh -- so grav_mean_rho and every multipole
-  // moment (hence every exterior gravity BC face value) would be wrong, silently.
+  // THE BUG. FillPoissonRHS is registered as FillDerivedMesh, which Parthenon invokes ONCE PER
+  // MeshData PARTITION. The original code summed over `md`'s blocks and Allreduce'd. With more
+  // than one partition per rank that sum is over "partition i across all ranks" -- a FRACTION of
+  // the mesh -- so grav_mean_rho and every multipole moment (hence every exterior gravity BC face
+  // value) came out wrong, silently. Worse: DefaultNumPartitions() is
+  // min(default_num_packs_, block_list.size()) in the packs_per_rank branch
+  // (parthenon/src/mesh/mesh.hpp:178), so a rank holding 1 block gets 1 partition while a
+  // neighbour gets N; the ranks then reach the Allreduce a different number of times => DEADLOCK.
   //
-  // Worse than wrong: DefaultNumPartitions() is min(default_num_packs_, block_list.size())
-  // in the packs_per_rank branch (parthenon/src/mesh/mesh.hpp), so a rank holding 1 block
-  // gets 1 partition while a neighbour gets N. The ranks then reach these Allreduces a
-  // different number of times => DEADLOCK, not a wrong number.
+  // THE FIX, in two parts, because the two failure modes are different:
+  //   (1) WRONG VALUE -- the leading call reduces over EVERY default partition on this rank
+  //       (AccumulateGravSums in the loop below), not just its own, so the local partial sum is
+  //       the rank's whole contribution before the Allreduce. GetOrAdd(md->StageName(), i) is the
+  //       same container the driver itself hands to FillDerived, so this reads the CURRENT stage's
+  //       `cons`, not "base" -- reducing over "base" during an RKL2 sub-stage would silently use
+  //       the wrong density.
+  //   (2) DEADLOCK -- the collective must be entered a rank-uniform number of times. Partition
+  //       count is not rank-uniform; SWEEP count is. grav_reduction_tick counts calls modulo this
+  //       rank's partition count, and only the call that sees tick == 0 reduces. Every
+  //       FillDerivedMesh invocation in the tree is "for each default block partition"
+  //       (Mesh::FillDerived at mesh.cpp:715, TaskRegion(num_partitions) at
+  //       hydro_driver.cpp:357/445/863), so the tick returns to 0 exactly at sweep boundaries.
+  //       The trailing calls of the sweep read the published Params instead.
   //
-  // Unreachable today: no deck sets <parthenon/mesh> pack_size or packs_per_rank, so
-  // DefaultNumPartitions() == 1. This guard makes that assumption explicit and loud rather
-  // than latent. (The tracers task region guards the same way, hydro_driver.cpp.) Fixing it
-  // properly means hoisting the reduction out of the per-partition call -- worth doing only
-  // when someone actually wants multiple partitions per rank.
-  if (use_swindle || has_multipole) {
-    PARTHENON_REQUIRE_THROWS(
-        pm->GetDefaultBlockPartitions().size() == 1,
-        "self-gravity: the Jeans swindle and the multipole boundary condition reduce over a "
-        "single MeshData partition and then Allreduce, so they require exactly one partition "
-        "per rank. Unset <parthenon/mesh> pack_size / packs_per_rank, or hoist the reduction "
-        "in SelfGravity::FillPoissonRHS out of the per-partition FillDerived call.");
-  }
-
-  // --- Mean density (for Jeans swindle) via par_reduce + MPI Allreduce -------
+  // BIT-IDENTITY WHEN npart == 1 (every deck today). tick is 0 on entry and (0+1)%1 == 0, so the
+  // leading branch is taken on every call; the partition loop runs once over `md` itself; the two
+  // Allreduces keep their original element counts (2 and 10, NOT one fused 12 -- MPI may pick a
+  // different reduction algorithm by message size, and that could move the last bit). The
+  // arithmetic is therefore the same operations in the same order as before this fix.
+  const int npart_local = static_cast<int>(pm->GetDefaultBlockPartitions().size());
   Real grav_mean_rho = 0.0;
-  if (use_swindle) {
-    Real total_mass = 0.0, total_volume = 0.0;
-    parthenon::par_reduce(
-        parthenon::loop_pattern_mdrange_tag, "SG::TotalMass",
-        parthenon::DevExecSpace(), 0, nblocks - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i,
-                      Real &lmass, Real &lvol) {
-          const auto &coords = cons_pack.GetCoords(b);
-          const Real vv = coords.CellVolume(k, j, i);
-          lvol += vv;
-          lmass += (cons_pack(b, IDN, k, j, i) > rho_floor ? cons_pack(b, IDN, k, j, i) : rho_floor) * vv;
-        },
-        Kokkos::Sum<Real>(total_mass), Kokkos::Sum<Real>(total_volume));
-    Kokkos::fence();
-#ifdef MPI_PARALLEL
-    Real buf[2] = {total_mass, total_volume};
-    PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, 2, MPI_PARTHENON_REAL,
-                                      MPI_SUM, MPI_COMM_WORLD));
-    total_mass = buf[0];
-    total_volume = buf[1];
-#endif
-    grav_mean_rho = total_mass / total_volume;
-  }
+  if (use_swindle || has_multipole) {
+    bool lead_call = true;
+    {
+      std::lock_guard<std::mutex> lk(grav_reduction_mutex);
+      int tick = grav_pkg->Param<int>("grav_reduction_tick");
+      // A regrid between sweeps changes npart_local; resync rather than trust a stale tick.
+      if (tick >= npart_local) tick = 0;
+      lead_call = (tick == 0);
+      grav_pkg->UpdateParam("grav_reduction_tick", (tick + 1) % npart_local);
+    }
 
-  // --- Multipole moments (for multipole exterior BC) -------------------------
-  // Ten raw moments about the coordinate origin (mass, mass-weighted x_i, and
-  // mass-weighted x_i x_j) summed over interior cells, then a global MPI_Allreduce.
-  // From these derive the center of mass and the traceless quadrupole about it.
-  // Uses the FULL density (not rho - rho_mean): the multipole BC is only used on
-  // isolated (non-periodic) boxes where the swindle is off, so RHS = 4piG*rho and
-  // the exterior expansion is of that same rho -- consistent by construction.
-  if (has_multipole) {
-    Kokkos::View<Real *> mom("SG::moments", 10);
-    Kokkos::deep_copy(mom, 0.0);
-    parthenon::par_for(
-        DEFAULT_LOOP_PATTERN, "SG::Moments", parthenon::DevExecSpace(), 0, nblocks - 1,
-        kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
-          const auto &coords = cons_pack.GetCoords(b);
-          const Real vv = coords.CellVolume(k, j, i);
-          const Real dm = (cons_pack(b, IDN, k, j, i) > rho_floor ? cons_pack(b, IDN, k, j, i) : rho_floor) * vv;
-          const Real x = coords.Xc<parthenon::X1DIR>(k, j, i);
-          const Real y = coords.Xc<parthenon::X2DIR>(k, j, i);
-          const Real z = coords.Xc<parthenon::X3DIR>(k, j, i);
-          Kokkos::atomic_add(&mom(0), dm);
-          Kokkos::atomic_add(&mom(1), dm * x);
-          Kokkos::atomic_add(&mom(2), dm * y);
-          Kokkos::atomic_add(&mom(3), dm * z);
-          Kokkos::atomic_add(&mom(4), dm * x * x);
-          Kokkos::atomic_add(&mom(5), dm * y * y);
-          Kokkos::atomic_add(&mom(6), dm * z * z);
-          Kokkos::atomic_add(&mom(7), dm * x * y);
-          Kokkos::atomic_add(&mom(8), dm * x * z);
-          Kokkos::atomic_add(&mom(9), dm * y * z);
-        });
-    Kokkos::fence();
-    auto mom_h = Kokkos::create_mirror_view(mom);
-    Kokkos::deep_copy(mom_h, mom);
-    Real h[10];
-    for (int t = 0; t < 10; ++t) h[t] = mom_h(t);
+    if (lead_call) {
+      Real acc[kNGravSums] = {};
+      if (npart_local == 1) {
+        AccumulateGravSums(md, use_swindle, has_multipole, rho_floor, acc);
+      } else {
+        const std::string stage = md->StageName();
+        for (int p = 0; p < npart_local; ++p) {
+          AccumulateGravSums(pm->mesh_data.GetOrAdd(stage, p).get(), use_swindle,
+                             has_multipole, rho_floor, acc);
+        }
+      }
+
+      // --- Mean density (for Jeans swindle) ------------------------------------
+      if (use_swindle) {
+        Real buf[2] = {acc[0], acc[1]};
 #ifdef MPI_PARALLEL
-    PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, h, 10, MPI_PARTHENON_REAL, MPI_SUM,
-                                      MPI_COMM_WORLD));
+        PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, buf, 2, MPI_PARTHENON_REAL,
+                                          MPI_SUM, MPI_COMM_WORLD));
 #endif
-    MultipoleMoments mm;
-    mm.four_pi_G = four_pi_G;
-    mm.M = h[0];
-    const Real invM = (h[0] != 0.0) ? 1.0 / h[0] : 0.0;
-    mm.cx = h[1] * invM;
-    mm.cy = h[2] * invM;
-    mm.cz = h[3] * invM;
-    // Second moments of mass about the COM: mu_ij = <x_i x_j> - M c_i c_j.
-    const Real muxx = h[4] - mm.M * mm.cx * mm.cx;
-    const Real muyy = h[5] - mm.M * mm.cy * mm.cy;
-    const Real muzz = h[6] - mm.M * mm.cz * mm.cz;
-    const Real muxy = h[7] - mm.M * mm.cx * mm.cy;
-    const Real muxz = h[8] - mm.M * mm.cx * mm.cz;
-    const Real muyz = h[9] - mm.M * mm.cy * mm.cz;
-    // Traceless Cartesian quadrupole Q_ij = 3 mu_ij - delta_ij tr(mu).
-    const Real tr = muxx + muyy + muzz;
-    mm.Qxx = 3.0 * muxx - tr;
-    mm.Qyy = 3.0 * muyy - tr;
-    mm.Qzz = 3.0 * muzz - tr;
-    mm.Qxy = 3.0 * muxy;
-    mm.Qxz = 3.0 * muxz;
-    mm.Qyz = 3.0 * muyz;
-    grav_pkg->UpdateParam("grav_multipole_moments", mm);
+        grav_pkg->UpdateParam("grav_mean_rho", Real(buf[0] / buf[1]));
+      }
+
+      // --- Multipole moments (for multipole exterior BC) -----------------------
+      // Ten raw moments about the coordinate origin (mass, mass-weighted x_i, and
+      // mass-weighted x_i x_j) summed over interior cells, then a global MPI_Allreduce.
+      // From these derive the center of mass and the traceless quadrupole about it.
+      // Uses the FULL density (not rho - rho_mean): the multipole BC is only used on
+      // isolated (non-periodic) boxes where the swindle is off, so RHS = 4piG*rho and
+      // the exterior expansion is of that same rho -- consistent by construction.
+      if (has_multipole) {
+        Real h[10];
+        for (int t = 0; t < 10; ++t) h[t] = acc[2 + t];
+#ifdef MPI_PARALLEL
+        PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, h, 10, MPI_PARTHENON_REAL,
+                                          MPI_SUM, MPI_COMM_WORLD));
+#endif
+        MultipoleMoments mm;
+        mm.four_pi_G = four_pi_G;
+        mm.M = h[0];
+        const Real invM = (h[0] != 0.0) ? 1.0 / h[0] : 0.0;
+        mm.cx = h[1] * invM;
+        mm.cy = h[2] * invM;
+        mm.cz = h[3] * invM;
+        // Second moments of mass about the COM: mu_ij = <x_i x_j> - M c_i c_j.
+        const Real muxx = h[4] - mm.M * mm.cx * mm.cx;
+        const Real muyy = h[5] - mm.M * mm.cy * mm.cy;
+        const Real muzz = h[6] - mm.M * mm.cz * mm.cz;
+        const Real muxy = h[7] - mm.M * mm.cx * mm.cy;
+        const Real muxz = h[8] - mm.M * mm.cx * mm.cz;
+        const Real muyz = h[9] - mm.M * mm.cy * mm.cz;
+        // Traceless Cartesian quadrupole Q_ij = 3 mu_ij - delta_ij tr(mu).
+        const Real tr = muxx + muyy + muzz;
+        mm.Qxx = 3.0 * muxx - tr;
+        mm.Qyy = 3.0 * muyy - tr;
+        mm.Qzz = 3.0 * muzz - tr;
+        mm.Qxy = 3.0 * muxy;
+        mm.Qxz = 3.0 * muxz;
+        mm.Qyz = 3.0 * muyz;
+        grav_pkg->UpdateParam("grav_multipole_moments", mm);
+      }
+    }
+
+    if (use_swindle) grav_mean_rho = grav_pkg->Param<Real>("grav_mean_rho");
   }
 
   // --- Fill rhs over entire domain (incl. ghosts) ----------------------------

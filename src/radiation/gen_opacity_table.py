@@ -37,10 +37,21 @@ h_P = 6.62607015e-27      # erg s
 k_B = 1.380649e-16        # erg/K
 h_over_k = h_P / k_B      # s K  (= 4.7992e-11)
 
-# --- shared FHC code units (must match units/physical_units.hpp defaults) ---
-RHO_UNIT = 5.467e-19      # g/cm^3
-LEN_UNIT = 2.81e16        # cm
-OPACITY_UNIT = RHO_UNIT * LEN_UNIT   # kappa_code = kappa_cgs * OPACITY_UNIT  (= 1.536e-2)
+# --- table file format (see opacity_table_format.hpp; both must agree) ---
+MAGIC = 0x4F50414354424C31      # ASCII "OPACTBL1"; cannot collide with a legacy file, whose
+                                # first int64 is ng (a small positive group count)
+VERSION = 2
+FLAG_KAPPA_CGS = 1              # bit 0: gray kappa arrays are cgs, scale by opacity_unit at load
+#
+# AUDIT N13 (2026-08-05). This script used to hardcode
+#     RHO_UNIT = 5.467e-19 ; LEN_UNIT = 2.81e16 ; OPACITY_UNIT = RHO_UNIT*LEN_UNIT
+# and write kappa ALREADY MULTIPLIED by OPACITY_UNIT. Those are ROUNDED copies of scales that
+# the run derives exactly (units/be_normalization.hpp), so every tabulated kappa came out
+# +0.135 % too large -- a bias no C++ guard could see, because the constants lived here.
+#
+# Version 2 writes kappa in **cgs** and lets the loader multiply by the RUNNING simulation's
+# opacity_unit. The table is then correct for every normalization, and this script no longer
+# needs to know the code units at all. Do not reintroduce them.
 
 
 # ---------------------------------------------------------------------------------------
@@ -175,22 +186,26 @@ def build(path, nr, nT, rho_min, rho_max, T_min, T_max, edges):
         for j in range(nT):
             T = 10.0**lT[j]
             gP, gR, _, _ = group_opacities(rho, T, edges)
-            kP[i, j] = gP * OPACITY_UNIT
-            kR[i, j] = gR * OPACITY_UNIT
-            ks[i, j] = scattering_kappa(rho, T) * OPACITY_UNIT
-    # binary: int64 [ng, nr, nT]; double [lr0,dlr,lT0,dlT];
-    #   gray kP[nr,nT], kR[nr,nT], ks[nr,nT]  (row-major float64, code units)
+            # CGS [cm^2/g] -- NOT code units. The loader applies the run's opacity_unit.
+            kP[i, j] = gP
+            kR[i, j] = gR
+            ks[i, j] = scattering_kappa(rho, T)
+    # binary v2: int64 [MAGIC, VERSION, FLAGS, ng, nr, nT];
+    #   double [lr0, dlr, lT0, dlT, gen_rho_unit, gen_len_unit, gen_opacity_unit]
+    #     (the three gen_* are provenance and are 0 for a cgs table -- it assumes no units)
+    #   gray kP[nr,nT], kR[nr,nT], ks[nr,nT]  (row-major float64, CGS cm^2/g)
     #   mult mP[ng,nT], mR[ng,nT]             (row-major float64, dimensionless)
     with open(path, "wb") as f:
-        np.array([ng, nr, nT], dtype=np.int64).tofile(f)
-        np.array([lr[0], lr[1]-lr[0], lT[0], lT[1]-lT[0]], dtype=np.float64).tofile(f)
+        np.array([MAGIC, VERSION, FLAG_KAPPA_CGS, ng, nr, nT], dtype=np.int64).tofile(f)
+        np.array([lr[0], lr[1]-lr[0], lT[0], lT[1]-lT[0], 0.0, 0.0, 0.0],
+                 dtype=np.float64).tofile(f)
         kP.astype(np.float64).tofile(f)
         kR.astype(np.float64).tofile(f)
         ks.astype(np.float64).tofile(f)
         mP.astype(np.float64).tofile(f)
         mR.astype(np.float64).tofile(f)
-    print(f"wrote {path}: ng={ng} grid {nr}x{nT}  logrho[{lr[0]:.1f},{lr[-1]:.1f}] "
-          f"logT[{lT[0]:.2f},{lT[-1]:.2f}]  OPACITY_UNIT={OPACITY_UNIT:.4e}")
+    print(f"wrote {path}: format v{VERSION} (kappa in CGS) ng={ng} grid {nr}x{nT}  "
+          f"logrho[{lr[0]:.1f},{lr[-1]:.1f}] logT[{lT[0]:.2f},{lT[-1]:.2f}]")
     # sanity anchors (cgs gray Rosseland vs Bell&Lin; per-group multipliers)
     for T in [10.0, 100.0, 1000.0, 1.0e4]:
         kBL = bell_lin_kappa(1e-12, T)

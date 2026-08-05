@@ -71,7 +71,14 @@ TaskStatus CT_AssembleEMF(MeshData<Real> *md) {
         });
   }
 
-  if (ndim > 2) {
+  // AUDIT N1 (2026-08-05), FIXED. E1/E2 are now assembled in 2D as well, so B_z can evolve.
+  // `km` is the k-neighbour of the edge: k-1 in 3D, and k itself in 2D, where the mesh has a
+  // single x3 layer (IndexShape::ke returns 0 when entire_ncells_[2] == 1, so k-1 would index
+  // out of bounds) and d/dz vanishes identically. With km == k the 4-cell average collapses to
+  // the correct 2-cell in-plane average, and in 3D km == k-1 reproduces the previous
+  // expressions token for token -- 3D is bit-identical by construction.
+  if (ndim > 1) {
+    const int km = (ndim > 2) ? -1 : 0; // offset added to k
     // E_x on E1 edges (corner in the y-z plane).
     IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E1);
     IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E1);
@@ -81,8 +88,8 @@ TaskStatus CT_AssembleEMF(MeshData<Real> *md) {
         kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
           pack.flux(b, TE::E1, Bf(), k, j, i) =
-              0.25 * (EmfCC<0>(prim, b, k, j, i) + EmfCC<0>(prim, b, k - 1, j, i) +
-                      EmfCC<0>(prim, b, k, j - 1, i) + EmfCC<0>(prim, b, k - 1, j - 1, i));
+              0.25 * (EmfCC<0>(prim, b, k, j, i) + EmfCC<0>(prim, b, k + km, j, i) +
+                      EmfCC<0>(prim, b, k, j - 1, i) + EmfCC<0>(prim, b, k + km, j - 1, i));
         });
     // E_y on E2 edges (corner in the z-x plane).
     ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E2);
@@ -93,8 +100,8 @@ TaskStatus CT_AssembleEMF(MeshData<Real> *md) {
         kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
           pack.flux(b, TE::E2, Bf(), k, j, i) =
-              0.25 * (EmfCC<1>(prim, b, k, j, i) + EmfCC<1>(prim, b, k - 1, j, i) +
-                      EmfCC<1>(prim, b, k, j, i - 1) + EmfCC<1>(prim, b, k - 1, j, i - 1));
+              0.25 * (EmfCC<1>(prim, b, k, j, i) + EmfCC<1>(prim, b, k + km, j, i) +
+                      EmfCC<1>(prim, b, k, j, i - 1) + EmfCC<1>(prim, b, k + km, j, i - 1));
         });
   }
   return TaskStatus::complete;
@@ -277,6 +284,63 @@ TaskStatus CT_AssembleEMF_GS05(MeshData<Real> *md, const Real dt) {
               0.25 * (de_l3 + de_r3 + de_l1 + de_r1 + e2x3f_im + e2x3f_i + e2x1f_km +
                       e2x1f_k);
         });
+  } else if (ndim == 2) {
+    // AUDIT N1 (2026-08-05), FIXED. 2D E1/E2, so that B_z evolves instead of being frozen.
+    //
+    // This is NOT the km-collapse used in the Balsara-Spicer assembler above: the 3D GS05
+    // formula reads cons.flux(X3DIR, ...), and in 2D the X3 flux is NEVER COMPUTED -- the
+    // Riemann solver skips it and even ResetFluxes returns early for ndim < 3
+    // (hydro_driver.cpp:115). Reading it would consume uninitialized memory.
+    //
+    // The correct 2D reduction is exact and needs no averaging or upwinding at all. An E1 edge
+    // in a single-layer 2D mesh IS the x2 face, and an E2 edge IS the x1 face; each has exactly
+    // ONE bounding face EMF instead of four, so the GS05 corner reconstruction (which averages
+    // four face EMFs and adds four contact-upwinded gradient corrections) has nothing to
+    // average -- the face value is the edge value. Using this codebase's sign convention from
+    // the header comment above,
+    //     E_x from the y-face = -F_y(B_z) = -cons.flux(X2DIR, IB3)
+    //     E_y from the x-face = +F_x(B_z) = +cons.flux(X1DIR, IB3)
+    // With these, CurlEMF<3> reduces to
+    //     dB_z/dt = -[F_x(B_z)|i+1 - F_x(B_z)|i]/dx1 - [F_y(B_z)|j+1 - F_y(B_z)|j]/dx2,
+    // i.e. exactly the conservative finite-volume update of B_z -- which is the right answer in
+    // 2D and is what Athena++'s ComputeCornerE does on its own nx3 == 1 branch.
+    //
+    // THIS IS THE EXACT z-INVARIANT LIMIT OF THE 3D FORMULA, not a separate scheme. Worth
+    // writing out, because it is what makes runs/ct_tests/n1_2d/ a test of an IDENTITY rather
+    // than a loose consistency check. Take the 3D E1 branch above and impose d/dz = 0. Write
+    // A = e1x2f_k = e1x2f_km (the y-face E_x, identical on both z-layers) and note that the
+    // x3-face EMF returned by a Riemann solve with identical L/R states IS the cell-centred
+    // value, so e1x3f_j = cc_kk_jj = cc_km_jj and e1x3f_jm = cc_kk_jm = cc_km_jm. Then
+    //     de_l3 = (1-w)(e1x3f_j - cc_km_jj) + w(e1x3f_jm - cc_km_jm) = 0,   de_r3 = 0,
+    //     de_l2 = A - cc_jm,                                                de_r2 = A - cc_jj,
+    // and the assembled edge value is
+    //     0.25*(0 + 0 + (A - cc_jm) + (A - cc_jj) + e1x2f_km + e1x2f_k + e1x3f_jm + e1x3f_j)
+    //   = 0.25*(2A - cc_jm - cc_jj + 2A + cc_jm + cc_jj) = A.
+    // The same cancellation gives E2 = e2x1f = +F_x(B_z). So a 3D run whose initial condition
+    // has no z-dependence and this 2D branch produce the SAME NUMBER, which is exactly what the
+    // 2D-vs-3D validation legs assert.
+    {
+      IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E1);
+      IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E1);
+      IndexRange kb = md->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::E1);
+      parthenon::par_for(
+          DEFAULT_LOOP_PATTERN, "CT_EMF_GS05_E1_2D", parthenon::DevExecSpace(), 0, nb - 1,
+          kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+          KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+            pack.flux(b, TE::E1, Bf(), k, j, i) = -cons_pack(b).flux(X2DIR, IB3, k, j, i);
+          });
+    }
+    {
+      IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E2);
+      IndexRange jb = md->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::E2);
+      IndexRange kb = md->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::E2);
+      parthenon::par_for(
+          DEFAULT_LOOP_PATTERN, "CT_EMF_GS05_E2_2D", parthenon::DevExecSpace(), 0, nb - 1,
+          kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+          KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+            pack.flux(b, TE::E2, Bf(), k, j, i) = cons_pack(b).flux(X1DIR, IB3, k, j, i);
+          });
+    }
   }
   return TaskStatus::complete;
 }
@@ -340,8 +404,12 @@ TaskStatus CT_UpdateBf(MeshData<Real> *md_base, MeshData<Real> *md_u1, const Rea
                                          beta_dt * curl;
         });
   }
-  // ---- F3 (B_z): dB_z/dt = -(E_y(i+1)-E_y(i))/dx + (E_x(j+1)-E_x(j))/dy (3D only) ----
-  if (three_d) {
+  // ---- F3 (B_z): dB_z/dt = -(E_y(i+1)-E_y(i))/dx + (E_x(j+1)-E_x(j))/dy ----
+  // AUDIT N1 (2026-08-05), FIXED: was `if (three_d)`, which FROZE B_z in 2D. The curl above
+  // reads E2 at (i,i+1) and E1 at (j,j+1) -- both in-plane -- so it is well defined in 2D as
+  // soon as E1/E2 exist there, which CT_AssembleEMF{,_GS05} now guarantee. 1D is still
+  // excluded: the E1 term would step off the degenerate x2 axis.
+  if (ndim > 1) {
     IndexRange ib = md_base->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::F3);
     IndexRange jb = md_base->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::F3);
     IndexRange kb = md_base->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::F3);
@@ -422,7 +490,9 @@ TaskStatus CT_ZeroEMF(MeshData<Real> *md) {
         });
   };
   zero(TE::E3, "CT_ZeroEMF_E3");
-  if (ndim > 2) {
+  // AUDIT N1 (2026-08-05), FIXED: `ndim > 2` here left the 2D E1/E2 slots holding whatever the
+  // previous sub-step wrote, which the diffusive `+=` accumulators would then have added to.
+  if (ndim > 1) {
     zero(TE::E1, "CT_ZeroEMF_E1");
     zero(TE::E2, "CT_ZeroEMF_E2");
   }
@@ -467,7 +537,7 @@ TaskStatus CT_CurlEMFToBf(MeshData<Real> *md_emf, MeshData<Real> *md_out) {
           out(b, TE::F2, Bf(), k, j, i) = CurlEMF<2>(emf, c, b, k, j, i, three_d);
         });
   }
-  if (three_d) {
+  if (ndim > 1) { // AUDIT N1: B_z is a live degree of freedom in 2D too.
     IndexRange ib = md_emf->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::F3);
     IndexRange jb = md_emf->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::F3);
     IndexRange kb = md_emf->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::F3);
@@ -513,7 +583,7 @@ TaskStatus CT_RKL2FirstBf(MeshData<Real> *md_Y0, MeshData<Real> *md_base,
   };
   run(TE::F1, "CT_RKL2First_F1");
   run(TE::F2, "CT_RKL2First_F2");
-  if (ndim > 2) run(TE::F3, "CT_RKL2First_F3");
+  if (ndim > 1) run(TE::F3, "CT_RKL2First_F3"); // AUDIT N1: B_z evolves in 2D as well.
   return TaskStatus::complete;
 }
 
@@ -574,7 +644,7 @@ TaskStatus CT_RKL2OtherBf(MeshData<Real> *md_Y0, MeshData<Real> *md_base,
           base(b, TE::F2, Bf(), k, j, i) = yj;
         });
   }
-  if (three_d) {
+  if (ndim > 1) { // AUDIT N1: B_z evolves in 2D as well.
     IndexRange ib = md_base->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::F3);
     IndexRange jb = md_base->GetBoundsJ(CellLevel::same, IndexDomain::interior, TE::F3);
     IndexRange kb = md_base->GetBoundsK(CellLevel::same, IndexDomain::interior, TE::F3);
@@ -915,30 +985,46 @@ Real CT_MaxRelFaceDivB(MeshData<Real> *md) {
 }
 
 //----------------------------------------------------------------------------------------
-//! AUDIT 2026-08-05 (N1) -- THE 2D CT B_z FREEZE, MADE LOUD.
+//! AUDIT 2026-08-05 (N1) -- THE 2D CT B_z FREEZE. **FIXED 2026-08-05; this is now a
+//! DIAGNOSTIC, not a gate.**
 //!
-//! In two dimensions this implementation never evolves B_z. `CT_AssembleEMF` and
-//! `CT_AssembleEMF_GS05` build the E1/E2 edge EMFs only when `ndim > 2` (they average over
+//! WHAT WAS WRONG. In two dimensions this implementation never evolved B_z. `CT_AssembleEMF`
+//! and `CT_AssembleEMF_GS05` built the E1/E2 edge EMFs only when `ndim > 2` (they average over
 //! k and k-1, and a 2D Parthenon mesh has no ghost cells in x3 to average with), and every
-//! F3 update -- `CT_UpdateBf`, `CT_CurlEMFToBf`, `CT_RKL2FirstBf`, `CT_RKL2OtherBf` -- is
-//! likewise behind `if (three_d)`. `CT_ProjectBfToCC` then copies the frozen face value onto
-//! cons(IB3), so the cell-centred B_z is frozen as well. The physics says otherwise:
+//! F3 update -- `CT_UpdateBf`, `CT_CurlEMFToBf`, `CT_RKL2FirstBf`, `CT_RKL2OtherBf` -- sat
+//! behind `if (three_d)`. `CT_ProjectBfToCC` then copied the frozen face value onto cons(IB3),
+//! freezing the cell-centred B_z as well. The physics says otherwise:
 //!
 //!     dB_z/dt = -(dE_y/dx - dE_x/dy) = div(v_z B_pol)   in 2D,
 //!
-//! which is non-zero whenever v_z != 0, and the non-ideal EMFs add more. The limitation was
-//! known -- pgen/diffusion.cpp and the two hall_whistler decks say so in comments, and the
-//! whistler test is run at nx3 = 4 to dodge it -- but nothing ENFORCED it, so a 2D CT run
-//! with a z-field simply returned a wrong answer that looks like "the term does nothing".
+//! non-zero whenever v_z != 0, with the non-ideal EMFs adding more. The limitation was known --
+//! pgen/diffusion.cpp and the two hall_whistler decks say so in comments, and the whistler test
+//! runs at nx3 = 4 to dodge it -- but nothing ENFORCED it, so a 2D CT run with a z-field simply
+//! returned a wrong answer that looks like "the term does nothing".
 //!
-//! The invariant is closed, which is what makes a guard sufficient rather than a patch: in
-//! 2D with B_z == 0 and v_z == 0, the z-Lorentz force is (JxB)_z = J_x B_y - J_y B_x with
-//! J_x = d_y B_z - d_z B_y = 0 and J_y = d_z B_x - d_x B_z = 0, and no other term drives
-//! z-momentum. So v_z stays zero, B_z stays zero, and the 2D scheme is EXACT. Outside that
-//! corner it is wrong. This reduction is the test for the corner; the driver runs it once,
-//! at the first step, and hard-fails otherwise.
+//! HOW IT IS FIXED. E1 and E2 now exist in 2D and the F3 update is gated on `ndim > 1`:
+//!   * ideal, Balsara-Spicer (`CT_AssembleEMF`): the 4-cell average collapses to the 2-cell
+//!     in-plane one via the `km` offset (k-1 in 3D, k in 2D).
+//!   * ideal, GS05 (`CT_AssembleEMF_GS05`): a SEPARATE 2D branch, because the 3D formula reads
+//!     the X3 flux, which a 2D run never computes. In 2D an E1 edge IS the x2 face and an E2
+//!     edge IS the x1 face, so E_x = -F_y(B_z) and E_y = +F_x(B_z) with no averaging and no
+//!     upwind correction -- there is only one bounding face, not four. CurlEMF<3> then reduces
+//!     to the conservative finite-volume update of B_z, which is the correct 2D answer and what
+//!     Athena++ does on its own nx3 == 1 branch.
+//!   * non-ideal (`CT_AddOhmicEMF`, `CT_AddAmbipolarEMF`, `CT_AddHallEMF`): same `km` collapse,
+//!     which zeroes every d/dz difference exactly. Omitting these would have been worse than
+//!     the original freeze -- B_z would evolve ideally while its diffusion silently vanished.
+//! All 3D expressions are unchanged token for token (km == -1 restores them), so the 3D
+//! production path is bit-identical by construction.
 //!
-//! Returns max(|B_z|, |v_z|) over interior cells (0 on the 3D path -- never called there).
+//! WHY THIS REDUCTION IS STILL HERE. It measures the corner in which the OLD scheme happened to
+//! be exact: in 2D with B_z == 0 and v_z == 0 the z-Lorentz force is (JxB)_z = J_x B_y - J_y B_x
+//! with J_x = d_y B_z - d_z B_y = 0 and J_y = d_z B_x - d_x B_z = 0, and nothing else drives
+//! z-momentum, so both stay zero. That is now a REGRESSION TEST, not a precondition: a 2D CT run
+//! started in that corner must still report 0 here, and one started outside it must produce a
+//! non-zero, physically evolving B_z instead of a frozen one.
+//!
+//! Returns max(|B_z|, |v_z|) over interior cells.
 Real CT_Max2DOutOfPlane(MeshData<Real> *md) {
   auto prim = md->PackVariables(std::vector<std::string>{"prim"});
   auto cons = md->PackVariables(std::vector<std::string>{"cons"});
@@ -1063,7 +1149,14 @@ TaskStatus CT_AddOhmicEMF(MeshData<Real> *md) {
         });
   }
 
-  if (three_d) {
+  // AUDIT N1 (2026-08-05), FIXED: was `if (three_d)`. Now that B_z evolves in 2D, dropping the
+  // Ohmic contribution to E1/E2 there would be a silent physics error instead of a harmless
+  // no-op. `km` is the offset to the edge's k-neighbour: -1 in 3D, 0 in 2D (single x3 layer, no
+  // x3 ghosts, d/dz == 0). With km == 0 the d/dz terms vanish exactly and the 4-cell eta average
+  // collapses to the correct 2-cell in-plane one; with km == -1 the expressions are unchanged
+  // token for token, so 3D is bit-identical.
+  if (ndim > 1) {
+    const int km = three_d ? -1 : 0;
     // ---- E1 edge (y-z corner, i,j-1/2,k-1/2). J1 = dBz/dy - dBy/dz. ----
     {
       IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E1);
@@ -1078,14 +1171,14 @@ TaskStatus CT_AddOhmicEMF(MeshData<Real> *md) {
                 (pack(b, TE::F3, Bf(), k, j, i) - pack(b, TE::F3, Bf(), k, j - 1, i)) /
                 c.Dxc<X2DIR>(k, j, i);
             const Real dBy_dz =
-                (pack(b, TE::F2, Bf(), k, j, i) - pack(b, TE::F2, Bf(), k - 1, j, i)) /
+                (pack(b, TE::F2, Bf(), k, j, i) - pack(b, TE::F2, Bf(), k + km, j, i)) /
                 c.Dxc<X3DIR>(k, j, i);
             const Real j1 = dBz_dy - dBy_dz;
             const Real eta =
                 0.25 * (CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j, i) +
                         CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j - 1, i) +
-                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k - 1, j, i) +
-                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k - 1, j - 1, i));
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k + km, j, i) +
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k + km, j - 1, i));
             pack.flux(b, TE::E1, Bf(), k, j, i) += eta * j1;
           });
     }
@@ -1100,7 +1193,7 @@ TaskStatus CT_AddOhmicEMF(MeshData<Real> *md) {
           KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
             const auto &c = pack.GetCoordinates(b);
             const Real dBx_dz =
-                (pack(b, TE::F1, Bf(), k, j, i) - pack(b, TE::F1, Bf(), k - 1, j, i)) /
+                (pack(b, TE::F1, Bf(), k, j, i) - pack(b, TE::F1, Bf(), k + km, j, i)) /
                 c.Dxc<X3DIR>(k, j, i);
             const Real dBz_dx =
                 (pack(b, TE::F3, Bf(), k, j, i) - pack(b, TE::F3, Bf(), k, j, i - 1)) /
@@ -1109,8 +1202,8 @@ TaskStatus CT_AddOhmicEMF(MeshData<Real> *md) {
             const Real eta =
                 0.25 * (CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j, i) +
                         CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k, j, i - 1) +
-                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k - 1, j, i) +
-                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k - 1, j, i - 1));
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k + km, j, i) +
+                        CellEtaO(use_cache, ohm_diff, eta_pack, prim, b, k + km, j, i - 1));
             pack.flux(b, TE::E2, Bf(), k, j, i) += eta * j2;
           });
     }
@@ -1499,89 +1592,96 @@ AmbiEdgeEMF_E3(const Prim &prim, const Eta &eta_pack, const Coords &c, const Dif
   return e3;
 }
 
-//! e1 at the E1 edge (i,j-1/2,k-1/2). In-plane = yz (tight); along-edge = x (wide). 3D only.
+//! e1 at the E1 edge (i,j-1/2,k-1/2). In-plane = yz (tight); along-edge = x (wide).
+//! AUDIT N1 (2026-08-05): `km` is the offset to the edge's k-neighbour -- -1 in 3D, 0 in 2D,
+//! where the mesh has one x3 layer and no x3 ghosts so k-1 would be out of bounds. At km == 0
+//! every d/dz difference is identically zero and the (k,k-1) averages collapse to the correct
+//! single in-plane value; at km == -1 the arithmetic is unchanged, so 3D is bit-identical.
 template <class Prim, class Eta, class Coords, class Diff>
 KOKKOS_INLINE_FUNCTION Real
 AmbiEdgeEMF_E1(const Prim &prim, const Eta &eta_pack, const Coords &c, const Diff &ad_diff,
-               const bool use_cache, const int b, const int k, const int j, const int i) {
+               const bool use_cache, const int b, const int k, const int j, const int i,
+               const int km) {
   const Real hiy = 0.5 / c.template Dxc<X2DIR>(k, j, i);
   const Real hiz = 0.5 / c.template Dxc<X3DIR>(k, j, i);
   const Real dBz_dy = hiy * ((prim(b, IB3, k, j, i) - prim(b, IB3, k, j - 1, i)) +
-                             (prim(b, IB3, k - 1, j, i) - prim(b, IB3, k - 1, j - 1, i)));
-  const Real dBy_dz = hiz * ((prim(b, IB2, k, j, i) - prim(b, IB2, k - 1, j, i)) +
-                             (prim(b, IB2, k, j - 1, i) - prim(b, IB2, k - 1, j - 1, i)));
+                             (prim(b, IB3, k + km, j, i) - prim(b, IB3, k + km, j - 1, i)));
+  const Real dBy_dz = hiz * ((prim(b, IB2, k, j, i) - prim(b, IB2, k + km, j, i)) +
+                             (prim(b, IB2, k, j - 1, i) - prim(b, IB2, k + km, j - 1, i)));
   const Real dBx_dy = hiy * ((prim(b, IB1, k, j, i) - prim(b, IB1, k, j - 1, i)) +
-                             (prim(b, IB1, k - 1, j, i) - prim(b, IB1, k - 1, j - 1, i)));
-  const Real dBx_dz = hiz * ((prim(b, IB1, k, j, i) - prim(b, IB1, k - 1, j, i)) +
-                             (prim(b, IB1, k, j - 1, i) - prim(b, IB1, k - 1, j - 1, i)));
+                             (prim(b, IB1, k + km, j, i) - prim(b, IB1, k + km, j - 1, i)));
+  const Real dBx_dz = hiz * ((prim(b, IB1, k, j, i) - prim(b, IB1, k + km, j, i)) +
+                             (prim(b, IB1, k, j - 1, i) - prim(b, IB1, k + km, j - 1, i)));
   const Real qix = 0.25 * 0.5 / c.template Dxc<X1DIR>(k, j, i);
   const Real dBy_dx = qix * ((prim(b, IB2, k, j, i + 1) - prim(b, IB2, k, j, i - 1)) +
                              (prim(b, IB2, k, j - 1, i + 1) - prim(b, IB2, k, j - 1, i - 1)) +
-                             (prim(b, IB2, k - 1, j, i + 1) - prim(b, IB2, k - 1, j, i - 1)) +
-                             (prim(b, IB2, k - 1, j - 1, i + 1) -
-                              prim(b, IB2, k - 1, j - 1, i - 1)));
+                             (prim(b, IB2, k + km, j, i + 1) - prim(b, IB2, k + km, j, i - 1)) +
+                             (prim(b, IB2, k + km, j - 1, i + 1) -
+                              prim(b, IB2, k + km, j - 1, i - 1)));
   const Real dBz_dx = qix * ((prim(b, IB3, k, j, i + 1) - prim(b, IB3, k, j, i - 1)) +
                              (prim(b, IB3, k, j - 1, i + 1) - prim(b, IB3, k, j - 1, i - 1)) +
-                             (prim(b, IB3, k - 1, j, i + 1) - prim(b, IB3, k - 1, j, i - 1)) +
-                             (prim(b, IB3, k - 1, j - 1, i + 1) -
-                              prim(b, IB3, k - 1, j - 1, i - 1)));
+                             (prim(b, IB3, k + km, j, i + 1) - prim(b, IB3, k + km, j, i - 1)) +
+                             (prim(b, IB3, k + km, j - 1, i + 1) -
+                              prim(b, IB3, k + km, j - 1, i - 1)));
   const Real Jx = dBz_dy - dBy_dz;
   const Real Jy = dBx_dz - dBz_dx;
   const Real Jz = dBy_dx - dBx_dy;
   const Real Bx = 0.25 * (prim(b, IB1, k, j, i) + prim(b, IB1, k, j - 1, i) +
-                          prim(b, IB1, k - 1, j, i) + prim(b, IB1, k - 1, j - 1, i));
+                          prim(b, IB1, k + km, j, i) + prim(b, IB1, k + km, j - 1, i));
   const Real By = 0.25 * (prim(b, IB2, k, j, i) + prim(b, IB2, k, j - 1, i) +
-                          prim(b, IB2, k - 1, j, i) + prim(b, IB2, k - 1, j - 1, i));
+                          prim(b, IB2, k + km, j, i) + prim(b, IB2, k + km, j - 1, i));
   const Real Bz = 0.25 * (prim(b, IB3, k, j, i) + prim(b, IB3, k, j - 1, i) +
-                          prim(b, IB3, k - 1, j, i) + prim(b, IB3, k - 1, j - 1, i));
+                          prim(b, IB3, k + km, j, i) + prim(b, IB3, k + km, j - 1, i));
   const Real bmag = std::sqrt(SQR(Bx) + SQR(By) + SQR(Bz));
   const Real eta = NonidealEdgeEta<NonidealEtaIdx::A>(
-      ad_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k, j - 1, i, k - 1, j, i, k - 1,
-      j - 1, i);
+      ad_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k, j - 1, i, k + km, j, i,
+      k + km, j - 1, i);
   Real e1, e2, e3;
   ADPerpEMF(eta, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
   return e1;
 }
 
-//! e2 at the E2 edge (i-1/2,j,k-1/2). In-plane = xz (tight); along-edge = y (wide). 3D only.
+//! e2 at the E2 edge (i-1/2,j,k-1/2). In-plane = xz (tight); along-edge = y (wide).
+//! `km`: see AmbiEdgeEMF_E1 above (-1 in 3D, 0 in 2D).
 template <class Prim, class Eta, class Coords, class Diff>
 KOKKOS_INLINE_FUNCTION Real
 AmbiEdgeEMF_E2(const Prim &prim, const Eta &eta_pack, const Coords &c, const Diff &ad_diff,
-               const bool use_cache, const int b, const int k, const int j, const int i) {
+               const bool use_cache, const int b, const int k, const int j, const int i,
+               const int km) {
   const Real hix = 0.5 / c.template Dxc<X1DIR>(k, j, i);
   const Real hiz = 0.5 / c.template Dxc<X3DIR>(k, j, i);
   const Real dBz_dx = hix * ((prim(b, IB3, k, j, i) - prim(b, IB3, k, j, i - 1)) +
-                             (prim(b, IB3, k - 1, j, i) - prim(b, IB3, k - 1, j, i - 1)));
-  const Real dBx_dz = hiz * ((prim(b, IB1, k, j, i) - prim(b, IB1, k - 1, j, i)) +
-                             (prim(b, IB1, k, j, i - 1) - prim(b, IB1, k - 1, j, i - 1)));
+                             (prim(b, IB3, k + km, j, i) - prim(b, IB3, k + km, j, i - 1)));
+  const Real dBx_dz = hiz * ((prim(b, IB1, k, j, i) - prim(b, IB1, k + km, j, i)) +
+                             (prim(b, IB1, k, j, i - 1) - prim(b, IB1, k + km, j, i - 1)));
   const Real dBy_dx = hix * ((prim(b, IB2, k, j, i) - prim(b, IB2, k, j, i - 1)) +
-                             (prim(b, IB2, k - 1, j, i) - prim(b, IB2, k - 1, j, i - 1)));
-  const Real dBy_dz = hiz * ((prim(b, IB2, k, j, i) - prim(b, IB2, k - 1, j, i)) +
-                             (prim(b, IB2, k, j, i - 1) - prim(b, IB2, k - 1, j, i - 1)));
+                             (prim(b, IB2, k + km, j, i) - prim(b, IB2, k + km, j, i - 1)));
+  const Real dBy_dz = hiz * ((prim(b, IB2, k, j, i) - prim(b, IB2, k + km, j, i)) +
+                             (prim(b, IB2, k, j, i - 1) - prim(b, IB2, k + km, j, i - 1)));
   const Real qiy = 0.25 * 0.5 / c.template Dxc<X2DIR>(k, j, i);
   const Real dBx_dy = qiy * ((prim(b, IB1, k, j + 1, i) - prim(b, IB1, k, j - 1, i)) +
                              (prim(b, IB1, k, j + 1, i - 1) - prim(b, IB1, k, j - 1, i - 1)) +
-                             (prim(b, IB1, k - 1, j + 1, i) - prim(b, IB1, k - 1, j - 1, i)) +
-                             (prim(b, IB1, k - 1, j + 1, i - 1) -
-                              prim(b, IB1, k - 1, j - 1, i - 1)));
+                             (prim(b, IB1, k + km, j + 1, i) - prim(b, IB1, k + km, j - 1, i)) +
+                             (prim(b, IB1, k + km, j + 1, i - 1) -
+                              prim(b, IB1, k + km, j - 1, i - 1)));
   const Real dBz_dy = qiy * ((prim(b, IB3, k, j + 1, i) - prim(b, IB3, k, j - 1, i)) +
                              (prim(b, IB3, k, j + 1, i - 1) - prim(b, IB3, k, j - 1, i - 1)) +
-                             (prim(b, IB3, k - 1, j + 1, i) - prim(b, IB3, k - 1, j - 1, i)) +
-                             (prim(b, IB3, k - 1, j + 1, i - 1) -
-                              prim(b, IB3, k - 1, j - 1, i - 1)));
+                             (prim(b, IB3, k + km, j + 1, i) - prim(b, IB3, k + km, j - 1, i)) +
+                             (prim(b, IB3, k + km, j + 1, i - 1) -
+                              prim(b, IB3, k + km, j - 1, i - 1)));
   const Real Jx = dBz_dy - dBy_dz;
   const Real Jy = dBx_dz - dBz_dx;
   const Real Jz = dBy_dx - dBx_dy;
   const Real Bx = 0.25 * (prim(b, IB1, k, j, i) + prim(b, IB1, k, j, i - 1) +
-                          prim(b, IB1, k - 1, j, i) + prim(b, IB1, k - 1, j, i - 1));
+                          prim(b, IB1, k + km, j, i) + prim(b, IB1, k + km, j, i - 1));
   const Real By = 0.25 * (prim(b, IB2, k, j, i) + prim(b, IB2, k, j, i - 1) +
-                          prim(b, IB2, k - 1, j, i) + prim(b, IB2, k - 1, j, i - 1));
+                          prim(b, IB2, k + km, j, i) + prim(b, IB2, k + km, j, i - 1));
   const Real Bz = 0.25 * (prim(b, IB3, k, j, i) + prim(b, IB3, k, j, i - 1) +
-                          prim(b, IB3, k - 1, j, i) + prim(b, IB3, k - 1, j, i - 1));
+                          prim(b, IB3, k + km, j, i) + prim(b, IB3, k + km, j, i - 1));
   const Real bmag = std::sqrt(SQR(Bx) + SQR(By) + SQR(Bz));
   const Real eta = NonidealEdgeEta<NonidealEtaIdx::A>(
-      ad_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k, j, i - 1, k - 1, j, i, k - 1,
-      j, i - 1);
+      ad_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k, j, i - 1, k + km, j, i,
+      k + km, j, i - 1);
   Real e1, e2, e3;
   ADPerpEMF(eta, Jx, Jy, Jz, Bx, By, Bz, e1, e2, e3);
   return e2;
@@ -1625,7 +1725,12 @@ TaskStatus CT_AddAmbipolarEMF(MeshData<Real> *md) {
         });
   }
 
-  if (three_d) {
+  // AUDIT N1 (2026-08-05), FIXED: was `if (three_d)`. B_z now evolves in 2D, so the ambipolar
+  // contribution to E1/E2 must be added there too -- otherwise 2D CT + AD would advance B_z by
+  // the ideal EMF alone and silently omit the diffusion. `km` (-1 in 3D, 0 in 2D) is what makes
+  // the shared edge kernels 2D-safe; see AmbiEdgeEMF_E1.
+  if (ndim > 1) {
+    const int km = three_d ? -1 : 0;
     // ---- E1 edge (i,j-1/2,k-1/2): Jx tight; Jy,Jz interpolated from E2/E3. ----
     {
       IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E1);
@@ -1638,7 +1743,7 @@ TaskStatus CT_AddAmbipolarEMF(MeshData<Real> *md) {
             const auto &c = pack.GetCoordinates(b);
             // E1 edge: DIRECT co-located tight-in-plane edge EMF (no face averaging).
             pack.flux(b, TE::E1, Bf(), k, j, i) +=
-                AmbiEdgeEMF_E1(prim, eta_pack, c, ad_diff, use_cache, b, k, j, i);
+                AmbiEdgeEMF_E1(prim, eta_pack, c, ad_diff, use_cache, b, k, j, i, km);
           });
     }
     // ---- E2 edge (i-1/2,j,k-1/2): Jy tight; Jx,Jz interpolated from E1/E3. ----
@@ -1653,7 +1758,7 @@ TaskStatus CT_AddAmbipolarEMF(MeshData<Real> *md) {
             const auto &c = pack.GetCoordinates(b);
             // E2 edge: DIRECT co-located tight-in-plane edge EMF (no face averaging).
             pack.flux(b, TE::E2, Bf(), k, j, i) +=
-                AmbiEdgeEMF_E2(prim, eta_pack, c, ad_diff, use_cache, b, k, j, i);
+                AmbiEdgeEMF_E2(prim, eta_pack, c, ad_diff, use_cache, b, k, j, i, km);
           });
     }
   }
@@ -1744,7 +1849,11 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
         });
   }
 
-  if (three_d) {
+  // AUDIT N1 (2026-08-05), FIXED: was `if (three_d)`. With B_z live in 2D the Hall E1/E2 must be
+  // accumulated there too. `km` (-1 in 3D, 0 in 2D) collapses the k-averages and, passed on to
+  // HallJxE1/HallJyE2 as `three_d`, drops the d/dz current terms exactly.
+  if (ndim > 1) {
+    const int km = three_d ? -1 : 0;
     // ---- E1 edge (i,j-1/2,k-1/2): e1 = eta_H (Jy Bz - Jz By)/|B| + eta_floor Jx. ----
     {
       IndexRange ib = md->GetBoundsI(CellLevel::same, IndexDomain::interior, TE::E1);
@@ -1755,31 +1864,31 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
           kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
           KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
             const auto &c = pack.GetCoordinates(b);
-            const Real Jx = HallJxE1(pack, c, b, k, j, i, true);
-            const Real Jy = 0.25 * (HallJyE2(pack, c, b, k, j, i, true) +
-                                    HallJyE2(pack, c, b, k, j - 1, i, true) +
-                                    HallJyE2(pack, c, b, k, j, i + 1, true) +
-                                    HallJyE2(pack, c, b, k, j - 1, i + 1, true));
+            const Real Jx = HallJxE1(pack, c, b, k, j, i, three_d);
+            const Real Jy = 0.25 * (HallJyE2(pack, c, b, k, j, i, three_d) +
+                                    HallJyE2(pack, c, b, k, j - 1, i, three_d) +
+                                    HallJyE2(pack, c, b, k, j, i + 1, three_d) +
+                                    HallJyE2(pack, c, b, k, j - 1, i + 1, three_d));
             const Real Jz = 0.25 * (HallJzE3(pack, c, b, k, j, i) +
                                     HallJzE3(pack, c, b, k, j, i + 1) +
-                                    HallJzE3(pack, c, b, k - 1, j, i) +
-                                    HallJzE3(pack, c, b, k - 1, j, i + 1));
+                                    HallJzE3(pack, c, b, k + km, j, i) +
+                                    HallJzE3(pack, c, b, k + km, j, i + 1));
             const Real Bx = 0.125 * (pack(b, TE::F1, Bf(), k, j, i) +
                                      pack(b, TE::F1, Bf(), k, j, i + 1) +
                                      pack(b, TE::F1, Bf(), k, j - 1, i) +
                                      pack(b, TE::F1, Bf(), k, j - 1, i + 1) +
-                                     pack(b, TE::F1, Bf(), k - 1, j, i) +
-                                     pack(b, TE::F1, Bf(), k - 1, j, i + 1) +
-                                     pack(b, TE::F1, Bf(), k - 1, j - 1, i) +
-                                     pack(b, TE::F1, Bf(), k - 1, j - 1, i + 1));
+                                     pack(b, TE::F1, Bf(), k + km, j, i) +
+                                     pack(b, TE::F1, Bf(), k + km, j, i + 1) +
+                                     pack(b, TE::F1, Bf(), k + km, j - 1, i) +
+                                     pack(b, TE::F1, Bf(), k + km, j - 1, i + 1));
             const Real By = 0.5 * (pack(b, TE::F2, Bf(), k, j, i) +
-                                   pack(b, TE::F2, Bf(), k - 1, j, i));
+                                   pack(b, TE::F2, Bf(), k + km, j, i));
             const Real Bz = 0.5 * (pack(b, TE::F3, Bf(), k, j, i) +
                                    pack(b, TE::F3, Bf(), k, j - 1, i));
             const Real bmag = std::sqrt(SQR(Bx) + SQR(By) + SQR(Bz));
             const Real eta_h =
                 HallEdgeEta(hall_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k,
-                            j - 1, i, k - 1, j, i, k - 1, j - 1, i);
+                            j - 1, i, k + km, j, i, k + km, j - 1, i);
             Real e1, e2, e3;
             HallEMFLocal(eta_h,
                        (hall_floor_ratio > 0.0) ? hall_diff.EffectiveOhmicFloor(eta_h)
@@ -1798,31 +1907,31 @@ TaskStatus CT_AddHallEMF(MeshData<Real> *md) {
           kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
           KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
             const auto &c = pack.GetCoordinates(b);
-            const Real Jy = HallJyE2(pack, c, b, k, j, i, true);
-            const Real Jx = 0.25 * (HallJxE1(pack, c, b, k, j, i, true) +
-                                    HallJxE1(pack, c, b, k, j + 1, i, true) +
-                                    HallJxE1(pack, c, b, k, j, i - 1, true) +
-                                    HallJxE1(pack, c, b, k, j + 1, i - 1, true));
+            const Real Jy = HallJyE2(pack, c, b, k, j, i, three_d);
+            const Real Jx = 0.25 * (HallJxE1(pack, c, b, k, j, i, three_d) +
+                                    HallJxE1(pack, c, b, k, j + 1, i, three_d) +
+                                    HallJxE1(pack, c, b, k, j, i - 1, three_d) +
+                                    HallJxE1(pack, c, b, k, j + 1, i - 1, three_d));
             const Real Jz = 0.25 * (HallJzE3(pack, c, b, k, j, i) +
                                     HallJzE3(pack, c, b, k, j + 1, i) +
-                                    HallJzE3(pack, c, b, k - 1, j, i) +
-                                    HallJzE3(pack, c, b, k - 1, j + 1, i));
+                                    HallJzE3(pack, c, b, k + km, j, i) +
+                                    HallJzE3(pack, c, b, k + km, j + 1, i));
             const Real Bx = 0.5 * (pack(b, TE::F1, Bf(), k, j, i) +
-                                   pack(b, TE::F1, Bf(), k - 1, j, i));
+                                   pack(b, TE::F1, Bf(), k + km, j, i));
             const Real By = 0.125 * (pack(b, TE::F2, Bf(), k, j, i) +
                                      pack(b, TE::F2, Bf(), k, j + 1, i) +
                                      pack(b, TE::F2, Bf(), k, j, i - 1) +
                                      pack(b, TE::F2, Bf(), k, j + 1, i - 1) +
-                                     pack(b, TE::F2, Bf(), k - 1, j, i) +
-                                     pack(b, TE::F2, Bf(), k - 1, j + 1, i) +
-                                     pack(b, TE::F2, Bf(), k - 1, j, i - 1) +
-                                     pack(b, TE::F2, Bf(), k - 1, j + 1, i - 1));
+                                     pack(b, TE::F2, Bf(), k + km, j, i) +
+                                     pack(b, TE::F2, Bf(), k + km, j + 1, i) +
+                                     pack(b, TE::F2, Bf(), k + km, j, i - 1) +
+                                     pack(b, TE::F2, Bf(), k + km, j + 1, i - 1));
             const Real Bz = 0.5 * (pack(b, TE::F3, Bf(), k, j, i) +
                                    pack(b, TE::F3, Bf(), k, j, i - 1));
             const Real bmag = std::sqrt(SQR(Bx) + SQR(By) + SQR(Bz));
             const Real eta_h =
                 HallEdgeEta(hall_diff, prim, eta_pack, use_cache, bmag, b, k, j, i, k, j,
-                            i - 1, k - 1, j, i, k - 1, j, i - 1);
+                            i - 1, k + km, j, i, k + km, j, i - 1);
             Real e1, e2, e3;
             HallEMFLocal(eta_h,
                        (hall_floor_ratio > 0.0) ? hall_diff.EffectiveOhmicFloor(eta_h)
