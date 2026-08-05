@@ -80,31 +80,10 @@ struct Gow17ReducedNetwork {
     return rho_code * rho_unit / (mu_n * m_H);
   }
 
-  // RHS in CODE time units for the 4 evolved species (e- is slaved). T in Kelvin.
-  CHEMG_FN void rhs(const double *y, double n_H, double T, double *ydot) const {
-    const double xH2 = y[gH2], xHp = y[gHp], xCp = y[gCp], xCO = y[gCO];
-    double xH = 1.0 - 2.0 * xH2 - xHp;          if (xH  < 0.0) xH  = 0.0;
-    double xC0 = x_Ctot - xCp - xCO;            if (xC0 < 0.0) xC0 = 0.0;
-    double xe = xHp + xCp;                      if (xe  < xe_floor) xe = xe_floor;
-
-    const double a_rr = a_rr0 * std::pow(T / 1.0e4, arr_exp);
-    const double a_C  = a_C0  * std::pow(T / 300.0, aC_exp);
-
-    const double R1 = kgr * n_H * xH;                          // H2 formation
-    const double R2 = f_cr_H2 * zeta * xH2;                    // H2 CR dissoc
-    const double R3 = f_cr_H  * zeta * xH;                     // H ionization
-    const double R4 = (a_rr * n_H * xe + k_gr_Hp * n_H) * xHp; // H+ recomb (gas+grain)
-    const double R5 = f_cr_C  * zeta * xC0;                    // C ionization
-    const double R6 = a_C * n_H * xe * xCp;                    // C+ recomb
-    const double R7 = k_CO * n_H * xCp;                        // CO formation
-    const double R8 = f_cr_CO * zeta * xCO;                    // CO CR destruction
-
-    ydot[gH2] = (R1 - R2) * t_unit;
-    ydot[gHp] = (R3 - R4) * t_unit;
-    ydot[gCp] = (R5 - R6 - R7 + R8) * t_unit;
-    ydot[gCO] = (R7 - R8) * t_unit;
-    ydot[ge]  = 0.0; // slaved: set in integrate_cell
-  }
+  // NOTE (audit N8, 2026-08-05): the plain explicit RHS that used to live here was DEAD --
+  // integrate_cell() has only ever called rhs_PL(). It was also the only place `ydot[ge]`
+  // appeared, which read as though x_e were integrated; it is not, it is slaved to charge
+  // neutrality at the end of integrate_cell(). Removed so the file cannot be misread.
 
   // Production/loss split of the RHS in CODE time units: for each evolved species
   //   dy_s/dt = P[s] - L[s] * y[s],
@@ -185,8 +164,17 @@ struct Gow17ReducedNetwork {
       }
       // Floor the step so stiffness can't stall progress: semi-implicit stability makes
       // these larger steps safe (they relax toward the local P/L equilibrium).
-      if (dt_chem < dt_floor) {
-        dt_chem = dt_floor;
+      // AUDIT 2026-08-05 (N12): never floor ABOVE the remaining time. The old test was
+      // `dt_chem < dt_floor`, which fires on the FINAL partial sub-step of every cell whose
+      // remainder happens to be shorter than dt_floor -- even when the accuracy criterion was
+      // perfectly happy with that remainder and nothing was overridden. `dt_chem` was then
+      // clamped straight back down on the next line, so the VALUE was always right and the
+      // physics is bit-identical; what was wrong is the COUNTER, and the counter is the whole
+      // instrument WP-10 used to choose nsub_max. Comparing against min(dt_floor, remaining)
+      // makes it fire only when accuracy really was overridden.
+      const double dt_min = (dt_floor < dt_code - t) ? dt_floor : (dt_code - t);
+      if (dt_chem < dt_min) {
+        dt_chem = dt_min;
         ++nfloored; // the accuracy criterion was OVERRIDDEN by nsub_max -- report it
       }
       if (t + dt_chem > dt_code) dt_chem = dt_code - t;

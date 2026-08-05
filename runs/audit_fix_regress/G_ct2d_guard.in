@@ -1,0 +1,81 @@
+<comment>
+problem = AUDIT N1 POSITIVE TEST -- hall_whistler_ct.in forced to 2D (nx3 = 1).
+# This is EXACTLY the configuration the comments in pgen/diffusion.cpp and the two
+# hall_whistler decks warn about: an iprob=60 whistler sets B_z = h*amp*sin(kx) != 0, and in
+# 2D this CT implementation never evolves B_z (E1/E2 are only assembled when ndim > 2 and
+# every F3 update is behind `if (three_d)`), so the mode would silently return zero Hall
+# evolution in B_z and report a bogus dispersion error.
+#
+# EXPECTED RESULT: the run ABORTS at the first step with the ct_2d_outofplane guard
+# (hydro.cpp, PreStepMeshUserWorkInLoop). Before the guard it ran to completion and lied.
+# The paired negative test is runs/ct_tests/field_loop_ct.in -- also 2D CT, but B_z = v_z = 0,
+# so the guard passes and the deck is bit-identical.
+
+<job>
+problem_id = diffusion
+
+<problem/diffusion>
+iprob = 60
+Bx    = 1.0
+By    = 0.0
+amp   = 1.0e-6
+nwave = 1.0
+helicity = -1.0
+
+<parthenon/mesh>
+refinement = none
+nghost = 2
+nx1 = 128
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 4
+x2min = -0.015625
+x2max = 0.015625
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.015625
+x3max = 0.015625
+ix3_bc = periodic
+ox3_bc = periodic
+
+<parthenon/meshblock>
+nx1 = 128
+nx2 = 4
+nx3 = 1
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 0.05
+nlim = 2
+ncycle_out = 500
+
+<hydro>
+fluid = glmmhd
+riemann = hlld
+eos = adiabatic
+reconstruction = plm
+gamma = 2.0
+divergence_control = ct
+ct_emf = gs05
+
+<diffusion>
+integrator = unsplit
+cfl = 0.3
+hall = hall
+hall_coeff = fixed
+hall_coeff_code = 0.5
+hall_ohmic_floor_code = 0.05
+
+<parthenon/output0>
+file_type = hdf5
+dt = 0.05
+variables = prim
+id = prim
+
+<parthenon/output1>
+file_type = hst
+dt = 0.0025

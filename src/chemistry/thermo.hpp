@@ -147,8 +147,15 @@ CHEMT_FN double AdvanceThermoEnergy(const ThermoParams &p, double rho_code, doub
       const double dt_acc = cfl * e / absR;
       if (dt_acc < dt_sub) dt_sub = dt_acc;
     }
-    if (dt_sub < dt_floor) {
-      dt_sub = dt_floor;
+    // AUDIT 2026-08-05 (N12): floor against min(dt_floor, remaining), not dt_floor. The old
+    // test fired on the final partial sub-step of any cell whose remainder was shorter than
+    // dt_floor, even with the accuracy criterion satisfied -- a false positive in the
+    // degraded-cell counter. dt_sub was clamped back to the remainder on the next line either
+    // way, so the energy update is bit-identical; only the diagnostic changes. Mirrored from
+    // network_gow17_reduced.hpp, which had the identical defect.
+    const double dt_min = (dt_floor < dt_code - t) ? dt_floor : (dt_code - t);
+    if (dt_sub < dt_min) {
+      dt_sub = dt_min;
       nfloored += 1; // accuracy criterion OVERRIDDEN by nsub_max -- report it (see *ntrunc)
     }
     if (t + dt_sub > dt_code) dt_sub = dt_code - t;

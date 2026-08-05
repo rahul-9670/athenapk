@@ -95,7 +95,24 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     net.x_Ctot = pin->GetOrAddReal(bn, "x_Ctot", 1.6e-4);
     net.xe_floor = pin->GetOrAddReal(bn, "xe_floor", 1.0e-15);
     net.x_floor = pin->GetOrAddReal(bn, "x_floor", 1.0e-20);
-    net.nsub_max = pin->GetOrAddInteger(bn, "nsub_max", 400);
+    // AUDIT 2026-08-05: default 400 -> 4000. nsub_max is NOT a truncation cap here, it is a
+    // MINIMUM SUB-STEP FLOOR (dt_floor = dt/nsub_max, network_gow17_reduced.hpp): when the
+    // accuracy criterion asks for a smaller step the integrator takes the larger one anyway,
+    // so at 400 `cfl_cool` was INERT. WP-10 measured this on the production config (job
+    // 2450198, three legs back to back on the same 2 GPUs): at 400 the floor bound in 100 %
+    // of cells (2097152/2097152 at 128^3); at 4000, 1.9 %; at 40000, 0.013 % and BYTE-
+    // IDENTICAL to 4000, so 4000 is the converged value. Wall cost: none (278/280/279 s).
+    // runs/root_ladder already sets 4000 explicitly; this only stops a NEW deck that omits
+    // the key from being born with an inert accuracy tolerance. Decks that set it are
+    // unaffected, so every historical deck still describes exactly what it ran.
+    // CAVEAT from audit N12 (2026-08-05): the counter behind those three percentages OVER-
+    // COUNTED -- it also fired on the final partial sub-step of a cell whose remainder was
+    // shorter than dt_floor, with the accuracy criterion satisfied. 100 % / 1.9 % / 0.013 %
+    // are therefore UPPER BOUNDS on the truly floor-bound fraction. The choice of 4000 does
+    // not rest on them: it rests on 40000 being BYTE-IDENTICAL to 4000, a direct convergence
+    // statement that the counter defect cannot touch. Counter fixed in the network header;
+    // re-measuring is optional and could only lower the three percentages.
+    net.nsub_max = pin->GetOrAddInteger(bn, "nsub_max", 4000);
     net.cfl = pin->GetOrAddReal(bn, "cfl_cool", 0.1);
     pkg->AddParam("network_gow", net);
     pkg->AddParam("network_type", NetworkType::gow17_reduced);
@@ -186,7 +203,10 @@ TaskStatus ReactScalars(MeshData<Real> *md, const Real dt) {
   // scalar_density_i are components [nhydro, nhydro+nscalars) of the "cons" field.
   auto hydro_pkg = pmb->pmy_mesh->packages.Get("Hydro");
   const int nhydro = hydro_pkg->Param<int>("nhydro");
-  const bool mhd = (nhydro > NHYDRO); // glmmhd carries IB1..IB3(,IPS) past the hydro vars
+  // audit N7 (2026-08-05): ask the package what fluid it is instead of inferring it from the
+  // component count (glmmhd carries IB1..IB3,IPS past the hydro vars). Same value today; one
+  // less invariant that a new variable could break silently. Mirrored in dust/dust.cpp.
+  const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
 
   // F1 fix (audit 2026-07-18): under eos=hydrogen the reaction temperature must come from
   // the EOS table -- mu varies with H2 dissociation/ionization, so T != gm1*eint/rho there

@@ -127,6 +127,77 @@ Real CalculateGlobalMinDx(MeshData<Real> *md) {
 void PreStepMeshUserWorkInLoop(Mesh *pmesh, ParameterInput *pin, SimTime &tm) {
   auto hydro_pkg = pmesh->packages.Get("Hydro");
 
+  // AUDIT 2026-08-05 (N1): 2D + CT silently freezes B_z. That is EXACT while B_z == v_z == 0
+  // (a closed invariant in 2D -- see the note on CT_Max2DOutOfPlane) and wrong otherwise, so
+  // check the corner once, on the first step, instead of returning a plausible wrong answer.
+  // Every 2D CT deck in the tree satisfies it, so this is bit-identical for all of them; the
+  // combination it rejects is the one pgen/diffusion.cpp and the hall_whistler decks already
+  // avoid by hand (nx3 = 4). 3D is untouched and pays nothing.
+  if (hydro_pkg->Param<bool>("use_ct") && pmesh->ndim < 3 &&
+      !hydro_pkg->Param<bool>("ct_2d_outofplane_checked")) {
+    Real maxop = 0.0;
+    const int num_partitions = pmesh->DefaultNumPartitions();
+    for (int i = 0; i < num_partitions; i++) {
+      auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
+      maxop = std::max(maxop, Hydro::CT::CT_Max2DOutOfPlane(mu0.get()));
+    }
+#ifdef MPI_PARALLEL
+    PARTHENON_MPI_CHECK(
+        MPI_Allreduce(MPI_IN_PLACE, &maxop, 1, MPI_PARTHENON_REAL, MPI_MAX, MPI_COMM_WORLD));
+#endif
+    PARTHENON_REQUIRE_THROWS(
+        maxop == 0.0,
+        "divergence_control=ct in " + std::to_string(pmesh->ndim) +
+            "D requires B_z == 0 AND v_z == 0 everywhere: this CT implementation assembles "
+            "the E1/E2 edge EMFs only when ndim > 2 (they average over k and k-1, which a 2D "
+            "mesh has no x3 ghosts for) and gates every B_z (F3) update on `three_d`, so B_z "
+            "is FROZEN -- dB_z/dt = div(v_z B_pol) is simply dropped, and the face->cell "
+            "projection then copies the frozen value onto cons(IB3). max(|B_z|,|v_z|) = " +
+            std::to_string(maxop) +
+            ". Use a 3D box (nx3 >= 4 is enough for an x-propagating mode -- see "
+            "runs/ct_tests/hall_whistler_ct.in), or divergence_control=glm.");
+    hydro_pkg->UpdateParam("ct_2d_outofplane_checked", true);
+  }
+
+  // D1 INSTRUMENT (hydro/d1_meminfo, default false) -- NOT a fix, a measurement.
+  // docs/validation/D1_gpu_memory_imbalance.md: deep-AMR GPU runs OOM in `bnd_flux::*coarse`
+  // at cycle ~120 regardless of rank count (4 and 5 ranks die at the SAME cycle), which
+  // falsifies "more ranks buys headroom" and leaves one hypothesis standing: the exhausted
+  // memory is AMR coarse/prolongation buffer space sized by the mesh's COARSE-FINE BOUNDARY
+  // COUNT, not by blocks per rank. That predicts the per-rank coarse-fine neighbour count,
+  // not the per-rank block count, tracks the per-device footprint. This prints both per rank
+  // whenever the block count changes (i.e. after each regrid), plus free/total device memory
+  // where CUDA is available, so the correlation can be read straight off the run log.
+  if (hydro_pkg->Param<bool>("d1_meminfo")) {
+    int nblocks = static_cast<int>(pmesh->block_list.size());
+    int ncf = 0, nsame = 0;
+    for (auto const &pmb : pmesh->block_list) {
+      const int mylev = pmb->loc.level();
+      for (auto const &nb : pmb->GetNeighbors()) {
+        if (nb.loc.level() != mylev) {
+          ncf++;
+        } else {
+          nsame++;
+        }
+      }
+    }
+    if (nblocks != hydro_pkg->Param<int>("d1_last_nblocks")) {
+      double freeGB = -1.0, totGB = -1.0;
+#ifdef KOKKOS_ENABLE_CUDA
+      size_t fb = 0, tb = 0;
+      if (cudaMemGetInfo(&fb, &tb) == cudaSuccess) {
+        freeGB = static_cast<double>(fb) / (1024.0 * 1024.0 * 1024.0);
+        totGB = static_cast<double>(tb) / (1024.0 * 1024.0 * 1024.0);
+      }
+#endif
+      printf("[D1] cycle=%d rank=%d nblocks=%d coarse_fine_nbrs=%d same_level_nbrs=%d "
+             "dev_free_GiB=%.2f dev_total_GiB=%.2f\n",
+             tm.ncycle, parthenon::Globals::my_rank, nblocks, ncf, nsame, freeGB, totGB);
+      fflush(stdout);
+      hydro_pkg->UpdateParam("d1_last_nblocks", nblocks);
+    }
+  }
+
   // Calculate hyperbolic divergence cleaning speed
   // TODO(pgrete) Calculating mindx is only required after remeshing. Need to
   // find a clean solution for this one-off global reduction.
@@ -567,6 +638,13 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     PARTHENON_FAIL("AthenaPK hydro: Unknown divergence_control (use 'glm' or 'ct').");
   }
   pkg->AddParam<>("use_ct", use_ct);
+  // AUDIT 2026-08-05 (N1): latch for the one-shot 2D out-of-plane check in
+  // PreStepMeshUserWorkInLoop. Mutable because the check runs once, on the first step, and
+  // then costs nothing for the rest of the run.
+  pkg->AddParam<>("ct_2d_outofplane_checked", false, Params::Mutability::Mutable);
+  // D1 instrument (see PreStepMeshUserWorkInLoop). Default off => no output, no cost.
+  pkg->AddParam<>("d1_meminfo", pin->GetOrAddBoolean("hydro", "d1_meminfo", false));
+  pkg->AddParam<>("d1_last_nblocks", -1, Params::Mutability::Mutable);
   // CT edge-EMF averaging scheme (increment 3). "gs05" = Gardiner & Stone (2005) upwind
   // CT (default; matches Athena++, adds Riemann dissipation via the transverse-B face
   // fluxes); "arithmetic" = Balsara & Spicer (1999) plain average (increment-1 fallback).

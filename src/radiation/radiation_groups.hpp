@@ -37,50 +37,14 @@ using parthenon::Real;
 constexpr int MAX_GROUP = 8;
 
 //----------------------------------------------------------------------------------------
-//! Band-limited moment of the Planck weight:  Int_a^b x^s / (e^x - 1) dx  (s = 3 gives the
-//! Planck energy weight; s = 3+beta weights a kappa_nu ~ nu^beta opacity for the Planck mean).
-//! Composite Simpson in x; the integrand ~ x^{s-1} as x->0 (finite for s>=1) and decays like
-//! x^s e^-x for large x. Device-callable.
-//! IMPORTANT: the moments are used ONLY inside same-band ratios (num/den with the same lower
-//! edge `a`), so a common factor e^{-a} is deliberately FACTORED OUT: the integrand carries
-//! e^{a-x} (<=1 on [a,b]) instead of e^{-x}. This makes the ratio robust even in the deep Wien
-//! tail (a >> 1) where e^{-x} underflows to 0 and would otherwise give 0/0 -> a spurious 0
-//! opacity for the hardest group. The returned value equals e^{a} * (true moment); every use
-//! divides two of these with the same a, so the e^{a} cancels exactly.
-KOKKOS_INLINE_FUNCTION Real PlanckMoment(const Real s, Real a, Real b, const int npts) {
-  if (a < 1.0e-8) a = 1.0e-8; // avoid the removable 1/x singularity of the weight at x=0
-  if (b <= a) return 0.0;
-  const int n = (npts % 2 == 0) ? npts : npts + 1; // Simpson needs an even number of panels
-  const Real h = (b - a) / n;
-  Real sum = 0.0;
-  for (int k = 0; k <= n; ++k) {
-    const Real x = a + k * h;
-    const Real w = (k == 0 || k == n) ? 1.0 : ((k % 2) ? 4.0 : 2.0);
-    // x^s/(e^x-1), with e^{-a} factored out: x^s e^{a-x}/(1-e^{-x}).
-    sum += w * std::pow(x, s) * std::exp(a - x) / (1.0 - std::exp(-x));
-  }
-  return sum * h / 3.0;
-}
-
-//! Band-limited moment of the Rosseland weight:  Int_a^b x^s e^x/(e^x-1)^2 dx  (s = 4 gives the
-//! Rosseland weight dB/dT; s = 4-beta forms the harmonic (Rosseland) mean of kappa_nu ~ nu^beta).
-//! Same e^{-a}-factored-out ratio convention as PlanckMoment (device-callable).
-KOKKOS_INLINE_FUNCTION Real RossMoment(const Real s, Real a, Real b, const int npts) {
-  if (a < 1.0e-8) a = 1.0e-8;
-  if (b <= a) return 0.0;
-  const int n = (npts % 2 == 0) ? npts : npts + 1;
-  const Real h = (b - a) / n;
-  Real sum = 0.0;
-  for (int k = 0; k <= n; ++k) {
-    const Real x = a + k * h;
-    const Real w = (k == 0 || k == n) ? 1.0 : ((k % 2) ? 4.0 : 2.0);
-    const Real d = 1.0 - std::exp(-x);
-    // x^s e^x/(e^x-1)^2, with e^{-a} factored out: x^s e^{a-x}/(1-e^{-x})^2.
-    sum += w * std::pow(x, s) * std::exp(a - x) / (d * d);
-  }
-  return sum * h / 3.0;
-}
-
+// NOTE (audit N9, 2026-08-05): two device-callable band-moment helpers, PlanckMoment() and
+// RossMoment(), used to live here. They were DEAD -- nothing in src/ or the tests ever called
+// them. They were superseded by the `phimean` quadrature inside GroupMultsAtT() below, which
+// computes the same band means but in the form actually needed (a ratio of a phi-weighted to
+// an unweighted moment) and on the host, where the table is built. Removed rather than kept
+// "for later": a device-callable helper with a subtle e^{-a}-factored-out return convention
+// is exactly the kind of thing a future caller uses without reading the convention. The
+// convention itself survives, documented at its one real use site in `phimean`.
 //----------------------------------------------------------------------------------------
 //! Cumulative Planck energy fraction F(x) = (15/pi^4) * Int_0^x u^3/(e^u - 1) du, x = h*nu/kT.
 //! F(0)=0, F(inf)=1; the fraction in a group [x1,x2] is F(x2)-F(x1). The tail integral
@@ -220,8 +184,13 @@ struct GroupOpacityTable {
     if (!active_) return 1.0;
     Real f = (std::log10(Tk) - lT0_) / dlT_;
     int i = static_cast<int>(f);
-    if (i < 0) i = 0;
+    // AUDIT 2026-08-05 (N10): clamp HIGH first, then LOW. The old order (low then high) left
+    // i = -1 whenever nT_ < 2, because the second clamp `i > nT_-2` then pushed i BELOW the
+    // zero it had just been raised to -- an out-of-bounds device read of W(g,-1). nT_ < 2 is
+    // rejected at construction now (see BuildGroupOpacityTable*), so this is belt-and-braces,
+    // but the clamp order was wrong on its own terms and cost nothing to fix.
     if (i > nT_ - 2) i = nT_ - 2;
+    if (i < 0) i = 0;
     Real t = f - i;
     if (t < 0.0) t = 0.0;
     if (t > 1.0) t = 1.0;
@@ -244,6 +213,18 @@ inline GroupOpacityTable BuildGroupOpacityTable(const DustOpacityModel &m, const
   tab.ng_ = g.n_group;
   tab.nT_ = nT;
   if (g.n_group == 1 || m.beta == 0.0) return tab; // inactive => Lookup returns 1
+  // AUDIT 2026-08-05 (N10): validate the T grid before it can reach a device kernel.
+  // radiation/opacity_table_nT, _Tmin_K, _Tmax_K are free deck knobs with no checks: nT < 2
+  // made dlT_ divide by zero AND drove Lookup's index negative; Tmin <= 0 makes lT0_ = -inf
+  // (every lookup then NaN); Tmax <= Tmin makes dlT_ <= 0 so the interpolation runs backwards.
+  // All three are silent on the host and only show up as garbage opacity multipliers.
+  if (nT < 2)
+    throw std::runtime_error("GroupOpacityTable: radiation/opacity_table_nT must be >= 2 (got " +
+                             std::to_string(nT) + ")");
+  if (!(Tmin_K > 0.0) || !(Tmax_K > Tmin_K))
+    throw std::runtime_error(
+        "GroupOpacityTable: need 0 < radiation/opacity_table_Tmin_K < opacity_table_Tmax_K (got " +
+        std::to_string(Tmin_K) + ", " + std::to_string(Tmax_K) + ")");
   tab.active_ = true;
   tab.lT0_ = std::log10(Tmin_K);
   tab.dlT_ = (std::log10(Tmax_K) - tab.lT0_) / (nT - 1);
@@ -290,6 +271,12 @@ inline GroupOpacityTable BuildGroupOpacityTableFromFile(const std::string &path,
   tab.lT0_ = g[2];
   tab.dlT_ = g[3];
   if (ng == 1) return tab; // gray => inactive (Lookup returns 1)
+  // audit N10: the T grid comes straight out of a binary header here, so it is even less
+  // checked than the analytic path. Same three conditions, same reasons.
+  if (nT < 2 || !(tab.dlT_ > 0.0))
+    throw std::runtime_error("GroupOpacityTable: bad T grid in " + path + " (nT=" +
+                             std::to_string(nT) + ", dlogT=" + std::to_string(tab.dlT_) +
+                             "); need nT >= 2 and dlogT > 0");
   // skip the 3 gray arrays kP,kR,ks (each nr*nT doubles)
   f.seekg(static_cast<std::streamoff>(3) * nr * nT * sizeof(double), std::ios::cur);
   tab.active_ = true;
@@ -345,9 +332,20 @@ inline RadGroups BuildRadGroups(int n_group, Real nu_min_hz, Real nu_max_hz) {
     return g;
   }
   // interior edges log-spaced in [nu_min, nu_max]; first edge 0, last +inf so nothing is lost.
+  // There are n_group-1 interior edges, so the log-spacing denominator is n_group-2.
+  // AUDIT 2026-08-05 (N11): n_group == 2 has exactly ONE interior edge, so it cannot span
+  // [nu_min, nu_max] -- the loop places that edge at nu_min and nu_max is silently DROPPED.
+  // (The `+1e-30` below existed only to keep that degenerate case from dividing 0 by 0; it
+  // gave the right answer for the wrong-looking reason.) Say so out loud instead: a deck that
+  // sets nu_max and gets two groups deserves to know its upper edge was ignored.
   const Real ll = std::log10(nu_min_hz), lh = std::log10(nu_max_hz);
+  if (n_group == 2) {
+    g.nu_edge[1] = nu_min_hz; // the single split point
+    g.nu_edge[2] = 1.0e30;
+    return g;
+  }
   for (int i = 1; i < n_group; ++i)
-    g.nu_edge[i] = std::pow(10.0, ll + (lh - ll) * (i - 1) / (n_group - 2 + 1e-30));
+    g.nu_edge[i] = std::pow(10.0, ll + (lh - ll) * (i - 1) / (n_group - 2));
   g.nu_edge[n_group] = 1.0e30;
   return g;
 }

@@ -915,6 +915,50 @@ Real CT_MaxRelFaceDivB(MeshData<Real> *md) {
 }
 
 //----------------------------------------------------------------------------------------
+//! AUDIT 2026-08-05 (N1) -- THE 2D CT B_z FREEZE, MADE LOUD.
+//!
+//! In two dimensions this implementation never evolves B_z. `CT_AssembleEMF` and
+//! `CT_AssembleEMF_GS05` build the E1/E2 edge EMFs only when `ndim > 2` (they average over
+//! k and k-1, and a 2D Parthenon mesh has no ghost cells in x3 to average with), and every
+//! F3 update -- `CT_UpdateBf`, `CT_CurlEMFToBf`, `CT_RKL2FirstBf`, `CT_RKL2OtherBf` -- is
+//! likewise behind `if (three_d)`. `CT_ProjectBfToCC` then copies the frozen face value onto
+//! cons(IB3), so the cell-centred B_z is frozen as well. The physics says otherwise:
+//!
+//!     dB_z/dt = -(dE_y/dx - dE_x/dy) = div(v_z B_pol)   in 2D,
+//!
+//! which is non-zero whenever v_z != 0, and the non-ideal EMFs add more. The limitation was
+//! known -- pgen/diffusion.cpp and the two hall_whistler decks say so in comments, and the
+//! whistler test is run at nx3 = 4 to dodge it -- but nothing ENFORCED it, so a 2D CT run
+//! with a z-field simply returned a wrong answer that looks like "the term does nothing".
+//!
+//! The invariant is closed, which is what makes a guard sufficient rather than a patch: in
+//! 2D with B_z == 0 and v_z == 0, the z-Lorentz force is (JxB)_z = J_x B_y - J_y B_x with
+//! J_x = d_y B_z - d_z B_y = 0 and J_y = d_z B_x - d_x B_z = 0, and no other term drives
+//! z-momentum. So v_z stays zero, B_z stays zero, and the 2D scheme is EXACT. Outside that
+//! corner it is wrong. This reduction is the test for the corner; the driver runs it once,
+//! at the first step, and hard-fails otherwise.
+//!
+//! Returns max(|B_z|, |v_z|) over interior cells (0 on the 3D path -- never called there).
+Real CT_Max2DOutOfPlane(MeshData<Real> *md) {
+  auto prim = md->PackVariables(std::vector<std::string>{"prim"});
+  auto cons = md->PackVariables(std::vector<std::string>{"cons"});
+  const int nb = prim.GetDim(5);
+  IndexRange ib = md->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBoundsK(IndexDomain::interior);
+  Real maxv = 0.0;
+  parthenon::par_reduce(
+      parthenon::loop_pattern_mdrange_tag, "CT_Max2DOutOfPlane", parthenon::DevExecSpace(),
+      0, nb - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &lmax) {
+        lmax = std::max(lmax, std::abs(cons(b, IB3, k, j, i)));
+        lmax = std::max(lmax, std::abs(prim(b, IV3, k, j, i)));
+      },
+      Kokkos::Max<Real>(maxv));
+  return maxv;
+}
+
+//----------------------------------------------------------------------------------------
 //! max over interior cells of |div B|_face * dx  (absolute, no |B| normalization).
 Real CT_MaxAbsFaceDivB(MeshData<Real> *md) {
   const int ndim = md->GetMeshPointer()->ndim;

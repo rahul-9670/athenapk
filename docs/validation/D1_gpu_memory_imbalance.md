@@ -125,3 +125,25 @@ before the crash — but a run needing to go further will simply stop there.
 (a Kokkos allocation dump by label at each regrid) and check whether their total scales with the
 coarse-fine boundary count rather than with blocks/rank. If so, the fix is in Parthenon's buffer
 sizing, not in job geometry.
+
+## The instrument (2026-08-05) — implemented, not yet run
+
+`<hydro> d1_meminfo` (default **false** => no output, no cost, bit-identical) makes every rank
+print, whenever the block count changes (i.e. after each regrid):
+
+```
+[D1] cycle=N rank=R nblocks=... coarse_fine_nbrs=... same_level_nbrs=... dev_free_GiB=... dev_total_GiB=...
+```
+
+`coarse_fine_nbrs` counts this rank's neighbours sitting at a **different** refinement level;
+`dev_free/total` come from `cudaMemGetInfo` under `KOKKOS_ENABLE_CUDA`. Implementation:
+`src/hydro/hydro.cpp`, `PreStepMeshUserWorkInLoop`.
+
+**The prediction to test.** If the surviving hypothesis is right, `dev_free_GiB` tracks
+`coarse_fine_nbrs` and **not** `nblocks`. That is precisely what would explain why 4 and 5 ranks
+die at the same cycle: rank count changes how blocks are distributed, not how many coarse-fine
+boundaries the hierarchy contains. If instead `dev_free_GiB` tracks `nblocks`, the hypothesis is
+dead and the search restarts.
+
+To collect: add `-hydro/d1_meminfo=true` to the CLI of a deep-AMR restart and grep `[D1]` out of
+the job log. It needs a GPU run; none has been launched.

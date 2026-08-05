@@ -89,6 +89,32 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     }
   }
 
+  // AUDIT 2026-08-05 (N4): <radiation> rho_unit_cgs / v_unit_cgs / length_unit_cgs are DEAD
+  // KEYS and have been since the Phase-1 unit consolidation -- the base scales come from
+  // PhysUnits::BuildPhysicalUnits, which reads block <units> (or derives them from the BE IC).
+  // 165 of the 295 decks in the tree still carry them, where they read as authoritative
+  // (counted 2026-08-05; all 165 occurrences are in <radiation>). Worse, the
+  // hard-fail that protects the BE normalisation only inspects <units>, so writing the
+  // override in <radiation> gets SILENCE rather than the intended error. Warn instead of
+  // failing: the values in every existing deck happen to agree with the derived ones to
+  // rounding, and hard-failing would break decks belonging to queued jobs.
+  if (parthenon::Globals::my_rank == 0) {
+    const char *keys[3] = {"rho_unit_cgs", "v_unit_cgs", "length_unit_cgs"};
+    const Real derived[3] = {rho_unit, v_unit, l_unit};
+    for (int q = 0; q < 3; ++q) {
+      if (!pin->DoesParameterExist(bn, keys[q])) continue;
+      const Real given = pin->GetReal(bn, keys[q]);
+      std::cout << "### WARNING Radiation: <radiation> " << keys[q] << " = " << given
+                << " is IGNORED (dead key). The base scales are single-sourced from "
+                   "PhysicalUnits; this run uses "
+                << derived[q] << " (relative difference "
+                << (derived[q] != 0.0 ? (given - derived[q]) / derived[q] : 0.0)
+                << "). Remove it from the deck, or set it in <units> -- where, for a "
+                   "collapse_be problem, it is correctly REJECTED rather than ignored."
+                << std::endl;
+    }
+  }
+
   //   c      : speed of light  (code units; default = calibrated c_light/v_unit)
   //   arad   : radiation constant a_R (so E_eq = arad * T^4; default = calibrated)
   //   creduc : reduced-speed-of-light factor (RSLA); chat = c / creduc (>=1)
@@ -164,6 +190,14 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                     "radiation/n_group must be in [1, MAX_GROUP=8].");
   const Real nu_min_hz = pin->GetOrAddReal(bn, "nu_min_hz", 1.0e12); // ~40 K blackbody peak
   const Real nu_max_hz = pin->GetOrAddReal(bn, "nu_max_hz", 1.0e15); // ~far-UV
+  PARTHENON_REQUIRE(!(n_group > 1) || (nu_min_hz > 0.0 && nu_max_hz > nu_min_hz),
+                    "radiation: multigroup needs 0 < nu_min_hz < nu_max_hz.");
+  // audit N11 (2026-08-05): n_group=2 has one interior edge, so nu_max_hz cannot be honoured.
+  if (n_group == 2 && parthenon::Globals::my_rank == 0)
+    std::cout << "### WARNING Radiation: n_group = 2 has a single interior group edge, which is "
+                 "placed at nu_min_hz = "
+              << nu_min_hz << " Hz. radiation/nu_max_hz = " << nu_max_hz
+              << " is IGNORED. Use n_group >= 3 to span [nu_min_hz, nu_max_hz]." << std::endl;
   RadGroups groups = BuildRadGroups(n_group, nu_min_hz, nu_max_hz);
   // Monochromatic dust opacity spectral index beta in kappa_nu = kappa_gray*(nu/nu_ref)^beta.
   // The per-group Planck/Rosseland means are the band-limited averages of kappa_nu with the

@@ -198,6 +198,13 @@ Real CT_MaxRelFaceDivB(MeshData<Real> *md);
 // stays at round-off regardless of the field magnitude or the EMF averaging scheme.
 Real CT_MaxAbsFaceDivB(MeshData<Real> *md);
 
+// AUDIT 2026-08-05 (N1). max(|B_z|, |v_z|) over interior cells. In 2D this CT implementation
+// never evolves B_z (E1/E2 are only assembled when ndim > 2, and every F3 update is behind
+// `if (three_d)`), which is exact ONLY while B_z == v_z == 0 -- an invariant that is closed
+// in 2D, see the long note at the definition. The driver calls this once, on the first step
+// of a 2D CT run, and hard-fails if it is non-zero rather than silently freezing the field.
+Real CT_Max2DOutOfPlane(MeshData<Real> *md);
+
 } // namespace CT
 } // namespace Hydro
 

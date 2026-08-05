@@ -439,7 +439,14 @@ TaskStatus MatterCouplingMultigroup(MeshData<Real> *md, const Real dt) {
         Real dFx[MAX_GROUP], dFy[MAX_GROUP], dFz[MAX_GROUP];
         Real sdFx = 0.0, sdFy = 0.0, sdFz = 0.0;
         const Real kR = RosselandOpacity(op, rho, T) * kdust;
-        const Real ks = ScatteringOpacity(op, rho, T);
+        // audit N5 (2026-08-05): scattering here is DUST scattering, so it scales with the
+        // dust factor exactly as the two absorption means do. Previously it did not, so a
+        // sublimating cell lost its absorption but kept full-strength scattering. Latent, and
+        // the reason is the DUST switch, not the scattering coefficient: exactly two decks in
+        // the tree set radiation/kappa_s_code non-zero (runs/validation_rt/diff_thick.in =
+        // 100.0 and runs/validation_rt/rad_shadow.in = 0.1) and NEITHER enables <physics>
+        // dust, so kdust == 1 in both and this line is bit-identical everywhere it has run.
+        const Real ks = ScatteringOpacity(op, rho, T) * kdust;
         for (int g = 0; g < n_group; ++g) {
           const Real ag = chat * dt * rho * (kR * optab.RossMult(g, T * T_unit) + ks);
           const Real fac = -ag / (1.0 + ag);
@@ -657,7 +664,7 @@ TaskStatus MatterCoupling(MeshData<Real> *md, const Real dt) {
         // which kicks the gas ANTI-parallel to the attenuated flux -- wrong direction.
         // Flux attenuation uses the ROSSELAND mean (kappa_R) + scattering.
         const Real a = chat * dt * rho *
-                       (RosselandOpacity(op, rho, T) * kdust + ScatteringOpacity(op, rho, T));
+                       (RosselandOpacity(op, rho, T) + ScatteringOpacity(op, rho, T)) * kdust;
         const Real dFx = -a / (1.0 + a) * Fx0;
         const Real dFy = -a / (1.0 + a) * Fy0;
         const Real dFz = -a / (1.0 + a) * Fz0;
