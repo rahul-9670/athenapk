@@ -19,6 +19,7 @@
 #include "kokkos_abstraction.hpp"
 #include "utils/error_checking.hpp"
 
+#include "../eos/adiabatic_glmmhd.hpp"
 #include "../main.hpp"
 #include "sinks.hpp"
 
@@ -292,6 +293,15 @@ TaskStatus CreateSinks(MeshData<Real> *md, const parthenon::SimTime &tm) {
 
   const Real G = pkg->Param<Real>("four_pi_G") / (4.0 * M_PI);
   const Real gam = pkg->Param<Real>("gamma");
+  // AUDIT 2026-08-05 (A4/A6). This package was written for pure hydro: it had no notion of
+  // the magnetic field at all, and derived its sound speed from the ideal gamma. Both are
+  // wrong under the production configuration (fluid=glmmhd, eos=hydrogen). See the two
+  // notes at the use sites below.
+  auto hydro_pkg = md->GetBlockData(0)->GetBlockPointer()->packages.Get("Hydro");
+  const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
+  const auto eos_mhd = mhd ? hydro_pkg->Param<AdiabaticGLMMHDEOS>("eos")
+                           : AdiabaticGLMMHDEOS(0., 0., 0., 0., 0., gam, false,
+                                                EOSTable::EosTable(), 0.0, false);
   const Real njeans = pkg->Param<Real>("n_jeans_sink");
   const Real rho_sink_fixed = pkg->Param<Real>("rho_sink_code");
   const Real racc_cells = pkg->Param<Real>("racc_cells");
@@ -327,7 +337,18 @@ TaskStatus CreateSinks(MeshData<Real> *md, const parthenon::SimTime &tm) {
         const Real dz = coords.template Dxc<parthenon::X3DIR>(k, j, i);
         Real rho_sink = rho_sink_fixed;
         if (rho_sink_fixed < 0.0) {
-          const Real cs2 = gam * prm(IPR, k, j, i) / rho;
+          // AUDIT 2026-08-05 (A6, same class as A1): the Truelove threshold must use the
+          // sound speed the integrator uses. Under eos=hydrogen, gam*p/rho is not it.
+          Real cs2;
+          if (mhd) {
+            Real prim_c[NHYDRO];
+            prim_c[IDN] = rho;
+            prim_c[IPR] = prm(IPR, k, j, i);
+            const Real cs = eos_mhd.SoundSpeed(prim_c);
+            cs2 = cs * cs;
+          } else {
+            cs2 = gam * prm(IPR, k, j, i) / rho;
+          }
           rho_sink = M_PI * cs2 / (G * njeans * dx * njeans * dx);
         }
         if (rho < rho_sink) return;
@@ -449,6 +470,15 @@ TaskStatus AccreteSinks(MeshData<Real> *md, const parthenon::SimTime &tm, const 
   if (!pkg->Param<bool>("accretion")) return TaskStatus::complete;
   const Real G = pkg->Param<Real>("four_pi_G") / (4.0 * M_PI);
   const Real gam = pkg->Param<Real>("gamma");
+  // AUDIT 2026-08-05 (A4/A6). This package was written for pure hydro: it had no notion of
+  // the magnetic field at all, and derived its sound speed from the ideal gamma. Both are
+  // wrong under the production configuration (fluid=glmmhd, eos=hydrogen). See the two
+  // notes at the use sites below.
+  auto hydro_pkg = md->GetBlockData(0)->GetBlockPointer()->packages.Get("Hydro");
+  const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
+  const auto eos_mhd = mhd ? hydro_pkg->Param<AdiabaticGLMMHDEOS>("eos")
+                           : AdiabaticGLMMHDEOS(0., 0., 0., 0., 0., gam, false,
+                                                EOSTable::EosTable(), 0.0, false);
   const Real njeans = pkg->Param<Real>("n_jeans_sink");
   const Real rho_sink_fixed = pkg->Param<Real>("rho_sink_code");
   const Real racc_cells = pkg->Param<Real>("racc_cells");
@@ -531,14 +561,38 @@ TaskStatus AccreteSinks(MeshData<Real> *md, const parthenon::SimTime &tm, const 
         const Real zc = coords.template Xc<parthenon::X3DIR>(k, j, i);
         const Real rho = c(IDN, k, j, i);
         // per-cell floor rho_sink/3 (fixed threshold, or Truelove)
+        // AUDIT 2026-08-05 (A4): magnetic energy density, Heaviside-Lorentz (P_mag = B^2/2),
+        // matching the convention used everywhere else in AthenaPK. Zero for fluid=euler.
+        const Real me = mhd ? 0.5 * (c(IB1, k, j, i) * c(IB1, k, j, i) +
+                                     c(IB2, k, j, i) * c(IB2, k, j, i) +
+                                     c(IB3, k, j, i) * c(IB3, k, j, i))
+                            : 0.0;
         Real rho_sink = rho_sink_fixed;
         if (rho_sink_fixed < 0.0) {
-          // c(IEN) is total energy; approximate p via (gamma-1)(E - KE) for the sound speed
+          // c(IEN) is TOTAL energy. The thermal part is E - KE - ME; the magnetic term was
+          // missing, which biased p (and hence rho_sink) HIGH under MHD -- in the magnetically
+          // dominated first-core interior, by a lot. (A6: and the sound speed must come from
+          // the EOS, not from gamma.)
           const Real ke = 0.5 *
                           (c(IM1, k, j, i) * c(IM1, k, j, i) + c(IM2, k, j, i) * c(IM2, k, j, i) +
                            c(IM3, k, j, i) * c(IM3, k, j, i)) / rho;
-          const Real p = (gam - 1.0) * (c(IEN, k, j, i) - ke);
-          const Real cs2 = gam * p / rho;
+          const Real eth = c(IEN, k, j, i) - ke - me;
+          const Real eth_pos = (eth > 0.0 ? eth : 0.0);
+          Real cs2;
+          if (mhd) {
+            // Invert e_int -> p with the SAME EOS that produced it, then take that EOS's
+            // sound speed. Mixing an ideal-gamma inversion with a tabulated sound speed
+            // would just move the inconsistency one step along.
+            Real prim_c[NHYDRO];
+            prim_c[IDN] = rho;
+            prim_c[IPR] = eos_mhd.UseH2Diss()
+                              ? eos_mhd.GetEosTable().PresFromRhoEint(rho, eth_pos)
+                              : (gam - 1.0) * eth_pos;
+            const Real cs = eos_mhd.SoundSpeed(prim_c);
+            cs2 = cs * cs;
+          } else {
+            cs2 = gam * ((gam - 1.0) * eth_pos) / rho;
+          }
           rho_sink = M_PI * cs2 / (G * njeans * dx * njeans * dx);
         }
         const Real floor = rho_sink / 3.0;
@@ -562,7 +616,17 @@ TaskStatus AccreteSinks(MeshData<Real> *md, const parthenon::SimTime &tm, const 
           const Real dpx = c(IM1, k, j, i) * phi, dpy = c(IM2, k, j, i) * phi,
                      dpz = c(IM3, k, j, i) * phi;
           c(IM1, k, j, i) -= dpx; c(IM2, k, j, i) -= dpy; c(IM3, k, j, i) -= dpz;
-          c(IEN, k, j, i) *= (1.0 - phi);
+          // AUDIT 2026-08-05 (A4). Was `c(IEN) *= (1 - phi)`, which scales the TOTAL energy
+          // -- including the magnetic part -- while B is deliberately left untouched. With
+          // rho, the momentum and hence KE all scaling by (1-phi), that left
+          //     e_th,new = (1-phi) e_th - phi * ME,
+          // i.e. it charged the removed gas for magnetic energy that is still in the cell.
+          // In any cell with ME > e_th (1-phi)/phi -- the magnetically dominated first-core
+          // interior, exactly where a sink lives -- the internal energy goes NEGATIVE and the
+          // cell is handed to the pressure floor.
+          // The update consistent with "B untouched" is to scale only what is being removed:
+          // the thermal and kinetic energy of the gas, leaving ME exactly as it was.
+          c(IEN, k, j, i) = (c(IEN, k, j, i) - me) * (1.0 - phi) + me;
           // accumulate onto the sink (dp already a total momentum: density*phi*... no -> *dV)
           Kokkos::atomic_add(&accum(s, 0), dM);
           Kokkos::atomic_add(&accum(s, 1), dpx * dV);
@@ -612,7 +676,12 @@ TaskStatus AccreteSinks(MeshData<Real> *md, const parthenon::SimTime &tm, const 
     Kokkos::deep_copy(Lzh, Lzd);
     for (int n = 0; n <= maxi; ++n) {
       if (!mask_h(n)) continue;
-      const int s = id2g[idh(n)];
+      // AUDIT 2026-08-05 (B4): std::map::operator[] would SILENTLY insert 0 for an id that
+      // is not in the gathered list, aliasing this sink onto global slot 0. .at() throws.
+      PARTHENON_REQUIRE_THROWS(id2g.count(idh(n)) == 1,
+                               "sinks: local sink id not present in the gathered global list "
+                               "(swarm/gather desync)");
+      const int s = id2g.at(idh(n));
       const Real dM = ac[7 * s + 0];
       if (dM <= 0.0) continue;
       const Real m0 = mh(n), mnew = m0 + dM;
@@ -763,7 +832,10 @@ TaskStatus AdvanceSinksNBody(MeshData<Real> *md, const Real dt) {
     auto idh = swarm->Get<std::uint64_t>(swarm_position::id::name()).Get().GetHostMirrorAndCopy();
     for (int n = 0; n <= maxi; ++n) {
       if (!mask_h(n)) continue;
-      const int g = id2g[idh(n)];
+      PARTHENON_REQUIRE_THROWS(id2g.count(idh(n)) == 1,
+                               "sinks: local sink id not present in the gathered global list "
+                               "(swarm/gather desync)");
+      const int g = id2g.at(idh(n));
       xh(n) = x[g]; yh(n) = y[g]; zh(n) = z[g];
       vxh(n) = vx[g]; vyh(n) = vy[g]; vzh(n) = vz[g];
     }

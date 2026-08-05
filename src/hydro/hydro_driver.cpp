@@ -206,338 +206,6 @@ TaskStatus RKL2StepOther(MeshData<Real> *md_Y0, MeshData<Real> *md_Yjm1,
   return TaskStatus::complete;
 }
 
-//----------------------------------------------------------------------------------------
-// TEMPORARY DIAGNOSTICS (2026-07-29, CT-vs-GLM ambipolar under-diffusion investigation).
-// Not gated behind a flag; each is an extra blocking global reduction + rank-0 print, added
-// as ordinary Task nodes (same pattern as MagneticTowerReducePowerContribs above) so they
-// run at actual task-graph EXECUTION time (not graph-build time, when "base" would still
-// hold the previous stage's stale data). Intended to be reverted once the investigation
-// concludes; harmless to leave in (pure diagnostics, no state mutation).
-
-// eta_A cache stats (max, mean) over the interior. Same code path/cache for CT and GLM, so
-// this establishes whether the ambipolar diffusivity ITSELF differs between the two schemes
-// at a given (identical, restart-derived) state.
-TaskStatus DiagEtaA(MeshData<Real> *md, const std::string label) {
-  auto pmb = md->GetBlockData(0)->GetBlockPointer();
-  auto hydro_pkg_diag = pmb->packages.Get("Hydro");
-  if (!hydro_pkg_diag->Param<bool>("nonideal_eta_cache")) {
-    if (parthenon::Globals::my_rank == 0) {
-      std::cout << "DIAG_ETA_A " << label << " (cache off, skipped)" << std::endl;
-    }
-    return TaskStatus::complete;
-  }
-  IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
-  IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
-  IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
-  auto eta_pack = md->PackVariables(std::vector<std::string>{"nonideal_eta"});
-  const int nb = eta_pack.GetDim(5);
-  Real lmax = 0.0, lsum = 0.0;
-  parthenon::par_reduce(
-      parthenon::loop_pattern_mdrange_tag, "DiagEtaA_max", parthenon::DevExecSpace(), 0,
-      nb - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &m) {
-        m = std::max(m, eta_pack(b, NonidealEtaIdx::A, k, j, i));
-      },
-      Kokkos::Max<Real>(lmax));
-  parthenon::par_reduce(
-      parthenon::loop_pattern_mdrange_tag, "DiagEtaA_sum", parthenon::DevExecSpace(), 0,
-      nb - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &s) {
-        s += eta_pack(b, NonidealEtaIdx::A, k, j, i);
-      },
-      Kokkos::Sum<Real>(lsum));
-  Real lcount = static_cast<Real>(nb) * (kb.e - kb.s + 1) * (jb.e - jb.s + 1) *
-               (ib.e - ib.s + 1);
-#ifdef MPI_PARALLEL
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, &lmax, 1, MPI_PARTHENON_REAL, MPI_MAX, MPI_COMM_WORLD));
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, &lsum, 1, MPI_PARTHENON_REAL, MPI_SUM, MPI_COMM_WORLD));
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, &lcount, 1, MPI_PARTHENON_REAL, MPI_SUM, MPI_COMM_WORLD));
-#endif
-  if (parthenon::Globals::my_rank == 0) {
-    std::cout << "DIAG_ETA_A " << label << " max=" << lmax
-              << " mean=" << (lsum / std::max(lcount, 1.0)) << " ncell=" << lcount
-              << std::endl;
-  }
-  return TaskStatus::complete;
-}
-
-// Stage-init M(Y0) magnitude restricted to the B-components, GLM path: reads MY0's "cons"
-// IB1..IB3 (the flux divergence of AmbipolarDiffFluxIsoFixed + OhmicDiffFluxIsoFixed, etc.,
-// evaluated on the Y0/restart state).
-TaskStatus DiagMOpB_GLM(MeshData<Real> *md_MY0, const std::string label) {
-  auto pmb = md_MY0->GetBlockData(0)->GetBlockPointer();
-  IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
-  IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
-  IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
-  auto MY0 = md_MY0->PackVariables(std::vector<std::string>{"cons"});
-  const int nb = MY0.GetDim(5);
-  Real lsum = 0.0, lmax = 0.0;
-  parthenon::par_reduce(
-      parthenon::loop_pattern_mdrange_tag, "DiagMOpB_GLM_sum", parthenon::DevExecSpace(), 0,
-      nb - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &s) {
-        s += std::abs(MY0(b, IB1, k, j, i)) + std::abs(MY0(b, IB1 + 1, k, j, i)) +
-             std::abs(MY0(b, IB1 + 2, k, j, i));
-      },
-      Kokkos::Sum<Real>(lsum));
-  parthenon::par_reduce(
-      parthenon::loop_pattern_mdrange_tag, "DiagMOpB_GLM_max", parthenon::DevExecSpace(), 0,
-      nb - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &m) {
-        const Real v = std::abs(MY0(b, IB1, k, j, i)) + std::abs(MY0(b, IB1 + 1, k, j, i)) +
-                       std::abs(MY0(b, IB1 + 2, k, j, i));
-        m = std::max(m, v);
-      },
-      Kokkos::Max<Real>(lmax));
-#ifdef MPI_PARALLEL
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, &lsum, 1, MPI_PARTHENON_REAL, MPI_SUM, MPI_COMM_WORLD));
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, &lmax, 1, MPI_PARTHENON_REAL, MPI_MAX, MPI_COMM_WORLD));
-#endif
-  if (parthenon::Globals::my_rank == 0) {
-    std::cout << "DIAG_MOP_B " << label << " L1sum=" << lsum << " Linf=" << lmax
-              << std::endl;
-  }
-  return TaskStatus::complete;
-}
-
-// Stage-init M(Y0) magnitude, CT path: reads MY0's face field Bf (already holds
-// -curl(E_diff) from CT_CurlEMFToBf at the point this is called).
-TaskStatus DiagMOpB_CT(MeshData<Real> *md_MY0, const std::string label) {
-  const int ndim = md_MY0->GetMeshPointer()->ndim;
-  const bool three_d = ndim > 2;
-  static auto desc = parthenon::MakePackDescriptor<Hydro::CT::Bf>(md_MY0);
-  auto MY0 = desc.GetPack(md_MY0);
-  const int nb = MY0.GetNBlocks();
-  using TE = parthenon::TopologicalElement;
-  using parthenon::CellLevel;
-  Real lsum = 0.0, lmax = 0.0;
-  auto accum = [&](TE te) {
-    IndexRange ib = md_MY0->GetBoundsI(CellLevel::same, IndexDomain::interior, te);
-    IndexRange jb = md_MY0->GetBoundsJ(CellLevel::same, IndexDomain::interior, te);
-    IndexRange kb = md_MY0->GetBoundsK(CellLevel::same, IndexDomain::interior, te);
-    Real s = 0.0, m = 0.0;
-    parthenon::par_reduce(
-        parthenon::loop_pattern_mdrange_tag, "DiagMOpB_CT_sum", parthenon::DevExecSpace(), 0,
-        nb - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &acc) {
-          acc += std::abs(MY0(b, te, Hydro::CT::Bf(), k, j, i));
-        },
-        Kokkos::Sum<Real>(s));
-    parthenon::par_reduce(
-        parthenon::loop_pattern_mdrange_tag, "DiagMOpB_CT_max", parthenon::DevExecSpace(), 0,
-        nb - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-        KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &acc) {
-          acc = std::max(acc, std::abs(MY0(b, te, Hydro::CT::Bf(), k, j, i)));
-        },
-        Kokkos::Max<Real>(m));
-    lsum += s;
-    lmax = std::max(lmax, m);
-  };
-  accum(TE::F1);
-  accum(TE::F2);
-  if (three_d) accum(TE::F3);
-#ifdef MPI_PARALLEL
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, &lsum, 1, MPI_PARTHENON_REAL, MPI_SUM, MPI_COMM_WORLD));
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, &lmax, 1, MPI_PARTHENON_REAL, MPI_MAX, MPI_COMM_WORLD));
-#endif
-  if (parthenon::Globals::my_rank == 0) {
-    std::cout << "DIAG_MOP_B " << label << " L1sum=" << lsum << " Linf=" << lmax
-              << std::endl;
-  }
-  return TaskStatus::complete;
-}
-
-// Total magnetic energy density integral proxy: sum(B^2) over interior cells from "cons"
-// IB1..IB3 -- valid/comparable for both CT (post CT_ProjectBfToCC) and GLM at any task
-// boundary. Called before/after/during the STS group to track the actual suppression
-// achieved, apples-to-apples.
-TaskStatus DiagTotalB2(MeshData<Real> *md, const std::string label) {
-  auto pmb = md->GetBlockData(0)->GetBlockPointer();
-  IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
-  IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
-  IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
-  auto cons = md->PackVariables(std::vector<std::string>{"cons"});
-  const int nb = cons.GetDim(5);
-  Real lsum = 0.0;
-  parthenon::par_reduce(
-      parthenon::loop_pattern_mdrange_tag, "DiagTotalB2", parthenon::DevExecSpace(), 0,
-      nb - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &s) {
-        s += SQR(cons(b, IB1, k, j, i)) + SQR(cons(b, IB1 + 1, k, j, i)) +
-             SQR(cons(b, IB1 + 2, k, j, i));
-      },
-      Kokkos::Sum<Real>(lsum));
-#ifdef MPI_PARALLEL
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, &lsum, 1, MPI_PARTHENON_REAL, MPI_SUM, MPI_COMM_WORLD));
-#endif
-  if (parthenon::Globals::my_rank == 0) {
-    std::cout << "DIAG_TOTAL_B2 " << label << " sumB2=" << lsum << std::endl;
-  }
-  return TaskStatus::complete;
-}
-
-// PER-LEVEL magnetic-energy dissipation rate integral sum_V V * B . M(B), where M(B)=dB/dt of
-// the (Ohmic+AD) parabolic operator evaluated on Y0. A discretely DISSIPATIVE operator must
-// give sum V B.M <= 0 (modulo boundary terms); a positive/near-zero value flags a
-// NON-dissipative (spurious) spatial operator. Split by AMR level to distinguish a coarse-fine
-// (edge-restriction) defect [non-dissipation localized to blocks at level boundaries] from a
-// local edge/curl/projection defect [non-dissipation throughout, incl. fine-block interiors].
-// CT variant: M = MY0.Bf (the -curl(E_diff) face field after CT_CurlEMFToBf) projected to cell
-// centres; B = Y0 (base) cons IB1..3. Reports rate = (sum V B.M)/(sum V B^2) per level.
-TaskStatus DiagBdotM_CT(MeshData<Real> *md_base, MeshData<Real> *md_MY0,
-                        const std::string label) {
-  const bool three_d = md_base->GetMeshPointer()->ndim > 2;
-  auto cons = md_base->PackVariables(std::vector<std::string>{"cons"});
-  static auto desc = parthenon::MakePackDescriptor<Hydro::CT::Bf>(md_MY0);
-  auto MY0 = desc.GetPack(md_MY0);
-  static auto desc_b = parthenon::MakePackDescriptor<Hydro::CT::Bf>(md_base);
-  auto Bf0 = desc_b.GetPack(md_base); // Y0 face field (base.Bf = u1.Bf snapshot)
-  using TE = parthenon::TopologicalElement;
-  constexpr int NLEV = 24;
-  double vb2[NLEV] = {0.0}, vbm[NLEV] = {0.0};
-  // FACE-NATIVE (no cell projection): dot co-located face Bf with face M(Bf). The projected
-  // measure above 0.5-averages Bf[i]+Bf[i+1] -> NULLS the Nyquist/grid-scale mode; this one
-  // keeps it, so it reveals AD acting on the sharp face field that the projection can't see.
-  double fb2[NLEV] = {0.0}, fbm[NLEV] = {0.0};
-  const int nblk = md_base->NumBlocks();
-  for (int bb = 0; bb < nblk; ++bb) {
-    auto pmb = md_base->GetBlockData(bb)->GetBlockPointer();
-    const int lev = pmb->loc.level();
-    IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
-    IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
-    IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
-    Real lb2 = 0.0, lbm = 0.0, lf2 = 0.0, lfm = 0.0;
-    parthenon::par_reduce(
-        parthenon::loop_pattern_mdrange_tag, "DiagBdotM_CT", parthenon::DevExecSpace(), kb.s,
-        kb.e, jb.s, jb.e, ib.s, ib.e,
-        KOKKOS_LAMBDA(const int k, const int j, const int i, Real &s2, Real &sm, Real &f2,
-                      Real &fm) {
-          const auto &co = cons.GetCoords(bb);
-          const Real V = co.CellVolume(k, j, i);
-          const Real bx = cons(bb, IB1, k, j, i), by = cons(bb, IB2, k, j, i),
-                     bz = cons(bb, IB3, k, j, i);
-          const Real Mx = 0.5 * (MY0(bb, TE::F1, Hydro::CT::Bf(), k, j, i) +
-                                 MY0(bb, TE::F1, Hydro::CT::Bf(), k, j, i + 1));
-          const Real My = 0.5 * (MY0(bb, TE::F2, Hydro::CT::Bf(), k, j, i) +
-                                 MY0(bb, TE::F2, Hydro::CT::Bf(), k, j + 1, i));
-          const Real Mz = three_d ? 0.5 * (MY0(bb, TE::F3, Hydro::CT::Bf(), k, j, i) +
-                                           MY0(bb, TE::F3, Hydro::CT::Bf(), k + 1, j, i))
-                                  : MY0(bb, TE::F3, Hydro::CT::Bf(), k, j, i);
-          s2 += V * (bx * bx + by * by + bz * bz);
-          sm += V * (bx * Mx + by * My + bz * Mz);
-          // face-native (lower faces of the cell; co-located Bf.M, no averaging)
-          const Real f1b = Bf0(bb, TE::F1, Hydro::CT::Bf(), k, j, i);
-          const Real f2b = Bf0(bb, TE::F2, Hydro::CT::Bf(), k, j, i);
-          const Real f3b = three_d ? Bf0(bb, TE::F3, Hydro::CT::Bf(), k, j, i) : 0.0;
-          const Real f1m = MY0(bb, TE::F1, Hydro::CT::Bf(), k, j, i);
-          const Real f2m = MY0(bb, TE::F2, Hydro::CT::Bf(), k, j, i);
-          const Real f3m = three_d ? MY0(bb, TE::F3, Hydro::CT::Bf(), k, j, i) : 0.0;
-          f2 += V * (f1b * f1b + f2b * f2b + f3b * f3b);
-          fm += V * (f1b * f1m + f2b * f2m + f3b * f3m);
-        },
-        Kokkos::Sum<Real>(lb2), Kokkos::Sum<Real>(lbm), Kokkos::Sum<Real>(lf2),
-        Kokkos::Sum<Real>(lfm));
-    if (lev >= 0 && lev < NLEV) {
-      vb2[lev] += lb2;
-      vbm[lev] += lbm;
-      fb2[lev] += lf2;
-      fbm[lev] += lfm;
-    }
-  }
-#ifdef MPI_PARALLEL
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, vb2, NLEV, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD));
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, vbm, NLEV, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD));
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, fb2, NLEV, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD));
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, fbm, NLEV, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD));
-#endif
-  if (parthenon::Globals::my_rank == 0) {
-    for (int L = 0; L < NLEV; ++L)
-      if (fb2[L] != 0.0)
-        std::cout << "DIAG_BDOTM_FACE " << label << " L" << L << " FB2=" << fb2[L]
-                  << " FBdotM=" << fbm[L] << " rate=" << (fbm[L] / fb2[L]) << std::endl;
-  }
-  if (parthenon::Globals::my_rank == 0) {
-    double t2 = 0.0, tm = 0.0;
-    for (int L = 0; L < NLEV; ++L) {
-      t2 += vb2[L];
-      tm += vbm[L];
-      if (vb2[L] != 0.0)
-        std::cout << "DIAG_BDOTM " << label << " L" << L << " VB2=" << vb2[L]
-                  << " VBdotM=" << vbm[L] << " rate=" << (vbm[L] / vb2[L]) << std::endl;
-    }
-    std::cout << "DIAG_BDOTM " << label << " TOTAL VB2=" << t2 << " VBdotM=" << tm
-              << " rate=" << (tm / t2) << " (rate<0 dissipative)" << std::endl;
-  }
-  return TaskStatus::complete;
-}
-
-// GLM variant of DiagBdotM: M = MY0 cons IB1..3 (the FluxDivergence of the parabolic fluxes);
-// B = Y0 (base) cons IB1..3. Same per-level sum V B.M reference (should be strongly negative).
-TaskStatus DiagBdotM_GLM(MeshData<Real> *md_base, MeshData<Real> *md_MY0,
-                         const std::string label) {
-  auto cons = md_base->PackVariables(std::vector<std::string>{"cons"});
-  auto M = md_MY0->PackVariables(std::vector<std::string>{"cons"});
-  constexpr int NLEV = 24;
-  double vb2[NLEV] = {0.0}, vbm[NLEV] = {0.0};
-  const int nblk = md_base->NumBlocks();
-  for (int bb = 0; bb < nblk; ++bb) {
-    auto pmb = md_base->GetBlockData(bb)->GetBlockPointer();
-    const int lev = pmb->loc.level();
-    IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
-    IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
-    IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
-    Real lb2 = 0.0, lbm = 0.0;
-    parthenon::par_reduce(
-        parthenon::loop_pattern_mdrange_tag, "DiagBdotM_GLM", parthenon::DevExecSpace(), kb.s,
-        kb.e, jb.s, jb.e, ib.s, ib.e,
-        KOKKOS_LAMBDA(const int k, const int j, const int i, Real &s2, Real &sm) {
-          const auto &co = cons.GetCoords(bb);
-          const Real V = co.CellVolume(k, j, i);
-          const Real bx = cons(bb, IB1, k, j, i), by = cons(bb, IB2, k, j, i),
-                     bz = cons(bb, IB3, k, j, i);
-          s2 += V * (bx * bx + by * by + bz * bz);
-          sm += V * (bx * M(bb, IB1, k, j, i) + by * M(bb, IB2, k, j, i) +
-                     bz * M(bb, IB3, k, j, i));
-        },
-        Kokkos::Sum<Real>(lb2), Kokkos::Sum<Real>(lbm));
-    if (lev >= 0 && lev < NLEV) {
-      vb2[lev] += lb2;
-      vbm[lev] += lbm;
-    }
-  }
-#ifdef MPI_PARALLEL
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, vb2, NLEV, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD));
-  PARTHENON_MPI_CHECK(
-      MPI_Allreduce(MPI_IN_PLACE, vbm, NLEV, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD));
-#endif
-  if (parthenon::Globals::my_rank == 0) {
-    double t2 = 0.0, tm = 0.0;
-    for (int L = 0; L < NLEV; ++L) {
-      t2 += vb2[L];
-      tm += vbm[L];
-      if (vb2[L] != 0.0)
-        std::cout << "DIAG_BDOTM " << label << " L" << L << " VB2=" << vb2[L]
-                  << " VBdotM=" << vbm[L] << " rate=" << (vbm[L] / vb2[L]) << std::endl;
-    }
-    std::cout << "DIAG_BDOTM " << label << " TOTAL VB2=" << t2 << " VBdotM=" << tm
-              << " rate=" << (tm / t2) << " (rate<0 dissipative)" << std::endl;
-  }
-  return TaskStatus::complete;
-}
-
 // Assumes that prim and cons are in sync initially.
 // Guarantees that prim and cons are in sync at the end.
 void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
@@ -554,14 +222,6 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
   // Bf with M(Bf) = -curl(E_diff). Each Bf sub-stage is projected onto cons IB1..IB3 so the
   // AD eta / edge EMF of the next sub-stage sees the updated field. See ct.hpp / ct.cpp.
   const bool use_ct = hydro_pkg->Param<bool>("use_ct");
-  // TEMPORARY DIAGNOSTICS tag (see DiagEtaA/DiagMOpB_*/DiagTotalB2 above).
-  const std::string diag_tag = use_ct ? "CT" : "GLM";
-  // TEMPORARY: compile-time gate for the CT-vs-GLM AD diagnostics (per-substep blocking
-  // reductions + rank-0 prints). false = production (no overhead, no log spam); flip to true
-  // to re-enable the DiagEtaA/DiagMOpB/DiagTotalB2/DiagBdotM instrumentation. Remove with the
-  // Diag* definitions once the CT-AD investigation is fully closed.
-  constexpr bool kCTDiag = false;
-
   // get number of RKL steps
   // eq (21) using half hyperbolic timestep due to Strang split
   int s_rkl =
@@ -629,11 +289,6 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
     // Reset flux arrays (not guaranteed to be zero)
     auto reset_fluxes = tl.AddTask(none, ResetFluxes, base.get());
 
-    // TEMPORARY DIAGNOSTIC: total B^2 of the Y0/restart-derived state, before this STS
-    // group touches anything.
-    if (kCTDiag) tl.AddTask(reset_fluxes, DiagTotalB2, base.get(),
-              diag_tag + " part" + std::to_string(i) + " pre(Y0)");
-
     // Calculate the diffusive fluxes for Y0 (here still "base" as nothing has been
     // updated yet) so that we can store the result as MY0 and reuse later
     // (in every subsetp). Parabolic terms only: in the mixed rkl2+Hall mode the
@@ -643,9 +298,6 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
     auto hydro_diff_fluxes = tl.AddTask(reset_fluxes, CalcDiffFluxes, hydro_pkg.get(),
                                         base.get(), DiffTermSet::parabolic, true);
 
-    // TEMPORARY DIAGNOSTIC: eta_A cache stats right after the stage-init fill.
-    if (kCTDiag) tl.AddTask(hydro_diff_fluxes, DiagEtaA, base.get(),
-              diag_tag + " part" + std::to_string(i) + " stage-init");
 
     // CT: build the diffusive-only edge EMF (Ohmic + AD) into base.Bf.flux BEFORE the flux
     // correction, so the coarse-fine reflux restricts it too (as in the unsplit step).
@@ -674,16 +326,6 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
     auto init_MY0 = tl.AddTask(set_flx, parthenon::Update::FluxDivergence<MeshData<Real>>,
                                base.get(), MY0.get());
 
-    // TEMPORARY DIAGNOSTIC: stage-init M(Y0) restricted to the B-components, cons/GLM path
-    // (informative for CT too: should show near-zero since the IBn deposit is gated off).
-    if (kCTDiag) tl.AddTask(init_MY0, DiagMOpB_GLM, MY0.get(),
-              diag_tag + " part" + std::to_string(i) + " cons-IB");
-    // TEMPORARY DIAGNOSTIC: per-level dissipation integral sum_V V B.M(Y0). GLM path (cons-IB
-    // M); for CT this shows the inert cons-IB (~0, IBn deposit gated off) -- the live CT
-    // measure is DiagBdotM_CT after CT_CurlEMFToBf below.
-    if (kCTDiag) tl.AddTask(init_MY0, DiagBdotM_GLM, Y0.get(), MY0.get(),
-              diag_tag + " part" + std::to_string(i) + " consIB");
-
     // Initialize Y0 and Y1 and the recursion relation starting with j = 2 needs data from
     // the two preceeding stages.
     auto rkl2_step_first = tl.AddTask(init_MY0, RKL2StepFirst, Y0.get(), base.get(),
@@ -695,14 +337,6 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
     if (use_ct) {
       auto curl_my0 =
           tl.AddTask(set_flx, Hydro::CT::CT_CurlEMFToBf, base.get(), MY0.get());
-      // TEMPORARY DIAGNOSTIC: stage-init M(Y0) on the face field (the actual CT operator).
-      if (kCTDiag) tl.AddTask(curl_my0, DiagMOpB_CT, MY0.get(),
-                diag_tag + " part" + std::to_string(i) + " Bf");
-      // TEMPORARY DIAGNOSTIC: per-level dissipation integral sum_V V B.M(Y0), CT path (M =
-      // projected MY0.Bf). rate<0 => dissipative; split by level localizes any non-dissipation
-      // to coarse-fine boundaries (restriction defect) vs fine-block interiors (local defect).
-      if (kCTDiag) tl.AddTask(curl_my0, DiagBdotM_CT, Y0.get(), MY0.get(),
-                diag_tag + " part" + std::to_string(i) + " Bf");
       auto ct_first =
           tl.AddTask(curl_my0 | rkl2_step_first, Hydro::CT::CT_RKL2FirstBf, Y0.get(),
                      base.get(), Yjm2.get(), MY0.get(), s_rkl, tau);
@@ -722,10 +356,6 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
     auto fill_derived_1 = tl.AddTask(
         bounds_exchange, parthenon::Update::FillDerived<MeshData<Real>>, base.get());
 
-    // TEMPORARY DIAGNOSTIC: total B^2 after the RKL2 first sub-stage (Y1).
-    if (kCTDiag) tl.AddTask(fill_derived_1, DiagTotalB2, base.get(),
-              diag_tag + " part" + std::to_string(i) + " afterY1(s=1/" +
-                  std::to_string(s_rkl) + ")");
   }
 
   // Compute coefficients. Meyer+2012 eq. (16)
@@ -813,15 +443,6 @@ void AddSTSTasks(TaskCollection *ptask_coll, Mesh *pmesh, BlockList_t &blocks,
 
       auto fill_derived_j = tl.AddTask(
           bounds_exchange, parthenon::Update::FillDerived<MeshData<Real>>, base.get());
-
-      // TEMPORARY DIAGNOSTIC: total B^2 after RKL2 sub-stage jj (only the LAST stage,
-      // s_rkl, to keep output compact -- the intermediate curve isn't needed to answer
-      // "how much did the whole STS group suppress B").
-      if (jj == s_rkl) {
-        if (kCTDiag) tl.AddTask(fill_derived_j, DiagTotalB2, base.get(),
-                  diag_tag + " part" + std::to_string(i) + " afterFinal(s=" +
-                      std::to_string(s_rkl) + "/" + std::to_string(s_rkl) + ")");
-      }
     }
 
     b_jm2 = b_jm1;
@@ -1174,6 +795,17 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
   // add each sink's softened point-mass force as an operator-split source on the final stage.
   if (stage == integrator->nstages &&
       pmesh->packages.Get("sinks")->Param<bool>("enabled")) {
+    // AUDIT 2026-08-05 (A3). Every task below contains collective MPI: GatherSinks and
+    // AccreteSinks do MPI_Allgather/Allgatherv, CreateSinks does an MPI_Allreduce with
+    // MPI_MAXLOC, AccreteSinks another MPI_Allreduce. Inside a TaskRegion(num_partitions)
+    // each of those is entered once PER PARTITION -- and DefaultNumPartitions() can differ
+    // between ranks (min(default_num_packs_, block_list.size())), so the ranks would reach
+    // the collectives a different number of times and DEADLOCK. Same guard, same wording as
+    // the tracers region below; unreachable while no deck sets pack_size/packs_per_rank.
+    PARTHENON_REQUIRE_THROWS(
+        num_partitions == 1,
+        "Only packs_per_rank=1 currently supported for sinks (the sink tasks contain "
+        "collective MPI and are invoked once per MeshData partition).");
     TaskRegion &sk_grav_region = tc.AddRegion(num_partitions);
     for (int i = 0; i < num_partitions; i++) {
       auto &tl = sk_grav_region[i];

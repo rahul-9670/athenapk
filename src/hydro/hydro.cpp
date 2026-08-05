@@ -1172,6 +1172,19 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         auto ad_diff = AmbipolarDiffusivity(ambipolar, ambipolar_coeff,
                                             ambipolar_coeff_code, 0.0, 0.0, 0.0);
         pkg->AddParam<>("ad_diff", ad_diff);
+        // AUDIT 2026-08-05 (B5). AmbipolarDiffusivity::Get's `fixed` branch returns
+        // coeff*B^2 UNCAPPED by design (diffusion.hpp) -- eta_ad_cap_code is threaded only
+        // into the ionization-family constructors above/below. That is correct (the fixed
+        // path is the Athena++-matched idealised coefficient), but it makes the key a
+        // silent no-op for anyone A/B-ing the cap against the fixed path. Say so.
+        if (parthenon::Globals::my_rank == 0 &&
+            eta_ad_cap_code < std::numeric_limits<Real>::max()) {
+          std::cout << "## WARNING: diffusion/eta_ad_cap_code = " << eta_ad_cap_code
+                    << " is IGNORED with ambipolar_coeff=fixed (eta_A = coeff*B^2 is "
+                       "uncapped by design). The cap applies only to the "
+                       "ionization/ionization_chem coefficient families."
+                    << std::endl;
+        }
 
       } else if (ambipolar_coeff_str == "ionization") {
         // Self-consistent eta_A = B^2/(4 pi gamma_AD rho_i rho) with rho_i from the
@@ -1486,6 +1499,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       // coefficients are not all ionization-family.
       const bool fused = pin->GetOrAddBoolean("diffusion", "fused_nonideal_dt", fusable);
       pkg->AddParam<>("nonideal_dt_fused", fused && fusable);
+
     }
 
     // Cell-centered non-ideal diffusivity cache. When enabled, CalcDiffFluxes first
@@ -1528,6 +1542,27 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       PARTHENON_REQUIRE(!(use_h2diss && any_ionization) || eta_cache,
                         "eos=hydrogen with ionization-coefficient non-ideal MHD requires "
                         "diffusion/eta_cache=true (the default).");
+      // AUDIT 2026-08-05 (A5). Companion guard, same failure mode, different consumer.
+      // The FUSED dt estimator takes the ionization temperature from the EOS table
+      // (diffusion.cpp EstimateNonidealTimestepIonizationFused*, via TemperatureKFromPres).
+      // The PER-TERM fallbacks do not: ambipolar.cpp / resistivity.cpp / hall.cpp compute
+      // `temp = prim(IPR)/prim(IDN)`, which is the ideal-gas identity only. Under
+      // eos=hydrogen mu varies with dissociation and ionization, so that temperature -- and
+      // therefore the diffusive dt -- is wrong. The REQUIRE above covers the flux kernels
+      // and says nothing about the estimators.
+      //
+      // Two routes reach the bad path: mixing coefficient families (e.g.
+      // resistivity_coeff=fixed with ambipolar_coeff=ionization) so the mix is not fusable,
+      // or setting diffusion/fused_nonideal_dt=false, which is exactly what that A/B escape
+      // hatch is for. Production is unaffected -- all three coefficients are
+      // ionization-family, so fusion is on -- making this a guard, not a behaviour change.
+      PARTHENON_REQUIRE(
+          !(use_h2diss && any_ionization) || pkg->Param<bool>("nonideal_dt_fused"),
+          "eos=hydrogen with ionization-coefficient non-ideal MHD requires the FUSED "
+          "non-ideal dt estimator (diffusion/fused_nonideal_dt): the per-term estimators "
+          "derive the ionization temperature as p/rho, which holds only for an ideal gas. "
+          "Keep every active non-ideal coefficient in the ionization family so fusion is "
+          "available, leave diffusion/fused_nonideal_dt at its default, or use eos=adiabatic.");
       pkg->AddParam<>("nonideal_eta_cache", eta_cache);
       if (eta_cache) {
         Metadata m_eta({Metadata::Cell, Metadata::Derived, Metadata::OneCopy},

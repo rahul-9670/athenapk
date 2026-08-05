@@ -1,8 +1,9 @@
 # D1 — per-rank GPU memory imbalance on deep AMR hierarchies
 
-**Status: CHARACTERISED, two hypotheses FALSIFIED, root cause NOT established.** It is a real
-defect that killed three runs on 2026-08-04. The practical mitigation (more ranks) works. This
-document exists so the next person does not re-derive the two dead ends.
+**Status: CHARACTERISED, THREE hypotheses FALSIFIED, root cause NOT established, and there is NO
+known mitigation.** A real defect that killed four runs on 2026-08-04. This document exists so the
+next person does not re-derive the dead ends — including the "just use more ranks" one, which I
+asserted here earlier and then disproved (§ Hypothesis 3).
 
 ## The observation
 
@@ -23,7 +24,8 @@ allocation that happens to fail is tiny and arbitrary (`bnd_flux::grav.phi`, `pr
 `bnd_flux::rad.Fr2_g1`).
 
 **Casualties:** WP-1 `cap=150` twice (jobs 2454256 at 5 ranks, and the leg inside 2454224), and
-the B7 closure truncated at 120 of 500 cycles (job 2454557).
+BOTH B7 closure runs — job 2454557 at 4 ranks and job 2454734 at 5 ranks — each truncated at
+exactly 120 of 500 cycles.
 
 ## Hypothesis 1 — block-distribution imbalance. FALSIFIED.
 
@@ -85,12 +87,41 @@ cheapest next step is a `Kokkos` allocation dump or a per-rank `View` inventory 
 attributing bytes by label — the failing labels are already known to be `bnd_flux::*`, which is
 itself consistent with this hypothesis.
 
-## Mitigation that works today
+## Hypothesis 3 — "more ranks buys headroom". FALSIFIED 2026-08-04.
 
-**Use more ranks.** Memory per rank falls roughly as 1/nranks while the *imbalance ratio* stays
-put, so headroom grows: at 5 ranks the peak was 79.2 GiB of 80; at 7 ranks the same state projects
-to ~57 GiB. WP-1's `cap=150` and the B7 closure rerun were both resubmitted at 7 ranks for exactly
-this reason.
+I originally documented this as the working mitigation, reasoning that per-rank memory falls as
+1/nranks. **It does not help at all.** Two runs of the identical B7 closure:
 
-This is a workaround, not a fix: it wastes GPUs to buy headroom for one overloaded rank, and it
-will fail again on a deeper hierarchy.
+| run | ranks | outcome |
+|---|---|---|
+| `b7_closure` (job 2454557) | 4 | OOM at **cycle 120**, `bnd_flux::rad.Fr2_g1` (1.068 MiB) |
+| `b7_closure2` (job 2454734) | 5 | OOM at **cycle 120**, `bnd_flux::cons.coarse` (2.93 MiB) |
+
+**The same cycle, to the cycle, with 25 % more GPUs.** A per-rank-load problem would have moved
+the failure point. This one did not budge.
+
+## What that implies — and it now points at a mechanism
+
+Both runs follow an identical mesh history: **792 → 883 blocks (row 16) → 939 blocks (row 61)**,
+then die at row 120. The failing allocations are always `bnd_flux::*`, and on the second run
+specifically **`cons.coarse`** — the COARSE buffer used for AMR prolongation/restriction across
+refinement boundaries.
+
+That is consistent with the surviving hypothesis and sharpens it: the exhausted memory is
+**AMR coarse/prolongation buffer space, sized by the mesh's refinement structure rather than by
+each rank's block count**. Rank count changes how blocks are distributed; it does not change how
+many coarse-fine boundaries the hierarchy contains. Hence adding ranks moves nothing.
+
+It also explains the earlier per-device spread (49.3 / 56.6 / **79.2** GiB on equal block counts):
+ranks holding Z-order intervals that straddle more refinement boundaries carry more coarse-buffer
+memory, independent of how many blocks they own.
+
+**There is currently NO known mitigation.** More ranks does not work. The practical consequence is
+that deep-AMR runs on this hierarchy terminate at ~cycle 120 from the deep restart, whatever the
+decomposition. Both B7 closure runs got their science anyway — the quadrature had converged well
+before the crash — but a run needing to go further will simply stop there.
+
+**Next step for whoever picks this up:** instrument the `bnd_flux::*coarse` allocations directly
+(a Kokkos allocation dump by label at each regrid) and check whether their total scales with the
+coarse-fine boundary count rather than with blocks/rank. If so, the fix is in Parthenon's buffer
+sizing, not in job geometry.

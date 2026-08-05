@@ -89,6 +89,7 @@ stdbuf -oL -eL mpirun -n $NRANK $MCA $WRAP $BIN $RA -t 05:30:00 \
   diffusion/eta_ohm_cap_code=0.1 diffusion/ion_zeta=1.0e-16 parthenon/output2/dn=250 \
   diffusion/cap_diag=true hydro/mag_diag=true \
   diffusion/hall_ohmic_floor_ratio=0.2 \
+  diffusion/dust_coupling=${DUSTC:-true} \
   hydro/boundary_flux_clamp=${CLAMP:-true} \
   ${OV:-} \
   >> $RUNDIR/run.log 2>&1

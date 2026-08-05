@@ -5,10 +5,19 @@
 // Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
 //! \file collapse_be.cpp
-//  \brief Bonnor-Ebert sphere collapse with zero-Dirichlet gravity BCs
-//         (multipole BCs not yet supported in AthenaPK self-gravity).
-//         Large-box setup: domain size ~4x sphere radius in each direction,
-//         ambient density = BE profile value at r = rc (pressure-continuous).
+//  \brief Bonnor-Ebert sphere collapse. Ambient density = the BE profile value at r = rc,
+//         so the sphere/ambient interface is pressure-continuous.
+//
+//  GRAVITY BOUNDARY CONDITIONS (this header used to say multipole BCs were unsupported --
+//  they landed in WS-5a and are what production uses; corrected 2026-08-05):
+//    * `self_gravity/*_bc = multipole` -- isolated exterior potential via an RHS
+//      Green's-function lift (src/self_gravity/multipole.hpp). PRODUCTION. Lets a
+//      physically MATCHED box (L=16) collapse freely; validated to 0.54% against the
+//      analytic exterior potential.
+//    * `... = zero` -- zero-Dirichlet. Still supported and still correct, but it needs a
+//      PADDED box (domain ~4x the sphere radius) because clamping phi=0 on the face of a
+//      matched box freezes the collapse. This is the setup the old header described.
+//    * `... = neumann` -- known broken; do not use.
 
 #include <algorithm>
 #include <array>

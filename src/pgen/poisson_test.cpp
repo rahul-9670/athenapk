@@ -42,6 +42,12 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
                                             "tophat") == "gaussian";
   const Real sigma   = pin->GetOrAddReal("problem/poisson_test", "sigma", 1.0);
   const Real v_radial = pin->GetOrAddReal("problem/poisson_test", "v_radial", 0.0);
+  // AUDIT 2026-08-05: optional uniform B along z, so this test problem can be run under
+  // fluid=glmmhd with a real magnetic energy density (Heaviside-Lorentz, ME = B^2/2). Needed
+  // by the A4 sink-accretion regression, which has to reach the ME > e_th regime. Default 0
+  // reproduces the previous behaviour exactly, so every existing poisson_test deck is
+  // bit-identical.
+  const Real b0z = pin->GetOrAddReal("problem/poisson_test", "b0z", 0.0);
 
   auto hydro_pkg = pmb->packages.Get("Hydro");
   const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
@@ -81,8 +87,10 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
         if (mhd) {
           u(IB1, k, j, i) = 0.0;
           u(IB2, k, j, i) = 0.0;
-          u(IB3, k, j, i) = 0.0;
+          u(IB3, k, j, i) = b0z;
           u(IPS, k, j, i) = 0.0;
+          // total energy carries the magnetic term (0 when b0z = 0 => bit-identical)
+          u(IEN, k, j, i) += 0.5 * b0z * b0z;
         }
       }
     }

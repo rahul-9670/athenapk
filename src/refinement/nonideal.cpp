@@ -14,8 +14,9 @@
 #include <cmath>
 #include <limits>
 
-#include "../main.hpp"
+#include "../eos/adiabatic_glmmhd.hpp"
 #include "../hydro/hydro.hpp"
+#include "../main.hpp"
 #include "refinement.hpp"
 
 namespace refinement {
@@ -37,7 +38,6 @@ parthenon::AmrTag JeansNonideal(MeshBlockData<Real> *rc) {
   const Real curr_rho_thresh = hydro_pkg->Param<Real>("refinement/curr_rho_thresh");
   const int curr_max_level = hydro_pkg->Param<int>("refinement/curr_max_level");
   const int block_level = pmb->loc.level();
-  const Real gam = hydro_pkg->Param<Real>("AdiabaticIndex");
   const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
 
   const Real dx = pmb->coords.Dxc<1>(0);
@@ -47,16 +47,33 @@ parthenon::AmrTag JeansNonideal(MeshBlockData<Real> *rc) {
   IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
   IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
   IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
-  const Real fac = 2.0 * M_PI / dx; // Jeans: lambda_J/dx = fac * v/sqrt(rho)
+  // Jeans: lambda_J/dx = fac * v/sqrt(rho), with lambda_J = 2 pi v / sqrt(rho) at 4 pi G = 1.
+  // AUDIT 2026-08-05 (B2): jeans.cpp documents that it assumes cubic cells and uses dx alone;
+  // this file silently inherited that while using dx, dy, dz properly a few lines below in the
+  // current-sheet stencil. Use the SMALLEST edge, which is the conservative choice: on a cubic
+  // mesh it is identical to the old dx (so production is bit-identical), and on a stretched
+  // one it refines rather than under-resolving.
+  const Real fac = 2.0 * M_PI / std::min(dx, std::min(dy, dz));
 
   // Jeans length in cells (min over block).
+  //
+  // AUDIT 2026-08-05 (A1) -- MIRRORS refinement/jeans.cpp. The sound speed comes from the
+  // EOS the integrator uses, not from a hard-coded gamma-law: with <hydro> eos = hydrogen
+  // the tabulated Gamma_1 is ~5/3 in the cold envelope (H2 rotation frozen below 85 K) and
+  // ~1.14 through dissociation, so a gamma=1.4 formula over-refines in the first regime and
+  // UNDER-refines in the second. jeans_nonideal is MHD-only (the current-sheet half needs B),
+  // and eos=hydrogen is glmmhd-only, so fetching the GLMMHD EOS here is always valid.
+  // Measurement and full rationale: the header note in refinement/jeans.cpp.
+  const auto eos = hydro_pkg->Param<AdiabaticGLMMHDEOS>("eos");
   Real njmin = std::numeric_limits<Real>::max();
   pmb->par_reduce(
       "jeans_ni: jeans", kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
       KOKKOS_LAMBDA(const int k, const int j, const int i, Real &lnjmin) {
         const Real rho = w(IDN, k, j, i);
-        const Real p = w(IPR, k, j, i);
-        Real v = std::sqrt(gam * p / rho);
+        Real prim_c[NHYDRO];
+        prim_c[IDN] = rho;
+        prim_c[IPR] = w(IPR, k, j, i);
+        Real v = eos.SoundSpeed(prim_c);
         if (mhd) {
           const Real bsq = w(IB1, k, j, i) * w(IB1, k, j, i) +
                            w(IB2, k, j, i) * w(IB2, k, j, i) +
@@ -83,8 +100,20 @@ parthenon::AmrTag JeansNonideal(MeshBlockData<Real> *rc) {
   // (validated: jeans_nonideal makes 1.5x [128^3] to 3x [256^3] more blocks than plain jeans ->
   // deep-core regrid OOM). Capping current-sheet refinement at curr_max_level keeps it in the
   // moderate-depth flux-loss region while Jeans owns the deepest core, bounding memory.
+  // AUDIT 2026-08-05 (B1) -- THE CAP NOW GATES THE ACTION, NOT THE MEASUREMENT.
+  // Previously the reduce itself was skipped at block_level >= curr_max_level, leaving
+  // lbmin = numeric_limits::max(). That value reads as "the field reversal is infinitely
+  // well resolved", so curr_deref came out unconditionally TRUE at the cap. Consequence:
+  // a parent one level BELOW the cap sees a thin sheet and refines; its children sit AT the
+  // cap, never measure the sheet, and therefore vote to derefine; the parent re-refines.
+  // A refine/derefine limit cycle, damped by derefine_count=50 but not removed.
+  //
+  // The fix is to keep measuring at every level and apply the cap only to the refine vote
+  // (below). Children at the cap then see the sheet they were refined for, curr_deref is
+  // false, and the cycle cannot close -- while the level cap still bounds block growth
+  // exactly as before. Cost: one extra par_reduce on blocks at/above the cap.
   Real lbmin = std::numeric_limits<Real>::max();
-  if (mhd && block_level < curr_max_level) {
+  if (mhd) {
     pmb->par_reduce(
         "jeans_ni: current sheet", kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int k, const int j, const int i, Real &llbmin) {
@@ -112,7 +141,9 @@ parthenon::AmrTag JeansNonideal(MeshBlockData<Real> *rc) {
 
   const bool jeans_refine = (njmin < njeans);
   const bool jeans_deref = (njmin > 2.5 * njeans);
-  const bool curr_refine = (lbmin < curr_nsheet);
+  // Level cap applied HERE (see the B1 note above): the sheet criterion may not DRIVE
+  // refinement at or beyond curr_max_level, but its derefinement veto is always live.
+  const bool curr_refine = (lbmin < curr_nsheet) && (block_level < curr_max_level);
   const bool curr_deref = (lbmin > 2.5 * curr_nsheet);
 
   if (jeans_refine || curr_refine) return parthenon::AmrTag::refine;

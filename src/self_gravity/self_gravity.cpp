@@ -373,6 +373,34 @@ void FillPoissonRHS(MeshData<Real> *md) {
   IndexRange kbe = md->GetBoundsK(IndexDomain::entire);
   const int nblocks = md->NumBlocks();
 
+  // AUDIT 2026-08-05 (A2). Both reductions below are GLOBAL quantities -- the Jeans-swindle
+  // mean density and the multipole moments of the WHOLE mass distribution. They are computed
+  // by summing over `md`'s blocks and then MPI_Allreduce'ing across ranks.
+  //
+  // But FillPoissonRHS is registered as FillDerivedMesh, which Parthenon invokes ONCE PER
+  // MeshData PARTITION. With more than one partition per rank the sum is over "partition i
+  // across all ranks" -- a FRACTION of the mesh -- so grav_mean_rho and every multipole
+  // moment (hence every exterior gravity BC face value) would be wrong, silently.
+  //
+  // Worse than wrong: DefaultNumPartitions() is min(default_num_packs_, block_list.size())
+  // in the packs_per_rank branch (parthenon/src/mesh/mesh.hpp), so a rank holding 1 block
+  // gets 1 partition while a neighbour gets N. The ranks then reach these Allreduces a
+  // different number of times => DEADLOCK, not a wrong number.
+  //
+  // Unreachable today: no deck sets <parthenon/mesh> pack_size or packs_per_rank, so
+  // DefaultNumPartitions() == 1. This guard makes that assumption explicit and loud rather
+  // than latent. (The tracers task region guards the same way, hydro_driver.cpp.) Fixing it
+  // properly means hoisting the reduction out of the per-partition call -- worth doing only
+  // when someone actually wants multiple partitions per rank.
+  if (use_swindle || has_multipole) {
+    PARTHENON_REQUIRE_THROWS(
+        pm->GetDefaultBlockPartitions().size() == 1,
+        "self-gravity: the Jeans swindle and the multipole boundary condition reduce over a "
+        "single MeshData partition and then Allreduce, so they require exactly one partition "
+        "per rank. Unset <parthenon/mesh> pack_size / packs_per_rank, or hoist the reduction "
+        "in SelfGravity::FillPoissonRHS out of the per-partition FillDerived call.");
+  }
+
   // --- Mean density (for Jeans swindle) via par_reduce + MPI Allreduce -------
   Real grav_mean_rho = 0.0;
   if (use_swindle) {
