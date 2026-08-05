@@ -5,6 +5,7 @@
 //========================================================================================
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -963,6 +964,33 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
             "and NOT fine for production -- set eos_table_file=.../src/eos/eos_table_hires.bin.");
       }
       eos_tab.Load(tabfile);
+      // AUDIT N14 (2026-08-05): gen_eos_table.py builds its rho/e code-unit grids from its OWN
+      // hardcoded, ROUNDED scales (rho0 = 5.467e-19, v0 = 1.9e4) and the .bin that Load() reads
+      // carries NO unit field -- it is exactly int64[3] + double[6] + four raw arrays, with no
+      // spare byte where a unit could hide (verified: eos_table.bin is 1,238,472 B = the exact
+      // packed size). So a run whose authoritative PhysUnits scales differ from the generator's
+      // silently indexes the table at slightly wrong (rho, e). This is warn-only by design:
+      // regenerating the table changes numbers on the production path. The correct fix is to
+      // stamp the assumed units into the .bin header and regenerate at a slot boundary.
+      // Mirrors the N13 guard in radiation.cpp for the opacity table.
+      {
+        const auto Ueos = PhysUnits::BuildPhysicalUnits(pin);
+        constexpr Real kGenEosRho0 = 5.467e-19; // gen_eos_table.py rho0 [g/cm^3]
+        constexpr Real kGenEosV0 = 1.9e4;       // gen_eos_table.py v0   [cm/s]
+        const Real drho = kGenEosRho0 / Ueos.rho_unit - 1.0;
+        const Real dv = kGenEosV0 / Ueos.v_unit - 1.0;
+        if (parthenon::Globals::my_rank == 0 &&
+            (std::abs(drho) > 1.0e-6 || std::abs(dv) > 1.0e-6)) {
+          std::cout << "### WARNING Hydro (audit N14): " << tabfile
+                    << " was generated assuming rho0 = " << kGenEosRho0 << ", v0 = " << kGenEosV0
+                    << " but this run's PhysUnits give rho_unit = " << Ueos.rho_unit
+                    << ", velocity_unit = " << Ueos.v_unit << " (rel diff " << drho
+                    << ", " << dv
+                    << "). The table grids are indexed AS IS; regenerate the table against the "
+                       "run's units to remove this bias."
+                    << std::endl;
+        }
+      }
       const auto riem = pin->GetOrAddString("hydro", "riemann", "hlld");
       PARTHENON_REQUIRE(riem == "hlld",
                         "Tabulated protostellar EOS (eos=hydrogen) requires riemann=hlld "

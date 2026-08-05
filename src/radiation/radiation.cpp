@@ -166,7 +166,30 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   const std::string opac_table_file = pin->GetOrAddString(
       bn, "opacity_table_file",
       "/beegfs/u/bbg6470/athenapk/src/radiation/opacity_table.bin");
-  if (op.model == OpacityModel::tabulated) op.table.Load(opac_table_file, rho_unit, T_unit);
+  if (op.model == OpacityModel::tabulated) {
+    op.table.Load(opac_table_file, rho_unit, T_unit);
+    // AUDIT N13 (2026-08-05): gen_opacity_table.py writes kappa already converted to CODE
+    // units, using its OWN hardcoded, ROUNDED unit scales -- and Load() reads those numbers
+    // verbatim (ru,tu are used only for grid indexing, never to rescale kappa). If the run's
+    // authoritative scales from PhysUnits differ from the generator's assumption, every
+    // tabulated kappa is off by exactly that ratio. This block does NOT correct the table
+    // (regenerating changes production numbers); it makes the discrepancy visible in the log.
+    // Proper fix: emit kappa in cgs, multiply by the runtime opacity_unit here, and stamp the
+    // assumed unit into the table header so this check can be exact instead of hardcoded.
+    constexpr Real kGenRhoUnit = 5.467e-19;   // gen_opacity_table.py RHO_UNIT
+    constexpr Real kGenLenUnit = 2.81e16;     // gen_opacity_table.py LEN_UNIT
+    const Real gen_opacity_unit = kGenRhoUnit * kGenLenUnit; // its OPACITY_UNIT
+    const Real unit_ratio = gen_opacity_unit / kappa_conv;
+    if (parthenon::Globals::my_rank == 0 && std::abs(unit_ratio - 1.0) > 1.0e-4) {
+      std::cout << "### WARNING Radiation (audit N13): tabulated opacity was generated "
+                   "assuming opacity_unit = "
+                << gen_opacity_unit << " but this run's PhysUnits opacity_unit = "
+                << kappa_conv << " (ratio " << unit_ratio << ", i.e. kappa is "
+                << 100.0 * (unit_ratio - 1.0)
+                << "% off). The table is used AS IS -- regenerate it against the run's "
+                   "units to remove this bias." << std::endl;
+    }
+  }
   pkg->AddParam("opacity", op);
   // Back-compat scalar params (constant model still reads these directly).
   pkg->AddParam("kappa_a", op.kappa_a0);
