@@ -151,3 +151,86 @@ predicted. Concentration measure on the same row:
 Both ≪ 1, and Ohmic is the more concentrated of the two — consistent with the core/envelope
 split above. Note this is the *coarse smoke deck*; at production resolution the carrying
 fraction was measured at ~1e-7, i.e. three to four decades worse.
+
+---
+
+# 2026-08-06 — the density split was never tested on the ladder. It is now, and for `Jsq` it does NOT work.
+
+**Status: the remedy above is PARTIALLY FALSIFIED. Splitting by density does not restore
+convergence for `Jsq`, because `Jsq`'s concentration is not organised by density.**
+
+## Why this was reopened
+
+Everything above — root cause, the two falsified hypotheses, the split columns, `f_eff` — was
+implemented, gated and documented, but the split was verified only for *self-consistency* on a
+12-cycle L = 52 smoke deck (`hi + lo == global` to the history file's text precision). **It was
+never applied to the njeans ladder**, i.e. to the measurement that showed the non-convergence in
+the first place. A remedy that is implemented and documented but never shown to work on the
+failing case is not a closed finding.
+
+## Method
+
+`docs/validation/scripts/wp8_split_convergence.py`, run at the same matched epoch as the original
+table (ρ_max = 1e-12 g cm⁻³), split at ρ_crit = 1e-13 g cm⁻³ — a physical boundary, not a tuned
+one. Re-running the ladder with `mag_diag_rho_split` enabled would cost GPU time this project does
+not have spare; all 135 snapshots (986 GB) are on disk, so the split is recomputed offline instead.
+
+**Why `Jsq` and not `dissO`/`dissA`.** The ladder snapshots carry only `prim` — there is no
+`nonideal_eta` field (that was added later, for WP-22 part 3, on a different run), and
+reconstructing η_A offline is only an *upper bound* because the equilibrium NICIL/Wardle ceiling
+needs the full grain + Saha charge solve. `Jsq = ∫|J|²dV` needs only **B** and the grid, so it is
+exact offline — and it is itself one of the non-converging quantities. J is taken by the 1-cell
+face difference on block interiors only (phdf carries no ghosts, so 17.6 % of cells — the outer
+layer of each 32³ block — are dropped rather than differenced against wrong data).
+
+**Validation of the script itself:** it reproduces the published global numbers exactly —
+**−52.3 % / −39.3 %**, against −52.3 %/−39.3 % recorded above for the 1-cell stencil.
+
+## Result
+
+| | nj4 | nj8 | nj16 |
+|---|---:|---:|---:|
+| `Jsq-glob` f_eff | 1.137e-7 | 1.384e-7 | 3.102e-7 |
+| `Jsq-hi` (ρ>ρ_crit) share of global | 2.58 % | 1.03 % | 2.14 % |
+| `Jsq-hi` f_eff | **0.575** | **0.465** | **0.642** |
+| `Jsq-lo` (ρ<ρ_crit) share of global | 97.42 % | 98.97 % | 97.86 % |
+| `Jsq-lo` f_eff | 1.111e-7 | 1.369e-7 | 3.303e-7 |
+| V(ρ>split)/V | 4.53e-9 | 3.34e-9 | 2.20e-9 |
+
+| quantity | nj4→nj8 | nj8→nj16 | verdict |
+|---|---:|---:|---|
+| `Jsq-glob` | −52.3 % | −39.3 % | monotone, not converged |
+| `Jsq-hi` | −80.9 % | +25.6 % | **NOT MONOTONE** — no convergence claim possible |
+| `Jsq-lo` | −51.6 % | −39.9 % | monotone, not converged |
+
+## What this means
+
+1. **The split does not rescue `Jsq`.** The low-density bin carries 97–99 % of the integral *and*
+   keeps f_eff ~ 1e-7, so it simply *is* the original pathology under a new name. Its convergence
+   history (−51.6 %, −39.9 %) is the global one to within a percent.
+2. **The core bin is nevertheless a well-posed integral.** `Jsq-hi` has **f_eff ≈ 0.47–0.64** — it
+   is volume-filling *within its own region*, exactly what the split was designed to produce. It
+   still does not converge (it is not even monotone), but that is now a statement about the
+   physics being under-resolved, not about the diagnostic being a point sample. That is a
+   qualitatively different and much more tractable failure.
+3. **The premise "the concentration is in the core" is wrong for `Jsq`.** The smoke-deck
+   measurement above found 89.6 % of `dissO` above ρ = 1 code, and the split was designed around
+   that. But `dissO` is weighted by η_O, which climbs steeply with density; `Jsq` is unweighted.
+   At production resolution the unweighted current is **envelope**-dominated and its pathological
+   concentration lives *below* ρ_crit — presumably in grid-scale current sheets, which a density
+   threshold cannot separate by construction.
+
+**Consequence:** a density split is the right tool for `dissO` (core-dominated by η weighting) and
+the wrong tool for `Jsq`. `Jsq` needs a split on a current-sheet indicator, not on density — or it
+should be retired as a convergence metric in favour of the split dissipation budgets.
+
+## What is still open
+
+- The same test **for `dissO`/`dissA`**, which is what the split was actually built for. It needs
+  either a ladder re-run with `mag_diag_rho_split` enabled and `nonideal_eta` in the output list,
+  or the ladder snapshots regenerated with that field. **Until then the split's core claim is
+  supported for `Jsq`'s core bin (f_eff → 0.5) and refuted for its envelope bin, and untested for
+  the dissipation integrals themselves.**
+- Guidance item 1 above ("use `mag-dissO-hi/lo`, not the global") remains sound but is now known to
+  be *insufficient on its own*: report `f_eff` per bin, and treat any bin with f_eff ≲ 1e-3 as a
+  point sample regardless of which side of the split it is on.

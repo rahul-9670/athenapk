@@ -45,7 +45,12 @@ nx3 = 16
 <hydro>
 fluid = glmmhd
 eos = hydrogen
-eos_table_file = /beegfs/u/bbg6470/athenapk/src/eos/eos_table_hires.bin
+# REPOINTED 2026-08-06 to the v2 table (audit N13/N14): the v1 file hardcoded the rounded
+# unit scales of ONE initial condition; v2 stores cgs with a stamped header and Load applies
+# the running unit system. Legacy tables still load and warn. Measured A/B on a 12-cycle
+# smoke: max 7.9e-6 relative -- but that deck is optically thin, so the production-regime
+# effect is NOT bounded by it. See AUDIT_ROUND2_2026-08-05.md section 12.
+eos_table_file = /beegfs/u/bbg6470/athenapk/src/eos/eos_table_hires_v2.bin
 gamma = 1.4
 riemann = hlld
 reconstruction = plm

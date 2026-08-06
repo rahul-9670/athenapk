@@ -1,0 +1,172 @@
+<comment>
+problem = TABULATED-OPACITY GATE (audit N13 follow-up) -- the flagship opacity path, which the
+# regression suite never exercised.
+#
+# WHY THIS DECK EXISTS. Every deck in this suite runs `opacity_model = belllin`. The flagship
+# (runs/root_ladder/fhc_rootladder.in) runs `opacity_model = tabulated` with n_group = 3 and an
+# offline opacity_table.bin. So the code path that N13 was ABOUT had no bit-level gate at all:
+# the audit measured the table CONTENT (+0.135% on kappa) but nothing measured what that does to
+# a RUN. This deck closes that hole.
+#
+# It is I_dust_hydrogen.in (tabulated EOS + dust + hydrogen EOS, the closest existing deck to the
+# flagship microphysics) with the opacity model switched to `tabulated` and the table named
+# explicitly, so the legacy and v2 tables can be A/B'd by overriding one CLI key.
+#
+# USE: run twice, once with the legacy table and once with
+#   radiation/opacity_table_file=/beegfs/u/bbg6470/athenapk/src/radiation/opacity_table_v2.bin
+# The difference is the run-level size of N13, which is the number that decides whether the
+# production decks can be repointed without re-running everything.
+<job>
+problem_id = collapse_be
+
+<parthenon/time>
+integrator = vl2
+cfl = 0.3
+tlim = 1.5
+nlim = 12
+ncycle_out = 1
+
+<parthenon/mesh>
+refinement = adaptive
+numlevel = 2
+multigrid = true
+nx1 = 32
+x1min = -26.0
+x1max = 26.0
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 32
+x2min = -26.0
+x2max = 26.0
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 32
+x3min = -26.0
+x3max = 26.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<parthenon/meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<hydro>
+fluid = glmmhd
+eos = hydrogen
+eos_table_file = /beegfs/u/bbg6470/athenapk/src/eos/eos_table.bin
+gamma = 1.4
+riemann = hlld
+reconstruction = plm
+glmmhd_source = dedner_extended
+dfloor = 1.0e-6
+pfloor = 1.0e-8
+nscalars = 7
+
+<refinement>
+type = jeans
+njeans = 8
+
+<diffusion>
+integrator = unsplit
+cfl = 0.3
+ambipolar = ambipolar
+ambipolar_coeff = ionization
+resistivity = ohmic
+resistivity_coeff = ionization
+hall = hall
+hall_coeff = ionization
+hall_ohmic_floor_code = 0.05
+
+<physics>
+self_gravity = true
+radiation = true
+chemistry = true
+dust = true
+
+<dust>
+# scalar_index must be >= NSPEC_GOW (=5) or f_dg/a_c alias onto the chemistry species --
+# guarded in Dust::Initialize since the 2026-07-18 F3 fix. nscalars = 7 = 5 species + 2 dust.
+evolve = true
+scalar_index = 5
+# NOTE: rho_unit_cgs / t_unit_cgs / T_unit_K are deliberately ABSENT. As of audit N3 they are
+# REJECTED (PARTHENON_REQUIRE_THROWS) -- the dust cgs scales come from the one authoritative
+# unit system. Adding any of them back must make this deck fail to start; that is the point.
+
+<chemistry>
+network = gow17_reduced
+nsub_max = 400
+cfl_cool = 0.1
+
+<radiation>
+closure = M1
+mu = 2.33
+rho_unit_cgs = 5.467e-19
+v_unit_cgs = 1.9e4
+length_unit_cgs = 2.81e16
+creduc = 1000.0
+opacity_model = tabulated
+opacity_table_file = /beegfs/u/bbg6470/athenapk/src/radiation/opacity_table.bin
+matter_coupling = true
+cfl = 0.4
+efloor = 1.0e-15
+tfloor_code = 1.0e-3
+
+<self_gravity>
+units_override = true
+four_pi_G = 1.0
+use_swindle = false
+packed_bc = true
+ix1_bc = multipole
+ox1_bc = multipole
+ix2_bc = multipole
+ox2_bc = multipole
+ix3_bc = multipole
+ox3_bc = multipole
+
+<self_gravity/solver_params>
+solver = BiCGSTAB
+max_iterations = 200
+residual_tolerance = 1.0e-6
+do_FAS = true
+max_coarsenings = 20
+smoother = SRJ1
+presmoother = SRJ1
+postsmoother = SRJ1
+preconditioner = Multigrid
+
+<problem/collapse_be>
+mass = 6.0
+temperature = 10.0
+f = 5.0
+rhocrit = 1.0e-13
+amp = 0.0
+omegatff = 0.02
+B0z = 0.15
+turb_mach = 0.5
+turb_alpha = 3.667
+turb_seed = 42
+turb_kmin = 1
+turb_kmax = 8
+turb_nmodes = 128
+turb_zeta = 0.5
+turb_region = sphere
+
+<parthenon/output0>
+file_type = hst
+dt = 0.005
+# FULL DOUBLE PRECISION. The default data_format is %12.5e -- SIX significant figures -- which
+# silently floors any A/B comparison at ~1e-6 relative. B7 hit exactly this and mis-recorded it as
+# an inherent limit of the history file; it is a deck parameter (outputs.cpp:348).
+data_format = %24.16e
+
+<parthenon/output1>
+file_type = hdf5
+dn = 100000
+variables = prim, grav.phi, rad.Er
+single_precision_output = 0
+hdf5_compression_level = 0
+
+<parthenon/output2>
+file_type = rst
+dn = 6

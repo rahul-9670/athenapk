@@ -107,7 +107,7 @@ hall_ohmic_floor_code = 0.05
 # Audit fix #1: unify the cosmic-ray ionization rate across chemistry (x_e -> AD) and the
 # equilibrium ionization model (Ohm/Hall). Must equal <chemistry> zeta_cr_cgs or the code
 # hard-fails at init. 1e-16 = the gow17/AD value (was silently 1e-17 here, 1e-16 in chem).
-ion_zeta = 1.0e-16
+ion_zeta = 7.913000990685557e-17
 
 <physics>
 self_gravity = true
@@ -116,7 +116,7 @@ chemistry = true
 
 <chemistry>
 network = gow17_reduced
-zeta_cr_cgs = 1.0e-16   # audit #1: single CR-rate source of truth (== <diffusion> ion_zeta)
+zeta_cr_cgs = 7.913000990685557e-17
 nsub_max = 400
 cfl_cool = 0.1
 
@@ -128,7 +128,7 @@ v_unit_cgs = 1.9e4
 length_unit_cgs = 2.81e16
 creduc = 1000.0
 opacity_model = tabulated
-dust_kappa0_cgs = 2.0e-4
+dust_kappa0_cgs = 0.00014357565124692112
 dust_Tmax_K = 1.5e3
 matter_coupling = true
 n_group = 3
@@ -171,14 +171,14 @@ postsmoother = SRJ1
 preconditioner = Multigrid
 
 <problem/collapse_be>
-mass = 6.0
+mass = 3.658418101763364
 temperature = 10.0
 f = 5.0
 rhocrit = 1.0e-13
 amp = 0.0
-omegatff = 0.02
-B0z = 0.15
-turb_mach = 0.5
+omegatff = 0.03469338416231937
+B0z = 0.1562601776956456
+turb_mach = 0.7479340455589338
 turb_alpha = 3.667
 turb_seed = 42
 turb_kmin = 1

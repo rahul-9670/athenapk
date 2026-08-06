@@ -8,9 +8,11 @@
 #SBATCH --output=%x_%j.out
 #
 # D1 MEASUREMENT, ONE LEG. Submit with the rank count on the command line, e.g.
-#     NR=4 sbatch --ntasks=4 --gres=gpu:h100:4 --job-name=d1r4 --export=ALL,NR=4 submit_d1_leg.sh
-#     NR=5 sbatch --ntasks=5 --gres=gpu:h100:5 --job-name=d1r5 --export=ALL,NR=5 submit_d1_leg.sh
-# (drive_d1.sh does exactly that.)
+#     sbatch --ntasks=4 --gres=gpu:h100:4 --job-name=d1r4 submit_d1_leg.sh
+#     sbatch --ntasks=5 --gres=gpu:h100:5 --job-name=d1r5 submit_d1_leg.sh
+# The rank count is taken from SLURM_NTASKS (see below), so --export is NOT required and there is
+# no wrapper script. (An earlier version of this header referred to a `drive_d1.sh` that does the
+# submitting; no such file has ever existed. Corrected 2026-08-06.)
 #
 # WHY ONE LEG PER JOB rather than the previous both-legs-in-one-4h-reservation
 # (submit_d1_meminfo.sh, superseded). The two legs are independent measurements that get
@@ -72,7 +74,17 @@ H=/beegfs/u/bbg6470/athenapk/runs/deep_amr
 RST=$H/run/parthenon.out2.00001.rhdf
 BIN=/beegfs/u/bbg6470/athenapk/build_gpu/bin/athenaPK_PRESERVED_84a6d248
 WRAP=$H/wrap_mod.sh
-NR=${NR:?set NR to the rank count, e.g. NR=4}
+# Rank count comes from SLURM's own --ntasks, which is guaranteed to be set in a batch job and
+# always agrees with the --gres the job actually holds. NR remains an override for interactive use.
+# It used to be `NR=${NR:?...}`, i.e. wholly dependent on `--export=ALL,NR=N` having landed -- an
+# assumption that cannot be checked from outside the job (scontrol does not print the submit
+# environment), and whose failure mode is a 9-second death that costs a whole scheduling day.
+# Deriving it from SLURM_NTASKS removes the assumption instead of documenting it.
+NR=${NR:-${SLURM_NTASKS:?neither NR nor SLURM_NTASKS is set}}
+if [ -n "${SLURM_NTASKS:-}" ] && [ "$NR" != "$SLURM_NTASKS" ]; then
+  echo "REFUSING: NR=$NR disagrees with SLURM_NTASKS=$SLURM_NTASKS (GPUs are allocated per task)." >&2
+  exit 1
+fi
 install -m 755 /beegfs/u/bbg6470/athenapk/runs/wrap_mod.sh $WRAP
 MCA="--mca mtl ^psm2 --mca btl tcp,self,sm -x LD_LIBRARY_PATH -x PMIX_MCA_gds -x OMP_NUM_THREADS -x OMPI_MCA_io -x TMPDIR"
 

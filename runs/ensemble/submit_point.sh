@@ -20,7 +20,14 @@ export TMPDIR=/beegfs/u/bbg6470/.chem_tmp; mkdir -p "$TMPDIR"
 export LD_LIBRARY_PATH=/sw/env/gcc-13.3.0_openmpi-5.0.7/pkgsrc/2025Q1/lib:$LD_LIBRARY_PATH
 
 : "${PDIR:?set PDIR}"; STOP_CGS="${STOP_CGS:-1.0e-13}"
-BIN=/beegfs/u/bbg6470/athenapk/build_gpu/bin/athenaPK   # multigroup+tabulated (rtsafe-fixed)
+# PINNED to the preserved hard link, NOT build_gpu/bin/athenaPK. That path is the scratch build
+# slot: `make -C build_gpu` overwrites it, and with MAX_CHAIN=30 across 24 members this campaign
+# can span up to 720 chained jobs over days. A rebuild mid-campaign would silently change the
+# binary underneath half the ensemble, and the members already finished would not be comparable
+# with the ones still running -- with nothing in the output to show it happened.
+# 84a6d248 = 0d3a559 (multigroup + tabulated + rtsafe + the 2026-08-05/06 audit batch, incl. the
+# N3 restart fix). Provenance frozen in docs/provenance/binary_84a6d248/.
+BIN=/beegfs/u/bbg6470/athenapk/build_gpu/bin/athenaPK_PRESERVED_84a6d248
 WRAP=$PDIR/wrap_mod.sh
 MCA="--mca mtl ^psm2 --mca btl tcp,self,sm -x LD_LIBRARY_PATH -x PMIX_MCA_gds -x OMP_NUM_THREADS -x OMPI_MCA_io -x TMPDIR"
 MAX_CHAIN=30; PY=/beegfs/u/bbg6470/venvs/analysis_env/bin/python; RHO0=5.467e-19

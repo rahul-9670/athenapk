@@ -97,3 +97,72 @@ One rank carries ~60 % more than another while a fourth GPU goes unused. The sam
 the WP-1 `cap=150` leg twice. It did not affect this result — the 120 rows collected before the
 crash already satisfy both validity checks — but it is a real scaling defect on deep AMR
 hierarchies and is worth its own investigation.
+
+---
+
+# 2026-08-06 — CORRECTION: closure IS resolved on all three axes. This document was stale.
+
+**The statement above — "No closure is claimed on L_x or L_z" — is superseded.** It was true of
+job 2454557. Job **2454734** (`b7_closure2`, 2026-08-04 21:53) closed the budget on **all three
+axes**, and this file was never updated. Anyone reading only the section above would under-report
+the result and repeat the "L_x can never be resolved this way" conclusion, which is wrong.
+
+## What changed: the 6-significant-figure limit was a deck parameter, not a property of the code
+
+The analysis above attributes the unresolvable `dL` on x and z to the history file printing six
+significant figures, and concludes that recovering them "would mean computing L directly from
+`.phdf` dumps". That was a **misdiagnosis of a configurable default**: `outputs.cpp:348` sets
+`data_format` to `%12.5e`, and it is settable per output block. With
+
+```
+parthenon/output0/data_format = %24.16e
+```
+
+the history file carries full double precision and `dL` on x goes from **3 quanta to 3.2e+11**.
+
+## Result — job 2454734, same restart, same configuration, per-cycle history
+
+120 rows / 120 cycles confirmed, t = 1.01458741 .. 1.01600297, median spacing 1.206e-05,
+blocks 792 → 939.
+
+| axis | actual dL | accounted | residual R | R/\|dL\| | dL in quanta | dL precision loss |
+|---|---:|---:|---:|---:|---:|---:|
+| x | −3.20876e-03 | −5.46224e-03 | +2.25348e-03 | **+70.2 %** | 3.21e+11 | **0.0 %** |
+| y | +3.05747e-03 | +1.08275e-02 | −7.77001e-03 | **−254.1 %** | 3.06e+12 | **0.0 %** |
+| z | −1.50008e-02 | −1.06241e-03 | −1.39384e-02 | **−92.9 %** | 1.50e+12 | **0.0 %** |
+
+Quadrature convergence (recompute at half the sample rate) — the check that rules out a cadence
+artefact:
+
+```
+R_x: full +2.25348e-03   half-rate +2.17423e-03   change 3.52 %   OK
+R_y: full -7.77001e-03   half-rate -7.62128e-03   change 1.91 %   OK
+R_z: full -1.39384e-02   half-rate -1.38280e-02   change 0.79 %   OK
+```
+
+Both validity checks now pass on **all three axes**: the residual is a real measurement of
+Cartesian finite-volume angular-momentum non-conservation, not a quadrature or precision artefact.
+
+## The scope bound this establishes — state it in the paper
+
+On every axis the numerical residual is **comparable to or larger than the physical budget it
+competes with** (70 %, 254 %, 93 % of |dL| over this window). Therefore:
+
+- **Do not** quote an angular-momentum budget, a magnetic-braking efficiency, or a disc
+  angular-momentum transport rate from this configuration as a physical result. The numerics
+  contribute as much as the physics.
+- **Do** quote flux retention: it is a magnetic quantity and does not inherit this residual.
+  `mag-ME` converges to 0.2 % on the njeans ladder (WP-8) while the angular-momentum budget does
+  not close — these are different observables with different error structures, and the fossil-field
+  result rests on the former.
+- **Never extrapolate the rate.** The window spans 1.4e-03 in t; naively scaling its residual
+  predicts far more drift than the −9.79 % measured for L_y over the full run, so the rate is not
+  constant in time. This is unchanged from the original analysis and remains the correct caution.
+
+## Lesson worth carrying
+
+Two separate findings in this campaign — this one and WP-8's `mag-dissO`/`mag-dissA` reporting —
+were limited by the same six-significant-figure history default, and in both cases the limit was
+initially written up as inherent. **Before concluding that a diagnostic cannot resolve something,
+check whether the output format is the binding constraint.** For any run where a history quantity
+will be differenced or integrated, set `data_format = %24.16e` at submit time.
