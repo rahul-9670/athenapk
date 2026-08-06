@@ -70,10 +70,10 @@ def rho_max_cgs(d):
     return -1.0, "none"
 
 
-def running_jobs():
-    """member name -> [jobid]. Exact mapping; see docstring."""
+def running_jobs(states="RUNNING"):
+    """member name -> [jobid], for the given SLURM states. Exact mapping; see docstring."""
     out = {}
-    raw = sh(f"squeue -u {USER} -h -t RUNNING -o '%i|%j'")
+    raw = sh(f"squeue -u {USER} -h -t {states} -o '%i|%j'")
     for line in raw.strip().splitlines():
         if "|" not in line:
             continue
@@ -127,10 +127,27 @@ def main():
             # tally reads 0-finished while members are in fact done. (Observed 2026-08-06: five
             # members past the stop, 0 of 24 carrying STOP_CHAIN.) The mtime cache keeps this
             # cheap -- an unchanged snapshot is never re-read.
+            # A finished member can still have queued jobs: its own next slot and/or an `afterany`
+            # successor submitted before it crossed the line. Each of those will start, allocate
+            # 4 GPUs, read STOP_CHAIN, and exit -- a scheduling slot spent on nothing while real
+            # members wait. Reap them. (Observed 2026-08-06: 7 such jobs against 7 finished
+            # members.) Safe by construction: only members already carrying STOP_CHAIN are touched,
+            # nothing is running, and no chain is broken because the member is done.
+            queued = running_jobs(states="PENDING")
+
             for d in sorted(glob.glob(os.path.join(DESIGN, "point*/"))):
                 member = os.path.basename(d.rstrip("/"))
                 stop_file = os.path.join(d, "STOP_CHAIN")
                 if os.path.exists(stop_file):
+                    stale = queued.get(member, [])
+                    if stale:
+                        if DRYRUN:
+                            print(f"WOULD REAP {member}: finished, but {len(stale)} job(s) still "
+                                  f"queued: {','.join(stale)}", flush=True)
+                        else:
+                            sh(f"scancel {' '.join(stale)}")
+                            print(f"WATCHDOG REAPED {member}: finished; cancelled "
+                                  f"{len(stale)} queued job(s) {','.join(stale)}", flush=True)
                     continue                       # already closed
                 rho, fname = rho_cached(d, member)
                 if rho < 0:
