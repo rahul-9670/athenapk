@@ -96,10 +96,18 @@ void ReflectBC(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse) {
 //! source of the +1.25e-3 mass rise that WP-6 flagged as "anomaly 2". The floors were excluded
 //! as the source by direct measurement (`cons-nfloor` = 0 on every row).
 //!
-//! This BC is the standard fix (Athena++ calls the same thing a "diode"): copy as for outflow,
-//! then set the normal momentum to zero if it points inward. Tangential momenta, density and
-//! energy are untouched, so it is strictly less permissive than `outflow` and reduces to it
-//! exactly whenever the flow is already outward.
+//! This BC is the standard fix: copy as for outflow, then set the normal momentum to zero if it
+//! points inward. Tangential momenta, density and energy are untouched, so it is strictly less
+//! permissive than `outflow` and reduces to it exactly whenever the flow is already outward.
+//!
+//! CORRECTION 2026-08-06: this comment used to add "(Athena++ calls the same thing a diode)".
+//! That is NOT true of the Athena++ checkout in this workspace, and it matters, because it is
+//! the kind of claim a future cross-code comparison would lean on. `BoundaryFlag` in
+//! `athena++/src/bvals/bvals_interfaces.hpp:84` is {block, undef, reflect, outflow, user,
+//! periodic, polar, polar_wedge, vacuum, shear_periodic, mg_zerograd, mg_zerofixed,
+//! mg_multipole} -- no diode -- and `grep -rn diode athena++/src/` returns nothing. A matched
+//! cross-code pair therefore cannot use the production BC on both sides without first adding a
+//! diode as an Athena++ `user` BC. See docs/validation/ITEM5_cross_code_check_scope.md.
 //!
 //! OPT-IN. Registered under the name "diode"; `outflow` keeps Parthenon's semantics unchanged.
 //! A deck that does not say `diode` is bit-identical. This is deliberate: switching the
