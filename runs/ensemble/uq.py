@@ -62,7 +62,16 @@ def mu_at_rho(run_dir, target_rho, stride=1, max_log_dist=0.3):
                 "dist": best[0]}
     d = fr.measure_snapshot(best[1])
     if abs(d["Phi_core"]) < 1e-300:
-        return {"reject": "Phi_core is zero", "dist": best[0]}
+        return {"reject": f"Phi_core is zero at {os.path.basename(best[1])} "
+                          f"(r_core={d.get('r_core')})", "dist": best[0]}
+    if d.get("r_core_degenerate"):
+        # r_core pinned to the innermost profile bin: the rhocrit crossing was never bracketed,
+        # so r_core reflects the binning rather than the core and mu_core is not a first-core
+        # measurement. Excluding is the honest choice -- including it would widen the predictive
+        # distribution with a discretisation artifact and misreport it as physical spread.
+        return {"reject": f"degenerate core at {os.path.basename(best[1])} "
+                          f"(r_core={d['r_core']:.4g} is the innermost profile bin; the rhocrit "
+                          f"crossing was not bracketed)", "dist": best[0]}
     return {"mu": d["M_core"] / d["Phi_core"], "M_core": d["M_core"], "Phi_core": d["Phi_core"],
             "rho_max": best[2], "snap": os.path.basename(best[1]), "dist": best[0]}
 

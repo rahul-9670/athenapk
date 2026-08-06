@@ -171,8 +171,18 @@ def measure_snapshot(path, r_core_fixed=None, center=None):
     layer = (np.abs(Z - cxyz[2] - 2e-6 * dz_half) < dz_half) & (rcyl < r_core)
     Phi_core = float((bz * dA)[layer].sum())
 
+    # QUALITY FLAG (added 2026-08-06). r_core pinned to the innermost profile bin means the
+    # rhocrit crossing was never actually bracketed -- the fallback fired because the
+    # super-critical region is smaller than the profile can resolve. The number that comes back
+    # is then a property of the binning (rb starts at 2e-4), not of the core, and mu_core built
+    # from it is not a first-core measurement. This is easy to hit at the matched epoch, where
+    # rho_max ~ RHOCRIT by construction, so callers must be able to see it: point003/00008
+    # returns r_core = 2.0441e-4 = rmid[0] exactly, and its mu differs 4x from a well-resolved
+    # member. Reported, never silently folded into a distribution.
+    degenerate = bool(r_core_fixed is None and r_core <= rmid[0] * 1.001)
     return dict(time=t, r_core=r_core, M_core=M_core, Phi_core=Phi_core,
-                rho_max=float(rho.max()), center=[float(c) for c in cxyz])
+                rho_max=float(rho.max()), center=[float(c) for c in cxyz],
+                r_core_degenerate=degenerate)
 
 
 def lagrangian_r0(path0, M_target_code, center):
