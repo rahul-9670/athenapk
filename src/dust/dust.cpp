@@ -45,16 +45,43 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // (rho +0.0031%, T -0.0014%, t -0.0000%) only because the defaults happen to be this
   // IC's rounded values; change mass/temperature/f -- a mu-ladder, a resolution ladder --
   // and dust would silently keep the 6/10/5 numbers while the dynamics moved.
-  // The REQUIRE_THROWS below breaks no existing deck: a scan of all 295 *.in files on
-  // 2026-08-05 found ZERO that set any of these three keys inside <dust>.
+  //
+  // WARN, DO NOT HARD-FAIL -- and the reason is not stylistic. This started life as a
+  // PARTHENON_REQUIRE_THROWS, justified by a scan of all 295 *.in files on 2026-08-05 that
+  // found ZERO decks setting these keys inside <dust>. The scan was right and still is; it
+  // simply cannot see the case that matters. `GetOrAddReal` INJECTS its default into the
+  // ParameterInput, and Parthenon dumps the resulting parameter list into every restart
+  // file. So a restart written by any PRE-N3 binary with dust active carries
+  //     <dust> rho_unit_cgs = 5.467e-19  # Default value added at run time
+  // and on restart that key EXISTS -- tripping a guard aimed at decks, on a file no deck
+  // ever wrote. Measured 2026-08-06: D1 probe job 2461421 (build_gpu_v5) died in 9 s, both
+  // legs, restarting from runs/deep_amr/run/parthenon.out2.00001.rhdf. Left as a REQUIRE
+  // this would make every historical dust restart -- the flagship chain included --
+  // unloadable by any post-N3 binary, i.e. it would burn the production chain the moment
+  // it moved forward a binary.
+  // A warning still satisfies the actual goal (the deck cannot QUIETLY claim a
+  // normalisation the code does not use) and matches how the identical situation is
+  // handled for <radiation> (radiation.cpp ~line 95), which reached the same conclusion
+  // from the other direction: 165 decks carried the dead keys and hard-failing would have
+  // broken queued jobs. Same defect, same remedy, now the same treatment.
   const auto U = PhysUnits::BuildPhysicalUnits(pin);
-  PARTHENON_REQUIRE_THROWS(
-      !(pin->DoesParameterExist(bn, "rho_unit_cgs") ||
-        pin->DoesParameterExist(bn, "t_unit_cgs") || pin->DoesParameterExist(bn, "T_unit_K")),
-      "<dust> rho_unit_cgs / t_unit_cgs / T_unit_K are no longer read: the dust package now "
-      "takes its cgs scales from the single authoritative unit system "
-      "(PhysUnits::BuildPhysicalUnits, set by <units> or by the BE IC). Remove them so the "
-      "deck cannot claim a normalisation the code does not use.");
+  if (parthenon::Globals::my_rank == 0) {
+    const char *ukeys[3] = {"rho_unit_cgs", "t_unit_cgs", "T_unit_K"};
+    const Real uderived[3] = {U.rho_unit, U.time_unit, U.temperature_unit};
+    for (int q = 0; q < 3; ++q) {
+      if (!pin->DoesParameterExist(bn, ukeys[q])) continue;
+      const Real given = pin->GetReal(bn, ukeys[q]);
+      std::cout << "### WARNING Dust: <dust> " << ukeys[q] << " = " << given
+                << " is IGNORED (dead key). The dust cgs scales are single-sourced from "
+                   "PhysUnits::BuildPhysicalUnits; this run uses "
+                << uderived[q] << " (relative difference "
+                << (uderived[q] != 0.0 ? (given - uderived[q]) / uderived[q] : 0.0)
+                << "). Remove it from the deck. If it appears in a RESTART rather than a "
+                   "deck it was injected as a GetOrAdd default by a pre-2026-08-05 binary "
+                   "and is harmless -- the value above is what is actually used."
+                << std::endl;
+    }
+  }
   DustModel d;
   d.rho_unit = U.rho_unit;
   d.t_unit = U.time_unit;
