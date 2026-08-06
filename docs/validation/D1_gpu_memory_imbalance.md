@@ -258,3 +258,82 @@ same `nlim`, diagnostics the *only* difference.
 **Lesson for the next person:** every number in the superseded section came from a run that was
 still going. Amplifications and correlations computed mid-run here are provisional — the sign of
 the correlation flipped and the amplification fell by 15× once the leg finished.
+
+---
+
+## D1 RESOLVED (2026-08-06, job 2468889, upgraded instrument) — memory is LINEAR IN BLOCKS, and the old instrument was biased
+
+112 samples (96 interval-triggered) across cycles 250–375, 4 ranks, binary `2f3aa4b8`. Also
+`exit=0` at `nlim=380` with **no OOM** — independently confirming job 2468612 on a different
+binary.
+
+### 1. Memory is a staircase: allocated at regrids, then EXACTLY flat
+
+| cycle | trigger | blk/rank | maxlev | consumed |
+|---|---|---|---|---|
+| 250 | regrid | 198.0 | 9 | 18.36 |
+| 255–265 | interval | 198.0 | 9 | **31.57** (identical at 255, 260, 265) |
+| 269 | regrid | 220.8 | 10 | 33.92 |
+| 270–310 | interval | 220.8 | 10 | **35.24** (identical, 9 consecutive samples) |
+| 311 | regrid | 234.8 | 11 | 36.67 |
+| 315–360 | interval | 234.8 | 11 | **37.80** (identical, 10 consecutive samples) |
+| 365 | regrid | 378.2 | 12 | 47.51 |
+| 370–375 | interval | 378.2 | 12 | **59.86** |
+
+Between regrids the value does not move in the last reported decimal, over as many as 10
+consecutive samples. **There is no leak.** Every rise happens at a regrid.
+
+### 2. The law: 0.159 GiB per block per rank, with no depth term and no coarse-fine term
+
+Using the **settled** (post-regrid) values:
+
+| cycle | blk/rank | cf/rank | GiB | **GiB per block** |
+|---|---|---|---|---|
+| 255 | 198.0 | 1544 | 31.57 | **0.1594** |
+| 270 | 220.8 | 1740 | 35.24 | **0.1596** |
+| 315 | 234.8 | 1888 | 37.80 | **0.1610** |
+| 370 | 378.2 | 2714 | 59.86 | **0.1583** |
+
+Constant to **±0.8 %** while blocks/rank nearly doubles and `maxlev` goes 9 → 12. Independently
+corroborated: `runs/mg_prod_tab/gpumem.log` — a different run, different physics tier — gives
+~0.16 GiB/block. **Consumed ≈ 0.159 GiB × blocks_per_rank** is the whole story.
+
+### 3. THE OLD INSTRUMENT WAS BIASED, and this explains the earlier confusion
+
+The regrid-triggered print fires in `PreStepMeshUserWorkInLoop` *before* the new buffers are
+fully allocated, so it samples mid-reallocation:
+
+| regrid cycle | value there | settled value | **under-report** |
+|---|---|---|---|
+| 250 | 18.36 (spread 0.9 %) | 31.57 (spread 1.5 %) | **41.9 %** |
+| 269 | 33.92 | 35.24 | 3.7 % |
+| 311 | 36.67 | 37.80 | 3.0 % |
+| 365 | 47.51 (spread **15.9 %**) | 59.86 (spread **2.3 %**) | **20.6 %** |
+
+Regrid-only sampling under-reported the settled footprint by up to **42 %**. This is exactly why
+the interval trigger was worth a rebuild.
+
+### 4. WITHDRAWN — "the dependence is depth-dependent" was an artifact of that bias
+
+The previous section claimed per-rank `cf` starts predicting memory at depth, on r = +0.990 at
+cycle 365. That sample was taken **mid-reallocation** (rank spread 15.9 %). At cycle 370, same
+mesh, settled:
+
+```
+rank2 cf=2291 -> 59.92 GiB      rank3 cf=2762 -> 59.26 GiB
+rank1 cf=2822 -> 60.64 GiB      rank0 cf=2979 -> 59.63 GiB
+cf spread 30.0 %   memory spread 2.3 %   r = -0.059
+```
+
+A 30 % swing in per-rank coarse-fine count produces **2.3 %** in memory, r ≈ 0. **Per-rank
+coarse-fine sizing is dead at every depth sampled.** The correlation was reallocation ordering,
+not sizing. Both the "7.4× unmodelled term" and the "depth-dependent cf" readings came from
+comparing mid-reallocation samples; the fix was to sample when the mesh is settled.
+
+### 5. The sharp prediction this makes for the diagnostics A/B (job 2468980)
+
+The original failure hit **79.2 GiB at 198 blocks/rank** = **0.40 GiB/block** — **2.5×** the law
+above. If the diagnostic packages are the cause, `d1_diagon` should show ~0.40 GiB/block and
+approach the 79.2 GiB ceiling almost immediately, since it *starts* at 198 blocks/rank. If instead
+it tracks 0.159 GiB/block and survives to `nlim=380`, the diagnostics are exonerated and the audit
+batch fixed the OOM. The prediction is quantitative and stated before the result.
