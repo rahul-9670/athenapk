@@ -2607,3 +2607,96 @@ rho **+3.149e-05**, T **−1.434e-05**, t **−3.24e-14** (the audit note's +0.0
 **Lesson worth keeping:** a `DoesParameterExist` guard cannot distinguish "the user asserted this"
 from "an older binary of mine wrote this into a restart". Guards on parameter *existence* are
 restart-hostile by construction; guard on a *disagreeing value*, or warn.
+
+## 2026-08-06 (afternoon) — D1 CLOSED, the ensemble's boundary condition was superseded, and WP-7 was never as bad as recorded
+
+Four results, three of which are corrections to things this project already believed.
+
+### 1. D1 is closed — the OOM was already fixed, and my own hypothesis for it was wrong
+
+Deep-AMR GPU runs were documented as OOMing at cycle ~369 regardless of rank count. On the current
+binary they simply do not: job 2468612 (4 ranks, `84a6d248`) ran the same restart to `nlim=380`,
+`exit=0`, zero OOM lines, peak 61.0 of 79.7 GiB — straight through the failure point. Job 2468889
+reproduced it on a *different* binary.
+
+At an essentially identical physical epoch (t = 1.0160030 old vs 1.0160299 new, 0.003 % apart):
+
+| | old binary, 5 ranks (2454734) | current, 4 ranks (2468612) |
+|---|---|---|
+| blocks | 939 (188/rank) | 1513 (378/rank) |
+| peak | **77.4 GiB → OOM** (`bnd_flux::cons.coarse`, 2.93 MiB) | **61.0 GiB, survived** |
+| GiB/block | **0.412** | **0.161** |
+
+61 % more blocks, 21 % less memory ⇒ **2.56× less memory per block**, from the 2026-08-05/06 audit
+batch. Which individual fix is not isolated (needs a binary bisect); the practical question is
+answered.
+
+**The sizing law**, from 112 samples: `consumed = 0.159 GiB × blocks_per_rank`, constant to ±0.8 %
+across 198→378 blocks/rank and `maxlev` 9→12. No depth term, no coarse-fine term, **no leak** —
+memory is a staircase, allocated at regrids then flat to the last decimal across up to 10
+consecutive samples. Corroborated at ~0.16 by `mg_prod_tab/gpumem.log` (different run, different
+tier). ⇒ **~498 blocks/rank per H100**; budget 85 %.
+
+**Two method lessons, worth more than the result.**
+*(a) A perfect correlation identified the wrong cause.* All four OOM casualty scripts had
+`cap_diag`/`mag_diag` on and the survivor had none — 4 for 4. I proposed the diagnostics as the
+cause. The one-variable A/B (job 2468980: same binary, restart, rank count, `nlim`; diagnostics the
+only difference) gave memory **identical to 0.01 GiB**. The binary was the confound. Deep-AMR runs
+may keep diagnostics on.
+*(b) Never compute a rate from an unsettled sample.* The regrid-triggered `[D1]` print fires in
+`PreStepMeshUserWorkInLoop` *before* the new buffers exist, under-reporting settled memory by up to
+**42 %**. Three claims made from it were withdrawn the same day: a "7.4× unmodelled growth term"
+(full sequence 7.4× → 1.3× → **0.5×**), "per-rank coarse-fine sizing is dead" (shallow cycles only),
+and its own correction "the dependence is depth-dependent" (**r = +0.990** mid-reallocation vs
+**r = −0.059** settled, with cf spanning 30 %). Fix: `hydro/d1_meminfo_every` (default 0 =
+bit-identical) and read only interval samples.
+
+### 2. The 24-member ensemble was about to run on a superseded boundary condition
+
+Every ensemble deck carried `ix{1,2,3}_bc = outflow`, inherited from `mg_prod_tab/fhc_mgtab.in`
+when `design.py` templated them on 2026-07-26. The 2026-08-03 production switch made **`diode`**
+the production BC and reached **exactly one deck tree-wide** (`root_ladder/fhc_rootladder.in`).
+Measured before the fix: **1 deck on diode, 170 on outflow.** Caught by a pre-launch audit only
+because the pilot had not started; with `MAX_CHAIN=30` × 24 members it would have surfaced after up
+to 720 chained jobs. Switched all 24 (verified by grep audit, re-diff vs template, and a runtime
+CPU init check). `mg_prod_tab`'s own deck deliberately left on `outflow` — that run **has data**.
+
+**Rule this yields:** after any production config change, `grep` the whole `runs/` tree for the OLD
+value and *count*. Templated decks never inherit later edits to their template.
+
+### 3. WP-7's ladder is converged — the pessimistic verdict was a t = 1.0-only reading
+
+A parallel record reported `ME p = 0.54`, `KE p = 0.29` and "do NOT quote a converged
+flux-retention number off this ladder". Those orders are correct **at t = 1.0**, the singular stall
+where §2 of that document already rules the ratio observable unusable (p = 0.21). Across time the
+Richardson error `|v512−v256|/(2^p−1)` is **≤ 0.09 % on every absolute energy through t ≤ 0.95**,
+rising to 13.27 % (KE) only at t = 1.0. Reading `p` alone caused it: `p` is a ratio of two
+differences and is pure noise when both sit at the 0.01 % level. **Epoch restriction, not
+rejection.**
+
+### 4. Job sizing was badly wrong, and the packing arithmetic is worth writing down
+
+The ensemble was queued at 5 GPUs / 12 h. Both were poor:
+- **Packing.** The gpu partition is 4 nodes of 8/8/8/7 H100 = 31. At 5 GPUs an 8-GPU node fits only
+  ONE job (`8//5 = 1`) ⇒ 4 concurrent members and **11 of 31 GPUs idle (35.5 %)**. At 4 GPUs two fit
+  per node ⇒ 7 concurrent, 9.7 % idle. **3 GPUs is worse, not better**: 8 concurrent × 3 = 24 GPUs
+  busy vs 7 × 4 = 28. Fewer GPUs per job means *less* aggregate compute here.
+- **Memory floor.** With the law above, an overshoot to `mg_prod_tab`'s 1373-block endpoint gives
+  4 GPUs → 54.6 GiB (69 %, safe) but 3 GPUs → 72.8 GiB (92 %). **4 is the floor.**
+- **Time.** `mg_prod_tab` reached ρ = 7.25e-12 — past this ensemble's 1e-13 stop — in **2.39 h**.
+  12 h was ~5× the whole job. Now 2 h; chaining makes truncation cost one restart, and a shorter
+  slot also caps overshoot past the density stop (checked only *between* slots).
+
+**Trap:** SLURM snapshots `#SBATCH` directives at submit, so editing the script does not resize
+queued jobs — they must be requeued. Input decks and data files *are* read at runtime and do reach
+pending jobs. When requeueing, chained successors (`--dependency=afterany`, job name `ens`) must be
+left alone or the parent's chain silently ends.
+
+### 5. CPU viability: still unmeasured, twice
+
+Two probes, both invalidated by configuration rather than hardware. Attempt 1 died on Parthenon's
+300 s `task_collection_timeout_in_seconds` at cycle 0. Attempt 2 (timeout raised) burned an hour at
+cycle 0 with the resource report reading **`CPU: 1% (2.2 out of 192 physical cores)`** — `srun`
+bound each rank to a single core and its 8 OpenMP threads timeshared it. The build was checked, not
+assumed: `Kokkos_ENABLE_OPENMP=ON`, `Release`, `-O3 -DNDEBUG`. **No CPU throughput number should be
+quoted from either run.** The investigation was then dropped by the user.
