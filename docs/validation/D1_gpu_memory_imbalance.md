@@ -203,3 +203,58 @@ themselves a function of rank count, which is the very thing the test varies. A 
 sampling history, not the hypothesis. The script now compares at **matched cycles** and refuses a
 verdict if the legs share none. It also gained the fixed-`nblocks` within-cycle discriminator
 above, which needs only one leg.
+
+---
+
+## COMPLETED LEG (2026-08-06, job 2468612) — **THE RUN DID NOT OOM**, and this supersedes the partial-data section above
+
+The 4-rank leg finished: `exit=0`, `last_cycle=380` (stopped by `nlim`, **not** by an allocation
+failure), `oom_lines=0`, peak **61.0 of 79.7 GiB**. It ran straight through cycle 369, the point at
+which the b7_closure runs died. Three corrections follow, two of them to what *this document* said
+a few hours earlier on partial data.
+
+### 1. The founding observation no longer reproduces
+
+| | original OOM (2026-08-04) | this leg (2026-08-06) |
+|---|---|---|
+| blocks/rank | 198 (792 total) | **378–379 (1513 total)** |
+| per-rank consumed | 49.3 / 56.6 / **79.2** GiB → rank 2 died | **43–50 GiB**, no death |
+| spread across ranks | 61 % | **16 %** |
+
+Nearly **double the blocks, less memory per rank, and four times better balanced.** The mesh is
+not the variable that changed.
+
+### 2. Every OOM casualty had DIAGNOSTIC PACKAGES on; this leg had none
+
+| script | diagnostics |
+|---|---|
+| `submit_wp1_bind150.sh` | `cap_diag mag_diag` |
+| `submit_wp1_bind150_r7.sh` | `cap_diag mag_diag` |
+| `submit_wp1_binding.sh` | `cap_diag mag_diag` |
+| `submit_b7_closure.sh` | `cap_diag mag_diag cons_diag angmom_diag solver_diag` |
+| `submit_b7_closure2_r5.sh` | the same five |
+| **`submit_d1_leg.sh` (survived)** | **none** |
+
+Four for four. If those packages allocate per-block fields, they are a large and entirely
+avoidable addition to the footprint — and D1's premise (AMR coarse/prolongation buffer sizing)
+is the wrong tree. **This is correlational**, with two confounds: the surviving leg also used a
+newer binary (`84a6d248`, carrying the 2026-08-05/06 audit batch) and 4 ranks rather than 5.
+`submit_d1_diagab.sh` (job 2468980) removes both — same binary, same restart, same rank count,
+same `nlim`, diagnostics the *only* difference.
+
+### 3. Two claims made earlier today from partial data are WITHDRAWN
+
+- **The "7.4× unmodelled term" is falsified.** With all 16 samples the sequence is
+  **7.4× → 1.3× → 0.5×**. The later intervals are at or *below* linear in blocks. 7.4× was one
+  early interval, not a trend. (It was labelled "leading hypothesis to test next, not a result" —
+  the hedge was right, and the test has now killed it.)
+- **"Per-rank coarse-fine sizing is dead" was drawn from shallow cycles only.** At 198–235
+  blocks/rank the amplification is 0.040–0.086 with inconsistent sign (r = −0.28, −0.64, +0.55),
+  but at **378 blocks/rank it is 0.531 with r = +0.990**. The dependence **emerges with depth**.
+  The hypothesis is not dead — it is depth-dependent, and the shallow cycles cannot refute it.
+  `d1_analyse.py` now reports this verdict per depth and refuses to pool. Caveat stated plainly:
+  the deep regime is **one cycle**, so it is a strong hint, not an established scaling.
+
+**Lesson for the next person:** every number in the superseded section came from a run that was
+still going. Amplifications and correlations computed mid-run here are provisional — the sign of
+the correlation flipped and the amplification fell by 15× once the leg finished.
