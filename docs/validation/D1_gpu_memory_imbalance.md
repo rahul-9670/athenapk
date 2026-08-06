@@ -147,3 +147,59 @@ dead and the search restarts.
 
 To collect: add `-hydro/d1_meminfo=true` to the CLI of a deep-AMR restart and grep `[D1]` out of
 the job log. It needs a GPU run; none has been launched.
+
+---
+
+## FIRST INSTRUMENT OUTPUT (2026-08-06, job 2468612, 4-rank leg) — the prediction fails, and a better hypothesis appears
+
+The instrument ran for the first time. 8 `[D1]` samples at cycles 250 and 269. Two results, one
+methodological correction, and a new leading hypothesis.
+
+### 1. Per-rank coarse-fine sizing is DEAD
+
+Parthenon load-balances to **equal block counts**, which turns each cycle into a clean
+fixed-`nblocks` contrast — the opposite of the collinearity the original plan assumed. At cycle
+250 every rank holds exactly 198 blocks while `coarse_fine_nbrs` spans 1381–1682:
+
+| cycle | nblocks | cf_nbrs spread | consumed spread | amplification | r |
+|---|---|---|---|---|---|
+| 250 | 198 on all 4 ranks | +21.8 % | **+0.9 %** | **0.040** | −0.284 |
+| 269 | 220–221 (0.45 %) | +19.8 % | **+0.8 %** | **0.040** | −0.643 |
+
+A ~20 % swing in a rank's own coarse-fine boundary count moves its memory by <1 %, *non-monotonically*
+(the highest-`cf` rank consumes the least), with the same amplification 0.040 at both cycles.
+
+**Scope — do not overstate this.** It kills the **per-rank** form only. A *global* form (buffers
+sized by the whole mesh's coarse-fine count, therefore identical on every rank) is invisible to a
+within-cycle contrast and remains open. Only the 4-vs-5-rank leg comparison separates global-cf
+from blocks.
+
+### 2. The unmodelled term: memory grows 7.4× faster than blocks
+
+| cycle 250 → 269 | change |
+|---|---|
+| blocks/rank | +11.5 % |
+| coarse_fine_nbrs | +12.7 % |
+| **consumed memory** | **+84.8 %** |
+| amplification vs blocks | **7.4×** |
+
+Consumed memory nearly **doubles** (18.4 → 34.0 GiB) over 19 cycles while neither per-rank
+predictor moves more than 13 %. **Neither hypothesis was framed to explain this**, and it is the
+more likely story: something scaling with mesh **depth over time** — level count,
+prolongation/restriction buffer growth, or a leak — rather than with how existing work is divided.
+That also explains the observation that killed hypothesis 3: if memory tracks depth rather than
+division, adding ranks cannot help, and 4 and 5 ranks OOM **at the same cycle** exactly as seen.
+
+Next test: `d1_meminfo` currently prints only when a rank's block count *changes*. Make it print
+unconditionally every N cycles to resolve the growth curve between regrids, and add a Kokkos
+allocation dump by label so the growing allocation is named rather than inferred.
+
+### 3. Methodological correction to `d1_analyse.py`
+
+The original cross-leg test compared **leg means** of consumed memory. That is invalid here:
+consumed memory is dominated by *when* a sample was taken (18.4 GiB at cycle 250, 34.0 at 269),
+and samples are emitted only when a rank's block count changes — so the sampling cycles are
+themselves a function of rank count, which is the very thing the test varies. A leg mean compares
+sampling history, not the hypothesis. The script now compares at **matched cycles** and refuses a
+verdict if the legs share none. It also gained the fixed-`nblocks` within-cycle discriminator
+above, which needs only one leg.
