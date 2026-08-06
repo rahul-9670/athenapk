@@ -337,3 +337,57 @@ above. If the diagnostic packages are the cause, `d1_diagon` should show ~0.40 G
 approach the 79.2 GiB ceiling almost immediately, since it *starts* at 198 blocks/rank. If instead
 it tracks 0.159 GiB/block and survives to `nlim=380`, the diagnostics are exonerated and the audit
 batch fixed the OOM. The prediction is quantitative and stated before the result.
+
+---
+
+## D1 CLOSED (2026-08-06, job 2468980) — diagnostics exonerated; the audit batch fixed it
+
+The A/B completed: **same binary, same restart, same 4 ranks, same `nlim`, diagnostics the only
+difference.** It reached `nlim=380` with all five packages ON, exactly as the no-diagnostics leg
+did, and the per-rank memory at cycle 365 is **identical to 0.01 GiB**:
+
+| rank | diagnostics OFF (2468612) | diagnostics ON (2468980) |
+|---|---|---|
+| 3 | 30.88 | 30.88 |
+| 1 | 31.22 | 31.21 |
+| 2 | 35.76 | 35.76 |
+| 0 | 28.83 | 28.83 |
+
+The 4-for-4 correlation between diagnostics and OOM was **spurious** — the confounded variable
+(the binary) was the real one. Worth recording as a method note: the correlation was perfect
+across every casualty script and still pointed at the wrong cause. Only the one-variable A/B
+settled it.
+
+### The actual cause, quantified
+
+Comparing the old failure and the current binary at an **essentially identical physical epoch**
+(t = 1.0160030 vs t = 1.0160299, a 0.003 % difference):
+
+| | old binary, 5 ranks (job 2454734) | current binary, 4 ranks (job 2468612) |
+|---|---|---|
+| cycle | 369 | 365 |
+| blocks | 939 (188/rank) | **1513 (378/rank)** |
+| peak GPU memory | **77.4 GiB → OOM** (`bnd_flux::cons.coarse`, 2.93 MiB) | **61.0 GiB, survived** |
+| GiB per block | **0.412** | **0.161** |
+
+At the same epoch the current binary refines to **61 % more blocks** and still uses **21 % less
+total memory** — a **2.56× reduction in memory per block**, attributable to the 2026-08-05/06
+audit batch (`4f9adff` → `84a6d248`). Which individual fix is responsible is not isolated here;
+doing so would need a binary bisect, and the practical question is already answered.
+
+### What this unblocks, with the budget
+
+D1 was the blocker on deep-AMR production (item 1, second core). It is no longer a blocker. The
+capacity budget follows directly from the law:
+
+```
+max blocks/rank  =  79.2 GiB / 0.159 GiB per block  ~=  498
+    4 GPUs  ->  ~1992 blocks        8 GPUs  ->  ~3984 blocks
+```
+
+Leave real headroom against this: it is a *settled-state* ceiling, and the regrid transient
+briefly runs above the settled value (measured: rank spread 15.9 % mid-reallocation vs 2.3 %
+settled). Budget ~85 % of it.
+
+**Deep-AMR runs may keep the diagnostics on.** They cost nothing measurable, and the reason to
+avoid them was based on a correlation that is now falsified.
