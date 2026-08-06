@@ -6,7 +6,7 @@
 #SBATCH --ntasks=4
 #SBATCH --gres=gpu:h100:4
 #SBATCH --cpus-per-task=8
-#SBATCH --time=04:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=%x_%j.out
 set -o pipefail
 #
@@ -39,6 +39,21 @@ set -o pipefail
 # on a 4-node partition. Shortening is SAFE because this script self-chains: a member that needs
 # longer simply takes another slot (MAX_CHAIN=30). The only cost of being wrong is one extra
 # slot; the cost of 12 h was permanent queue starvation.
+#
+# 2026-08-06, SECOND SHRINK: 4 h -> 2 h. mg_prod_tab reached rho=7.25e-12 -- past this ensemble's
+# 1e-13 stop -- in 2.39 h on 5 GPUs, so 2 h at 4 GPUs will usually need a second slot. That is the
+# intended trade: chaining makes truncation free apart from one restart, and short jobs backfill
+# far better on a 4-node partition. A shorter slot ALSO caps how far a member can overshoot the
+# density stop (which is only checked BETWEEN slots), which lowers peak block count and therefore
+# peak memory.
+#
+# 4 GPUs IS THE FLOOR -- do not shrink further. With the memory law now measured
+# (D1: consumed = 0.159 GiB x blocks/rank, +/-0.8%, docs/validation/D1_gpu_memory_imbalance.md):
+#   overshoot to mg_prod_tab's 1373-block endpoint  =>  4 GPUs: 343 blk/rank = 54.6 GiB (69%, safe)
+#                                                       3 GPUs: 458 blk/rank = 72.8 GiB (92%, NO)
+# and on throughput 3 GPUs is worse anyway: the partition (8/8/8/7 = 31 H100) fits 8 concurrent
+# 3-GPU jobs = 24 GPUs busy, versus 7 concurrent 4-GPU jobs = 28 busy. Fewer GPUs per job here
+# means LESS aggregate compute, not more.
 source ~/athenapk_env.sh; module load cuda/12.5.1
 export PMIX_MCA_gds=hash OMP_NUM_THREADS=1 OMPI_MCA_io=romio341
 export TMPDIR=/beegfs/u/bbg6470/.chem_tmp; mkdir -p "$TMPDIR"
@@ -63,24 +78,43 @@ N=$(cat chain_n 2>/dev/null || echo 0); N=$((N+1)); echo $N > chain_n
 grep -q "Driver completed" run.log 2>/dev/null && { echo "completed -> exit"; exit 0; }
 LATEST=$(ls -t $PDIR/parthenon.out2.*.rhdf 2>/dev/null | head -1)
 if [ $N -ge 2 ] && [ -z "$LATEST" ]; then echo "no restart -> STOP"; echo "no-restart $(date)" > STOP_CHAIN; exit 0; fi
-# matched-epoch density stop
-NEWEST=$(ls -t $PDIR/parthenon.out1.*.phdf 2>/dev/null | head -1)
-if [ -n "$NEWEST" ]; then
-  RM=$($PY - "$NEWEST" <<'PYEOF'
-import sys,h5py,numpy as np
-try:
- with h5py.File(sys.argv[1],"r") as h: print("%.6e"%float(np.array(h["prim"][:,0,...]).max()))
-except: print("0.0")
+# matched-epoch density stop.
+#
+# FIXED 2026-08-06: this used to read ONLY the newest phdf and fall back to `print("0.0")` on
+# any exception. A truncated newest snapshot -- exactly what a mid-write kill produces, and
+# slots here end on a timer -- therefore read as rho=0, so the member RESTARTED instead of
+# stopping, silently burning another whole slot past its own finish line. It now walks BACK to
+# the newest READABLE snapshot and reports which file it used, so a corrupt tail costs one
+# snapshot of resolution instead of the entire stop condition. It also returns -1 rather than 0
+# when nothing is readable, so "no data yet" is distinguishable from "density is zero".
+RM=$($PY - "$PDIR" <<'PYEOF'
+import sys, glob, os, h5py, numpy as np
+fs = sorted(glob.glob(os.path.join(sys.argv[1], "parthenon.out1.*.phdf")),
+            key=os.path.getmtime, reverse=True)
+for f in fs:
+    try:
+        with h5py.File(f, "r") as h:
+            print("%.6e %s" % (float(np.array(h["prim"][:, 0, ...]).max()),
+                               os.path.basename(f)))
+        break
+    except Exception:
+        continue          # truncated / half-written -> fall back to the previous snapshot
+else:
+    print("-1.0 none")    # NO readable snapshot at all -- NOT the same as density zero
 PYEOF
 )
-  [ "$($PY -c "print(1 if $RM*$RHO0>=$STOP_CGS else 0)")" = "1" ] && {
-    echo "matched epoch reached -> STOP"; echo "epoch stop rho=$RM $(date)" > STOP_CHAIN; exit 0; }
+RMV=${RM%% *}; RMF=${RM##* }
+if [ "$RMV" = "-1.0" ]; then
+  echo "no readable snapshot yet (fresh start, or all truncated) -> continuing"
+elif [ "$($PY -c "print(1 if $RMV*$RHO0>=$STOP_CGS else 0)")" = "1" ]; then
+  echo "matched epoch reached (rho=$RMV code, from $RMF) -> STOP"
+  echo "epoch stop rho=$RMV from $RMF $(date)" > STOP_CHAIN; exit 0
 fi
 [ $N -lt $MAX_CHAIN ] && sbatch --dependency=afterany:$SLURM_JOB_ID --export=ALL,PDIR=$PDIR,STOP_CGS=$STOP_CGS $0 && echo "successor queued"
 
 if [ -n "$LATEST" ]; then RA="-r $LATEST"; else RA="-i fhc_ens.in"; fi
 echo "=== $(basename $PDIR) slot $N $(date) ===" >> $PDIR/run.log
-stdbuf -oL -eL mpirun -n 4 $MCA $WRAP $BIN $RA -t 03:30:00 \
+stdbuf -oL -eL mpirun -n 4 $MCA $WRAP $BIN $RA -t 01:45:00 \
   parthenon/mesh/do_coalesced_comms=true diffusion/integrator=rkl2 \
   diffusion/hall_floor_integrator=rkl2 diffusion/rkl2_max_dt_ratio=1000 \
   diffusion/rkl2_freeze_eta=true diffusion/eta_ohm_cap_code=0.1 parthenon/output2/dn=250 \
