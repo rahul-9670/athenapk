@@ -35,18 +35,37 @@ multigrid = true
 nx1 = 256
 x1min = -8.0
 x1max = 8.0
-ix1_bc = outflow
-ox1_bc = outflow
+# BOUNDARY CONDITION: diode, NOT the template's outflow. This is the ONE deliberate deviation
+# from mg_prod_tab/fhc_mgtab.in, which this deck is otherwise templated from value-for-value
+# (verified by diff 2026-08-06: the only other differences are the 6 sampled IC keys).
+# Reason: the 2026-08-03 production switch (docs/validation/PRODUCTION_SWITCH_2026-08-03.md, B1)
+# made `diode` the production fluid BC, and it was applied to exactly ONE deck -- root_ladder/
+# fhc_rootladder.in, the flagship. These 24 ensemble decks were generated 2026-07-26, BEFORE that
+# switch, and inherited `outflow` from a template that has since been superseded. Parthenon's
+# `outflow` is a plain zero-gradient ghost copy with NO inflow suppression, so mass flows IN
+# through nominally-outflow faces; the diode zeroes the ghost face-normal momentum. Measured
+# effect on total mass drift: +0.10577% -> +0.05216% at 256^3, a ~51% cut that is
+# resolution-independent -- the signature of a real boundary effect rather than a coincidence.
+# WHY IT MATTERS HERE: this ensemble exists to put a predictive DISTRIBUTION around the flagship's
+# flux-retention curve. Run on a superseded BC, the distribution and the curve are not
+# like-for-like, and that would only surface after up to 720 chained jobs.
+# HONEST SCOPE: the effect of the BC on mu_core itself is NOT measured. The 0.05 pp figure above
+# is total mass drift, not flux retention. The switch is made to match production, not because the
+# flux-retention bias has been quantified.
+# mg_prod_tab's own deck is deliberately left on `outflow`: that run HAS DATA (17 outputs,
+# 2026-07-26) and its deck must keep describing what actually produced it.
+ix1_bc = diode
+ox1_bc = diode
 nx2 = 256
 x2min = -8.0
 x2max = 8.0
-ix2_bc = outflow
-ox2_bc = outflow
+ix2_bc = diode
+ox2_bc = diode
 nx3 = 256
 x3min = -8.0
 x3max = 8.0
-ix3_bc = outflow
-ox3_bc = outflow
+ix3_bc = diode
+ox3_bc = diode
 
 <parthenon/meshblock>
 nx1 = 32

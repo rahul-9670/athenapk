@@ -169,11 +169,27 @@ void PreStepMeshUserWorkInLoop(Mesh *pmesh, ParameterInput *pin, SimTime &tm) {
   // not the per-rank block count, tracks the per-device footprint. This prints both per rank
   // whenever the block count changes (i.e. after each regrid), plus free/total device memory
   // where CUDA is available, so the correlation can be read straight off the run log.
+  // 2026-08-06 UPGRADE, after the first output (job 2468612). Two things the original
+  // instrument could not see, both added here:
+  //   (a) `d1_meminfo_every` (default 0 = unchanged, print only when the block count changes).
+  //       Regrids are sparse -- the first leg produced samples at only cycles 250 and 269 in
+  //       288 cycles -- and between those two the consumed memory rose +84.8 % while
+  //       blocks/rank rose 11.5 % and coarse_fine_nbrs 12.7 % (a 7.4x amplification neither
+  //       hypothesis predicts). Resolving that growth curve needs sampling that does NOT wait
+  //       for a regrid.
+  //   (b) max/min refinement LEVEL present on this rank. The 7.4x term points at something
+  //       scaling with mesh DEPTH over time rather than with how work is divided -- which is
+  //       also the only story consistent with 4 and 5 ranks OOMing at the same cycle. Depth was
+  //       simply not recorded before, so it could not be tested.
+  // The new fields are APPENDED to the line so logs from the original instrument still parse.
   if (hydro_pkg->Param<bool>("d1_meminfo")) {
     int nblocks = static_cast<int>(pmesh->block_list.size());
     int ncf = 0, nsame = 0;
+    int maxlev = -1, minlev = 1 << 30;
     for (auto const &pmb : pmesh->block_list) {
       const int mylev = pmb->loc.level();
+      maxlev = std::max(maxlev, mylev);
+      minlev = std::min(minlev, mylev);
       for (auto const &nb : pmb->GetNeighbors()) {
         if (nb.loc.level() != mylev) {
           ncf++;
@@ -182,7 +198,13 @@ void PreStepMeshUserWorkInLoop(Mesh *pmesh, ParameterInput *pin, SimTime &tm) {
         }
       }
     }
-    if (nblocks != hydro_pkg->Param<int>("d1_last_nblocks")) {
+    if (nblocks == 0) {
+      minlev = -1;
+    }
+    const int every = hydro_pkg->Param<int>("d1_meminfo_every");
+    const bool on_change = (nblocks != hydro_pkg->Param<int>("d1_last_nblocks"));
+    const bool on_interval = (every > 0) && (tm.ncycle % every == 0);
+    if (on_change || on_interval) {
       double freeGB = -1.0, totGB = -1.0;
 #ifdef KOKKOS_ENABLE_CUDA
       size_t fb = 0, tb = 0;
@@ -192,8 +214,9 @@ void PreStepMeshUserWorkInLoop(Mesh *pmesh, ParameterInput *pin, SimTime &tm) {
       }
 #endif
       printf("[D1] cycle=%d rank=%d nblocks=%d coarse_fine_nbrs=%d same_level_nbrs=%d "
-             "dev_free_GiB=%.2f dev_total_GiB=%.2f\n",
-             tm.ncycle, parthenon::Globals::my_rank, nblocks, ncf, nsame, freeGB, totGB);
+             "dev_free_GiB=%.2f dev_total_GiB=%.2f maxlev=%d minlev=%d trigger=%s\n",
+             tm.ncycle, parthenon::Globals::my_rank, nblocks, ncf, nsame, freeGB, totGB,
+             maxlev, minlev, on_change ? "regrid" : "interval");
       fflush(stdout);
       hydro_pkg->UpdateParam("d1_last_nblocks", nblocks);
     }
@@ -646,6 +669,10 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // D1 instrument (see PreStepMeshUserWorkInLoop). Default off => no output, no cost.
   pkg->AddParam<>("d1_meminfo", pin->GetOrAddBoolean("hydro", "d1_meminfo", false));
   pkg->AddParam<>("d1_last_nblocks", -1, Params::Mutability::Mutable);
+  // Sampling interval in cycles for the D1 instrument. 0 (default) = original behaviour:
+  // print only when the block count changes. >0 also prints every N cycles, which is what
+  // resolving the memory-growth curve between sparse regrids requires.
+  pkg->AddParam<>("d1_meminfo_every", pin->GetOrAddInteger("hydro", "d1_meminfo_every", 0));
   // CT edge-EMF averaging scheme (increment 3). "gs05" = Gardiner & Stone (2005) upwind
   // CT (default; matches Athena++, adds Riemann dissipation via the transverse-B face
   // fluxes); "arithmetic" = Balsara & Spicer (1999) plain average (increment-1 fallback).
