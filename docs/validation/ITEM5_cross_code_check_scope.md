@@ -1,5 +1,12 @@
 # Item 5 — what a cross-code (AthenaPK ↔ Athena++) check can still test, and what it cannot
 
+> **CLOSED — DROPPED BY THE USER, 2026-08-06: "forget athena++, no need for any comparison."**
+> No cross-code work is planned or pending. This document is retained for one reason: §2 and §3
+> are findings about the *code*, not about a proposed run, and they stay true regardless. In
+> particular **§2 means no future document may claim the flagship was validated against an
+> independent code** — that option does not exist in this workspace, so if such a claim is ever
+> wanted it needs a different second code, not a rerun of this one.
+
 **Assessed 2026-08-06, from the tree, not from memory.** The head-to-head was formally
 **concluded 2026-07-05** by the user and its large datasets deleted. Item 5 proposes re-running it
 as an independent-code check on the current production code. This document establishes what is
