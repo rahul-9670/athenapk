@@ -178,12 +178,38 @@ watchdog. Compute efficiency and measurability pull in opposite directions here;
 raised, the watchdog needs raising with it or it will keep trimming exactly the margin the
 measurement requires.
 
+### Terminal-density census — all 24 members (from each member's own `STOP_CHAIN`)
+
+This is the datum the decision turns on, and it is free: the watchdog recorded the stopping density
+in every marker file, so the full campaign can be surveyed without touching a single 1.7 GB
+snapshot. Terminal rho_max, in units of rho_crit = 1e-13 g/cm³:
+
+| × rho_crit | members | count |
+|---|---|---|
+| 256.6 | point002 | 1 |
+| 11.3 – 31.3 | point021 (31.3), point023 (26.4), point000 (20.0), point022 (18.0), point005 (12.8), point001 (11.3) | 6 |
+| 2.3 – 3.8 | point009 (3.8), point011 (3.8), point019 (3.0), point006 (2.9), point008 (2.9), point020 (2.6), point003 (2.3) | 7 |
+| 1.1 – 2.0 | point018 (2.0), point017 (1.8), point007 (1.5), point012 (1.5), point014 (1.4), point004 (1.3), point010 (1.3), point013 (1.3), point015 (1.1), point016 (1.1) | 10 |
+
+**Consequence for the 1e-12 epoch.** At `--max-log-dist 0.3` the acceptance window is
+rho ∈ [5.01e-13, 2.00e-12] cgs, i.e. 5.0–20× rho_crit. Only a member whose *terminal* density
+clears 5.01e-13 can ever land in it, so **N ≤ 7 at the 1e-12 epoch** — point000, point001,
+point002, point005, point021, point022, point023 — and the other **17 members are excluded by how
+far they ran, not by anything wrong with the measurement**. That is a materially different failure
+mode from the 1e-13 epoch, where members are excluded by `r_core` degeneracy. Extending those 17
+from their restarts is the only way to grow N at 1e-12.
+
+The census also confirms the self-inflicted interaction above by direct inspection rather than by
+inference: the single largest margin (point002, 256.6×) is the member that ran *before* the
+watchdog existed, and the 10 members sitting at 1.1–2.0× — squarely in the degenerate regime — are
+exactly the ones the watchdog trimmed.
+
 ## Status
-Machinery COMPLETE + validated. Launch is **held** on the boundary-condition decision above.
-Otherwise: running the ensemble (+ the convergence ladder for the discretization class) is the
-remaining COMPUTE, gated on GPU availability + user go. This is the LAST code-development piece of
-the flagship program (per the user's plan: ensemble is last, then resume prod_v9 once the flagship
-is fully done).
+Machinery COMPLETE + validated. **Campaign COMPLETE 2026-08-07: 24/24 members finished, 0 failed,
+0 jobs remaining, every member carrying a `STOP_CHAIN` marker.** The boundary-condition decision
+was resolved (all 24 decks switched to `diode` before launch). The remaining open item is the
+measurement-epoch decision above — it is an analysis choice plus optional extra compute, not a
+blocker on the machinery.
 
 Also done 2026-08-06: all 24 decks repointed to the v2 EOS/opacity tables (audit N13/N14), and
 `submit_point.sh` pinned to `athenaPK_PRESERVED_84a6d248` instead of the mutable `build_gpu/bin/`
