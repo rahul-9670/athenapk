@@ -60,6 +60,17 @@ export TMPDIR=/beegfs/u/bbg6470/.chem_tmp; mkdir -p "$TMPDIR"
 export LD_LIBRARY_PATH=/sw/env/gcc-13.3.0_openmpi-5.0.7/pkgsrc/2025Q1/lib:$LD_LIBRARY_PATH
 
 : "${PDIR:?set PDIR}"; STOP_CGS="${STOP_CGS:-1.0e-13}"
+# Science-output cadence, in CYCLES. Default 50 = the value in every fhc_ens.in, so leaving OUT_DN
+# unset reproduces the original campaign exactly. It MUST be passed on the command line rather than
+# edited into the deck: a restarted run takes its parameters from the rhdf + CLI, not from the .in.
+#
+# Measured cadence behaviour (from the completed campaign, docs in README):
+#   * BEFORE first core the collapse runs away and dn=50 spans 1.3-1.9 decades of rho per snapshot;
+#   * AFTER first core dt collapses and dn=50 spans only 0.08-0.17 decades (point000, 00007->final).
+# So coarse output only loses resolution across the first-core transition itself. That is what cost
+# point021/point023 their 1e-12 measurement -- both had ample density margin (31.3x, 26.4x) but
+# their cadence jumped straight over the acceptance window.
+OUT_DN="${OUT_DN:-50}"
 # PINNED to the preserved hard link, NOT build_gpu/bin/athenaPK. That path is the scratch build
 # slot: `make -C build_gpu` overwrites it, and with MAX_CHAIN=30 across 24 members this campaign
 # can span up to 720 chained jobs over days. A rebuild mid-campaign would silently change the
@@ -110,7 +121,7 @@ elif [ "$($PY -c "print(1 if $RMV*$RHO0>=$STOP_CGS else 0)")" = "1" ]; then
   echo "matched epoch reached (rho=$RMV code, from $RMF) -> STOP"
   echo "epoch stop rho=$RMV from $RMF $(date)" > STOP_CHAIN; exit 0
 fi
-[ $N -lt $MAX_CHAIN ] && sbatch --dependency=afterany:$SLURM_JOB_ID --export=ALL,PDIR=$PDIR,STOP_CGS=$STOP_CGS $0 && echo "successor queued"
+[ $N -lt $MAX_CHAIN ] && sbatch --dependency=afterany:$SLURM_JOB_ID --export=ALL,PDIR=$PDIR,STOP_CGS=$STOP_CGS,OUT_DN=$OUT_DN $0 && echo "successor queued"
 
 if [ -n "$LATEST" ]; then RA="-r $LATEST"; else RA="-i fhc_ens.in"; fi
 echo "=== $(basename $PDIR) slot $N $(date) ===" >> $PDIR/run.log
@@ -118,5 +129,6 @@ stdbuf -oL -eL mpirun -n 4 $MCA $WRAP $BIN $RA -t 01:45:00 \
   parthenon/mesh/do_coalesced_comms=true diffusion/integrator=rkl2 \
   diffusion/hall_floor_integrator=rkl2 diffusion/rkl2_max_dt_ratio=1000 \
   diffusion/rkl2_freeze_eta=true diffusion/eta_ohm_cap_code=0.1 parthenon/output2/dn=250 \
+  parthenon/output1/dn=$OUT_DN \
   >> $PDIR/run.log 2>&1
 echo "RUN_EXIT $? $(date)" >> $PDIR/run.log
