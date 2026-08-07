@@ -204,6 +204,58 @@ inference: the single largest margin (point002, 256.6×) is the member that ran 
 watchdog existed, and the 10 members sitting at 1.1–2.0× — squarely in the degenerate regime — are
 exactly the ones the watchdog trimmed.
 
+### RESULT 2026-08-07 — both epochs measured (SLURM job 2478818, COMPLETED 1:16:43, rc 0)
+
+Run via `submit_uq.sh` -> `uq_both_epochs.py`, one IO sweep serving both targets.
+
+| | **1e-13 (1.0x rho_crit)** | **1e-12 (10x rho_crit)** |
+|---|---|---|
+| N kept | **10** of 24 | **5** of 24 |
+| median mu_core | 48.96 | 97.13 |
+| 16-84 % | [15.23, 205.5] | [47.04, 140.3] |
+| min/max | [7.55, 224.2] | [44.67, 212.3] |
+| total CoV | 93.87 % | 60.28 % |
+| turbulence-seed sub-class CoV | **29.78 %** | **59.31 %** |
+| match quality | 0.046-0.257 dec | **0.015-0.256 dec** |
+| top sensitivity | **B0z rho_S = -0.867** | turb_mach rho_S = +0.600 |
+
+Kept at 1e-13: 000, 001, 004, 007, 010, 012, 013, 014, 015, 017.
+Kept at 1e-12: 000, 001, 002, 005, 022.
+
+**A THIRD exclusion mechanism exists: snapshot cadence.** The terminal-density census bounds N from
+above but is blind to whether any snapshot actually LANDS in the acceptance window. point021 and
+point023 had ample margin (31.3x, 26.4x) yet were excluded at 1e-12 because their cadence jumped
+straight past the window to 0.50 and 0.42 decades ABOVE target. Same mechanism cost 5 members at
+1e-13 (008, 009, 011, 018, 020). So exclusions decompose as: degeneracy (9 at 1e-13), never
+reached (17 at 1e-12), and cadence overshoot (5 at 1e-13, 2 at 1e-12). Any future extension must
+raise the phdf output cadence near the target epoch -- nearly free, and it would have salvaged 7
+member-measurements across the two epochs.
+
+**mu_core is strongly EPOCH-DEPENDENT -- roughly x2 per decade of rho_max.** The two epochs share
+only point000 and point001, so the median shift 48.96 -> 97.13 could have been pure sample
+composition. `paired_epoch_check.py` measures those two members at BOTH epochs and settles it:
+
+| member | mu_core @1x | mu_core @10x | M_core | Phi_core | mu ratio |
+|---|---|---|---|---|---|
+| point000 | 22.35 | 44.67 | x6.63 | x3.31 | **x2.00** |
+| point001 | 41.31 | 97.13 | x11.92 | x5.07 | **x2.35** |
+
+The within-member ratios (2.00, 2.35) agree with the across-sample median ratio (**1.984**) from two
+nearly disjoint member sets. The epoch shift is therefore a REAL physical effect, not a sampling
+artifact. Physically it is the fossil-field signal itself: between 1x and 10x rho_crit the core
+gains 6.6-11.9x in mass but only 3.3-5.1x in flux, so flux is not accreted in proportion to mass
+and the mass-to-flux ratio doubles. (N=2 for the paired test -- indicative, not a distribution.)
+
+**Consequence: the two epochs are NOT two estimates of one number.** Any quoted mu_core must state
+its epoch, and a sensitivity ranking may legitimately differ between them rather than contradict.
+
+**Neither epoch currently supports the headline sensitivity claim.** At 1e-13 the ranking is clean
+and well separated (B0z dominant at -0.867; seed noise 29.78 % well below total 93.87 %, so the
+spread is genuinely parameter-driven) but the sample is biased by definitional degeneracy. At
+1e-12 degeneracy is gone and matches are 10x tighter, but seed noise (59.31 %) is essentially the
+ENTIRE spread (60.28 %) and N=5 gives Spearman a granularity of 0.1 with no significance -- the
+ranking there is noise, which is the honest reading of B0z moving -0.867 -> +0.300.
+
 ## Status
 Machinery COMPLETE + validated. **Campaign COMPLETE 2026-08-07: 24/24 members finished, 0 failed,
 0 jobs remaining, every member carrying a `STOP_CHAIN` marker.** The boundary-condition decision
