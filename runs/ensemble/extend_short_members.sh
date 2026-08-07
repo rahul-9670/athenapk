@@ -15,6 +15,20 @@
 # its remaining leg sits entirely in the well-resolved regime and dn=50 would have sufficed.
 # dn=25 (~0.04-0.09 dec) is bought as margin in case a member's dt recovers faster than point000's.
 #
+# ^^^ THE TWO SENTENCES ABOVE ARE WRONG. Measured 2026-08-08 on point008 (worst overshooter,
+# stopped 2.9x past 2e-12), reading its snapshots directly:
+#     00005 = 2.935e-13 cgs   (0.23 dec BELOW the window floor; end of the 1e-13 campaign)
+#     00006 = 1.406e-12 cgs   IN-WINDOW
+#     00007 = 5.847e-12 cgs   (watchdog stop trigger)
+# i.e. 0.62-0.68 decades per snapshot AT dn=25 -- not 0.04-0.09. The fine-cadence regime is not
+# entered at rho_crit; it is entered after FIRST CORE, once dt actually collapses. These members
+# restarted AT rho_crit, still inside the runaway, so their first extension snapshots are as
+# coarse as the pre-core campaign was. With spacing (0.62-0.68 dec) >= the acceptance width
+# (0.60 dec at --max-log-dist 0.3), a member gets AT MOST ONE in-window snapshot and can miss
+# entirely: point008 passed on luck, not margin. dn=25 was the right call for the wrong reason;
+# dn=50 would have doubled the spacing to ~1.3 dec and lost most of these members outright.
+# Any future extension launched from rho_crit should size cadence off the RUNAWAY spacing.
+#
 # STORAGE, checked before launch rather than after. Snapshots near this epoch are ~4.07 GiB
 # (point000, out1.00011+). point000's 1.43e-13 -> 2.00e-12 leg was 9 snapshots at dn=50 = ~450
 # cycles, so at dn=25 expect ~18 snapshots = ~73 GiB per member, ~1.25 TiB over 17 members.
