@@ -1,9 +1,19 @@
 # D1 — per-rank GPU memory imbalance on deep AMR hierarchies
 
-**Status: CHARACTERISED, THREE hypotheses FALSIFIED, root cause NOT established, and there is NO
-known mitigation.** A real defect that killed four runs on 2026-08-04. This document exists so the
-next person does not re-derive the dead ends — including the "just use more ranks" one, which I
-asserted here earlier and then disproved (§ Hypothesis 3).
+**Status: CLOSED 2026-08-06 (job 2468980) — see "D1 CLOSED" below. Memory is LINEAR IN BLOCKS:
+consumed ≈ 0.159 GiB × blocks_per_rank (±0.8 %), with no depth term and no coarse-fine term, so
+one H100 holds ~498 blocks/rank. The original OOM does not reproduce: the 2026-08-05/06 audit
+batch cut memory per block by 2.56×. The diagnostics were exonerated — the 4-for-4 correlation
+that blamed them was spurious (A/B identical to 0.01 GiB per rank).**
+
+*(Header corrected 2026-08-08. It previously read "root cause NOT established, and there is NO
+known mitigation", which was true on 2026-08-04 and was never updated when the closure sections
+below were appended two days later. The status line is what people read; it disagreed with its own
+document. If you are re-reading this file, the sections are in chronological order and the last
+one wins.)*
+
+The dead ends below are kept so the next person does not re-derive them — including the
+"just use more ranks" one, which I asserted here earlier and then disproved (§ Hypothesis 3).
 
 ## The observation
 
