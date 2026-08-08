@@ -249,6 +249,26 @@ Real MGResidual(const Real Tt, const Real rho, const Real kdust, const Real arad
 }
 
 //----------------------------------------------------------------------------------------
+//! GRAY gas energy-balance residual R(T), radiation energy eliminated analytically. This is
+//! MGResidual specialised to one group (PlanckFraction == PlanckMult == 1), written as its own
+//! free function so the gray kernel does not have to carry the RadGroups/GroupOpacityTable
+//! objects it otherwise never touches:
+//!     E^new = (E0 + a B)/(1 + a),  a = chat dt rho kappa_P(T) kdust,  B = arad T^4
+//!     R(T)  = [e(T) - e0] - (c/chat) a (E0 - B(T)) / (1 + a)
+//! MONOTONICALLY INCREASING in T (e(T) rises; B rises so -(E0-B) rises), so a bracketed method
+//! on it is guaranteed to converge. Used ONLY as the non-convergence fallback below.
+KOKKOS_INLINE_FUNCTION
+Real GrayResidual(const Real Tt, const Real rho, const Real kdust, const Real arad,
+                  const Real chat, const Real c, const Real dt, const Real gm1,
+                  const Real T_unit, const bool use_h2, const EOSTable::EosTable &eos_tab,
+                  const OpacityParams &op, const Real Er0, const Real e0_ref) {
+  const Real e = use_h2 ? eos_tab.EintFromRhoTk(rho, Tt * T_unit) : rho * Tt / gm1;
+  const Real B = arad * Tt * Tt * Tt * Tt;
+  const Real a = chat * dt * rho * PlanckOpacity(op, rho, Tt) * kdust;
+  return (e - e0_ref) - c / chat * a * (Er0 - B) / (1.0 + a);
+}
+
+//----------------------------------------------------------------------------------------
 //! Implicit MULTIGROUP matter coupling (n_group>1). One matter temperature T couples to all
 //! groups: group g emits B_g = arad*T^4*PlanckFraction(g,T) and absorbs at a_g = chat*dt*rho*
 //! kappa_P,g. The (n_group) group-energy equations are linear in E_g given T
@@ -528,6 +548,9 @@ TaskStatus MatterCoupling(MeshData<Real> *md, const Real dt) {
   const Real efloor = pkg->Param<Real>("efloor");
   const int inner_max = pkg->Param<int>("inner_iteration_max");
   const Real inner_tol = pkg->Param<Real>("inner_iteration_tol");
+  // Upper bracket for the WP-13b non-convergence fallback (code T), capped inside the
+  // tabulated EOS/opacity range exactly as the multigroup path caps it.
+  const Real coupling_tmax = pkg->Param<Real>("coupling_tmax");
   const Real Bfloor = arad * tfloor * tfloor * tfloor * tfloor;
   // Tabulated-EOS coupling: map gas internal-energy DENSITY e <-> code temperature T via
   // the shared table instead of the ideal e=rho*T/gm1. T (code) = T_phys[K]/T_unit.
@@ -650,6 +673,48 @@ TaskStatus MatterCoupling(MeshData<Real> *md, const Real dt) {
           }
         }
         if (!conv) lnfail += 1; // audit #6: non-silent non-convergence
+
+        // WP-13b (2026-08-08): BRACKETED FALLBACK for the cells the Newton above did not
+        // converge. Without it those cells wrote "the last iterate", which is not a function of
+        // the cell's state at all -- it is wherever the stalled iteration happened to be, so a
+        // last-bit change in the input moves it by a FINITE amount. That is the whole mechanism
+        // behind WP-13b's restart divergence: with `radiation/inner_iteration_tol` loosened so
+        // that every cell converged, restart rad.Er divergence fell from 1.7743e-02 to 2.5975e-12
+        // (6.8e9x) at fixed gravity perturbation, while raising `inner_iteration_max` 100 -> 5000
+        // changed nothing bit-for-bit (the iteration is STALLED, not slow).
+        //
+        // Pure bisection on the monotone gray residual: guaranteed to converge, no derivative,
+        // and -- unlike the Newton -- its answer depends only on (rho, e0, Er0, dt). Cells that
+        // already converged are untouched, so this is BIT-IDENTICAL wherever `conv` is true;
+        // only the previously-garbage cells change, and they change to the actual root.
+        // Mirrors what MatterCouplingMultigroup already does via rtsafe; the gray path had been
+        // left on the bare Newton.
+        if (!conv) {
+          Real Tlo = tfloor, Thi = coupling_tmax;
+          if (Thi <= Tlo) Thi = 1.0e5; // ideal EOS: no table cap
+          auto Rof = [&](const Real Tt) {
+            return GrayResidual(Tt, rho, kdust, arad, chat, c, dt, gm1, T_unit, use_h2, eos_tab,
+                                op, Er0, e0_ref);
+          };
+          const Real Rlo = Rof(Tlo), Rhi = Rof(Thi);
+          // Only solve when the root is actually bracketed; otherwise clamp to the end the
+          // monotone residual points at, which is what the multigroup path does too.
+          if (Rlo >= 0.0) {
+            T = Tlo;
+          } else if (Rhi <= 0.0) {
+            T = Thi;
+          } else {
+            // FIXED iteration count, no early exit: on GPU a warp runs until its slowest lane
+            // finishes, so a fixed count is both faster and divergence-free. 80 bisections take
+            // the bracket below the double round-off of any T in range.
+            for (int it = 0; it < 80; ++it) {
+              const Real Tm = 0.5 * (Tlo + Thi);
+              if (Rof(Tm) < 0.0) Tlo = Tm; else Thi = Tm;
+            }
+            T = 0.5 * (Tlo + Thi);
+          }
+          B = std::max(arad * T * T * T * T, Bfloor);
+        }
 
         // Gas internal-energy change from the converged temperature.
         T = std::pow(B / arad, 0.25);

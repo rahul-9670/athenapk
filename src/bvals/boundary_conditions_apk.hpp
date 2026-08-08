@@ -139,6 +139,29 @@ void DiodeBC(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse) {
             : (X1 ? IndexDomain::outer_x1
                   : (X2 ? IndexDomain::outer_x2 : IndexDomain::outer_x3));
 
+  // WP-13b (2026-08-08). FIRST do the plain zero-gradient copy for EVERY variable, exactly as
+  // Parthenon's stock `outflow` does (same GenericBC, same variable_names::any pack); THEN apply
+  // the diode momentum clamp to `cons` below.
+  //
+  // WHY. This function used to pack ONLY "cons", so with `ix1_bc = diode` the domain-boundary
+  // ghost zones of every OTHER FillGhost field -- in particular all of the M1 radiation moments
+  // rad.Er / rad.Fr1..3 and their per-group copies -- were never written by any boundary
+  // condition at all. A FRESH run got away with it because the problem generator initialises the
+  // whole array, ghosts included, so ghost ~ interior and the face flux stays ~1e-4. A RESTART
+  // does not: restart files store INTERIOR cells only, so the ghosts came up zero-initialised and
+  // the first CalculateRadFluxes after the restart saw a full-amplitude jump across the domain
+  // face. Measured on the flagship deck (job 2491776, ensemble point000, 4xH100, 31 cycles):
+  // restart-vs-fresh differed by 7.41e+01 in rad.Fr1/2/3 against a non-determinism floor of
+  // 8.6e-09 (1e10x), confined EXACTLY to the outermost meshblock layer, and predicted by
+  // chat*Er/2 = 1578*0.104/2 ~ 79. With the radiation package off the same test passes at the
+  // floor, and nsub, block ordering and the restart file were all separately exonerated.
+  // This reaches the flagship and all 24 ensemble members: every one uses `diode` + radiation.
+  //
+  // The cons path is UNCHANGED -- the same copy from the same reference cell, then the same
+  // clamp -- so a radiation-free run is bit-identical to before this fix.
+  parthenon::BoundaryFunction::GenericBC<DIR, SIDE, parthenon::BoundaryFunction::BCType::Outflow,
+                                         parthenon::variable_names::any>(mbd, coarse);
+
   auto cons = mbd->PackVariables(std::vector<std::string>{"cons"}, coarse);
   const bool fine = false;
 

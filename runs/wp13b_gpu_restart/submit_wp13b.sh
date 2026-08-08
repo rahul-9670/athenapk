@@ -42,7 +42,15 @@ export LD_LIBRARY_PATH=/sw/env/gcc-13.3.0_openmpi-5.0.7/pkgsrc/2025Q1/lib:$LD_LI
 #   WP13B_DIFF  = diffusion/integrator   (rkl2 = production; unsplit = what WP-13 actually tested)
 #   WP13B_NLIM  = final cycle            (60 = default; 31 = one step past the restart)
 #   WP13B_SPLIT = restart cycle          (30)
+#   WP13B_DECK  = the input deck to test. DEFAULT (wp13_restart/straight/fhc.in) is the GRAY
+#                 radiation path -- it sets no `n_group`, so n_group=1 and MatterCoupling's
+#                 plain linearized Newton runs. The FLAGSHIP and all 69 production decks set
+#                 `n_group = 3`, which dispatches to MatterCouplingMultigroup and its SAFEGUARDED
+#                 rtsafe solve instead. Those are DIFFERENT SOLVERS, so a result on one says
+#                 nothing about the other; use ensemble/design01/point000/fhc_ens.in to test the
+#                 solver production actually runs.
 R=${WP13B_DIR:-/beegfs/u/bbg6470/athenapk/runs/wp13b_gpu_restart}
+DECK=${WP13B_DECK:-/beegfs/u/bbg6470/athenapk/runs/wp13_restart/straight/fhc.in}
 DIFFINT=${WP13B_DIFF:-rkl2}
 NLIM=${WP13B_NLIM:-60}
 SPLIT=${WP13B_SPLIT:-30}
@@ -53,16 +61,24 @@ SPLIT=${WP13B_SPLIT:-30}
 FREEZE=${WP13B_FREEZE:-true}
 EXTRA=${WP13B_EXTRA:-}
 mkdir -p $R/fresh_a $R/fresh_b $R/split
+DECKDIR=$(dirname $DECK)
 for d in fresh_a fresh_b split; do
-  cp -n /beegfs/u/bbg6470/athenapk/runs/wp13_restart/straight/fhc.in \
-        /beegfs/u/bbg6470/athenapk/runs/wp13_restart/straight/units.json $R/$d/ 2>/dev/null
+  cp -n $DECK $R/$d/fhc.in 2>/dev/null
+  cp -n $DECKDIR/units.json $R/$d/ 2>/dev/null
 done
 cp -n /beegfs/u/bbg6470/athenapk/runs/wp13b_gpu_restart/wrap_mod.sh $R/ 2>/dev/null
 cp -n /beegfs/u/bbg6470/athenapk/runs/wp13b_gpu_restart/compare_wp13b.py $R/ 2>/dev/null
 # Same pinned binary the ensemble ran, so this statement covers the ensemble's own restarts.
-BIN=/beegfs/u/bbg6470/athenapk/build_gpu/bin/athenaPK_PRESERVED_84a6d248
+# WP13B_BIN lets a leg test a CANDIDATE binary. Default stays the binary the ensemble ran, so
+# every result already recorded remains reproducible with the same command.
+BIN=${WP13B_BIN:-/beegfs/u/bbg6470/athenapk/build_gpu/bin/athenaPK_PRESERVED_84a6d248}
 WRAP=$R/wrap_mod.sh
+# RAD_PRINT_NSUB / RAD_DISABLE_TRANSPORT are radiation_moments.cpp's own getenv diagnostics
+# (nsub = ceil(dt/dt_rad) is an INTEGER, so it is a candidate discrete branch across a restart).
+# They must be forwarded explicitly: mpirun does not inherit the submitter's environment.
 MCA="--mca mtl ^psm2 --mca btl tcp,self,sm -x LD_LIBRARY_PATH -x PMIX_MCA_gds -x OMP_NUM_THREADS -x OMPI_MCA_io -x TMPDIR"
+[ -n "$RAD_PRINT_NSUB" ] && MCA="$MCA -x RAD_PRINT_NSUB"
+[ -n "$RAD_DISABLE_TRANSPORT" ] && MCA="$MCA -x RAD_DISABLE_TRANSPORT"
 # Production physics flags, verbatim from runs/ensemble/submit_point.sh. output2/dn=30 puts a
 # restart file exactly at the split point; output1/dn=100000 leaves only the final phdf, which is
 # the artifact being compared.
