@@ -256,6 +256,78 @@ spread is genuinely parameter-driven) but the sample is biased by definitional d
 ENTIRE spread (60.28 %) and N=5 gives Spearman a granularity of 0.1 with no significance -- the
 ranking there is noise, which is the honest reading of B0z moving -0.867 -> +0.300.
 
+## RESULT 2026-08-08 — extension campaign + re-measurement (SLURM job 2490249, COMPLETED 3:13:15, rc 0)
+
+The 17 members that never reached the 1e-12 window were extended to `STOP_CGS=2.0e-12` at
+`OUT_DN=25` (`extend_short_members.sh`, jobs 2487330-2487346). Re-measured at both epochs:
+
+| | 1e-13 (1.0x rho_crit) | 1e-12 (10x rho_crit) |
+|---|---|---|
+| N | **8** (was 10) | **19** (was 5) |
+| median mu_core | 21.92 (was 48.96) | 87.60 (was 97.13) |
+| 16-84 % | [14.26, 54.78] | [44.36, 202.7] |
+| min/max | [7.567, 68.33] | [21.83, 418.7] |
+| total CoV | 65.99 % | 82.15 % |
+| seed sub-class CoV | 37.37 % | 57.58 % |
+
+**1e-12 is now the usable epoch.** At N=5 seed noise (59.31 %) was the entire spread (60.28 %). At
+N=19, decomposing as variances, parameter-driven CoV = sqrt(0.8215^2 - 0.5758^2) = 58.6 %: seed
+noise is ~49 % of the variance and IC parameters ~51 %. Half and half -- enough to RANK, not enough
+to call the spread parameter-dominated. Matches are also 10x tighter than at 1e-13 (point010 0.000
+decades, point016 0.001, point004 0.007; only point022 loose at 0.256).
+
+**SENSITIVITY -- two previously-reported drivers do NOT survive.** Spearman t-approximation,
+alpha = 0.05 two-tailed, gives |rho_S| > 0.707 at n=8 and > 0.456 at n=19:
+
+| parameter | 1e-13, N=8 | 1e-12, N=19 | verdict |
+|---|---|---|---|
+| **B0z** | **-0.762** significant | **-0.563** significant | the only real driver, negative at both epochs |
+| dust_kappa0 | -0.190 | +0.002 | NOT significant (was +0.733 at N=10) |
+| mass | -0.095 | +0.060 | NOT significant (was +0.709 at N=10) |
+| omegatff | 0.000 | +0.230 | not significant |
+| turb_mach | -0.357 | -0.018 | not significant |
+| zeta_cr | +0.190 | +0.002 | not significant |
+
+The old `dust_kappa0 = +0.733` and `mass = +0.709` were small-sample artifacts of a biased
+10-member set, and dust_kappa0 even flips sign. Do not carry them into the paper.
+
+Also: the across-sample median ratio between epochs is 87.60/21.92 = **4.0** here, versus 1.984
+from the previous pair of samples, while the WITHIN-member paired measurement gave x2.00 and x2.35.
+Across-sample ratios move by 2x with composition; only the paired number supports x2/decade.
+
+### INCIDENT — the extension cost 2 members at 1e-13 (restart-from-t=0 overwrite)
+
+`submit_point.sh` restarts from `ls -t parthenon.out2.*.rhdf | head -1`. With `output2/dn=250`, a
+member whose first slot was ended by the DENSITY STOP before cycle 250 never wrote a second restart
+file, so the only `.rhdf` on disk was the **t=0** one and the "restart" re-ran the whole collapse.
+Hit **point012 (slot1 ended cycle 200), point013 (209), point014 (209)**. point020 ended at cycle
+**253** and escaped by three cycles. All other members restarted from cycle 250 or their exact last
+cycle -- true continuations.
+
+The re-run overwrote `out1.*` from index 1 up, and because `output1/dn` also changed 50 -> 25 the
+re-written indices correspond to DIFFERENT cycles, so the snapshots that matched 1e-13 are gone.
+It is also not the same trajectory: point012 at cycle 200 reads `t=1.0262248077486364, dt=1.940e-4`
+originally versus `t=0.9922842318649277, dt=9.970e-5` on the re-run -- a different realization of
+the same IC. **Never pair a member's old 1e-13 number with its new 1e-12 number across this.**
+
+1e-13 membership diff: lost 012, 013, 014 (t=0) and 017 (was marginal at 0.257 dec, now degenerate);
+gained 006 and 019, both previously degenerate and now matched on new dn=25 intermediate snapshots.
+
+**The pipeline itself verified clean.** Untouched control members reproduce exactly -- point000
+`00007` rho=2.618e5, point001 `00008` rho=2.538e5, point004 `00010` rho=2.095e5, point010 `00005`
+rho=2.320e5, all identical to job 2478818. point007 proves the cycle-250 restarts are faithful:
+same rho=2.692e5 to 4 significant figures, merely renumbered `00006` -> `00007` by the dn=50 -> 25
+re-indexing. The 1e-13 shift is sample composition, not corrupted trajectories.
+
+### CADENCE — the dn=25 rationale was wrong, and right by accident
+The launch comment claimed these members restart past the transition where dn=50 spans 0.08-0.17
+decades. Measured on point008: `00005` = 2.935e-13, `00006` = 1.406e-12 (IN-WINDOW), `00007` =
+5.847e-12 cgs -- i.e. **0.62-0.68 decades per snapshot at dn=25**. The fine-cadence regime starts
+after FIRST CORE, not at rho_crit, and these members restarted at rho_crit, still in the runaway.
+With spacing >= the 0.60-decade acceptance width a member gets at most ONE in-window snapshot;
+point008 passed on luck. dn=50 would have doubled the spacing and lost most of them. Members that
+had already passed first core (004, 015, 016) behaved as advertised and matched to <0.03 decades.
+
 ## Status
 Machinery COMPLETE + validated. **Campaign COMPLETE 2026-08-07: 24/24 members finished, 0 failed,
 0 jobs remaining, every member carrying a `STOP_CHAIN` marker.** The boundary-condition decision
