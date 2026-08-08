@@ -288,3 +288,50 @@ treatment.
 > read from the code's own applied-diffusivity cache. The mechanism (fixed ratio, same power of k)
 > is **inferred** but is consistent with all three scans. The `rkl2`-vs-`unsplit` caveat in §4 is
 > **unmeasured**.
+
+---
+
+# 2026-08-08 — the recommendation is now the DEFAULT
+
+§6 recommended setting `diffusion/hall_ohmic_floor_ratio = 0.2` in the production deck. That
+recommendation stood unexecuted: **0 of 295 decks set it**, so the ratio existed but nothing used
+it, and the closing statement "production is measured to sit inside the stable regime with margin"
+remained an *empirical* safety claim about one measured snapshot rather than a structural property
+of the code.
+
+**Changed:** the input default is now `0.2` at all four read sites in `src/hydro/hydro.cpp`
+(`fixed`, `ionization`, `ionization_chem`, and the startup-banner probe). The C++ constructor
+fallback in `diffusion.hpp` stays `0.0`; every call site passes the input value explicitly.
+
+## Why this is free today, and why it is not cosmetic
+
+Free: `max|η_H| = 4.316e-02` measured over 78.7 M cells of `prod_v9`, so `0.2·|η_H| ≤ 8.6e-03 <
+0.05` and the `max()` selects the absolute floor in **every** cell ⇒ no change to production
+numbers. This is not an argument, it is §5's gates C (unsplit) and D (rkl2 — production's actual
+integrator, and the path where a naive implementation would have been inert), both **PASS
+byte-identical**.
+
+Not cosmetic: η_H is a *local* quantity. §4 already flagged caveat (i) — "a future run reaching
+different ρ/T/B could exceed the floor; the safety is empirical, not structural". The default flip
+is exactly what converts that caveat into a guarantee: once the ratio is on, the floor tracks the
+term it stabilises, so a run that drives |η_H| up carries its own stabiliser up with it instead of
+silently crossing the measured onset at η_floor/|η_H| ≈ 0.11.
+
+## What this DOES change
+
+The `hall_whistler*` validation decks run η_H = 0.5, so the floor becomes `max(0.05, 0.1) = 0.1`
+and their recorded numbers move. In particular the historical **1D "4.23e-03"** in §2 is a
+ratio = 0.0 result. Reproduce it with `diffusion/hall_ohmic_floor_ratio = 0.0`.
+
+That is the intended trade: the stock decks become **stable in 3D by default**, and reproducing the
+historical unstable configuration is now the opt-in. Given that §2's headline finding is that those
+same stock 3D decks amplify by five decades and crash at N = 256 with zero overrides, defaulting
+them to the stable branch is the correct polarity.
+
+## Verification
+
+`runs/audit_fix_regress/submit_default_flips.sh` — one binary, new defaults vs the old values
+restored explicitly on the command line, on `A_multipole.in` (32³, `hall_coeff = ionization`,
+`hall_ohmic_floor_code = 0.05`, radiation on). Includes a falsification leg
+(`hall_ohmic_floor_ratio = 5.0`) so that a bit-identical result cannot be produced by the parameter
+name simply being ignored.

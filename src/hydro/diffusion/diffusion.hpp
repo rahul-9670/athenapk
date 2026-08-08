@@ -380,6 +380,12 @@ struct HallDiffusivity {
   // so the floor tracks the term it stabilizes instead of being a fixed number that merely
   // happens to be large enough. 0 = disabled => EffectiveOhmicFloor() returns ohmic_floor_
   // exactly, and every consumer is bit-identical to the pre-B11 code.
+  //
+  // NOTE the INPUT default is now 0.2, not 0 (hydro.cpp, 2026-08-08): WP-16 part 3 measured a
+  // real 3D instability below eta_floor/|eta_H| ~ 0.11, and leaving the remedy opt-in meant no
+  // deck used it. The 0.0 below is only the C++ constructor fallback -- every call site passes
+  // the value from the input file explicitly -- and 0.0 remains the way to reproduce pre-B11
+  // behaviour, via diffusion/hall_ohmic_floor_ratio = 0.0.
   Real ohmic_floor_ratio_;
 
  public:

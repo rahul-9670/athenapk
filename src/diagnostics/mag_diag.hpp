@@ -107,7 +107,41 @@ enum class MagDiag {
   // nonzero almost everywhere, so it just returns the box volume. Measured: 1.40608e5 on
   // the L=52 smoke deck, i.e. exactly 52^3.)
   dissOsq, // int (eta_O |J|^2)^2 dV
-  dissAsq  // int (eta_A |J_perp|^2)^2 dV
+  dissAsq, // int (eta_A |J_perp|^2)^2 dV
+  // --- WP-8 REOPENED 2026-08-06, ADDRESSED 2026-08-08: the CURRENT-SHEET split ------------
+  // The density split above was built from a smoke-deck measurement showing 89.6 % of dissO
+  // sits above rho = 1 code. That is right for dissO, which is weighted by eta_O and so is
+  // core-dominated. It is WRONG for Jsq, which is unweighted: re-measured on the ladder at
+  // production resolution, the low-density bin carries 97-99 % of Jsq AND keeps f_eff ~ 1e-7,
+  // so `Jsq-lo` is simply the original pathology under a new name (its convergence history,
+  // -51.6 %/-39.9 %, is the global one to within a percent). WP08_dissipation_nonconvergence.md
+  // states the consequence directly: "Jsq needs a split on a current-sheet indicator, not on
+  // density". A density threshold cannot separate grid-scale current sheets by construction,
+  // because those sheets live in the diffuse envelope.
+  //
+  // The indicator is the DIMENSIONLESS grid-scale current
+  //     s = |J| * dx_min / |B|
+  // i.e. the fraction of the local field that reverses across one cell. s -> 1 means B flips
+  // over a single zone: the current is at the grid scale and is a numerical-resolution
+  // artefact as much as a physical structure. s << 1 means a current spread over many cells,
+  // which is a resolved, physically meaningful sheet. This is the right variable precisely
+  // because it is measured IN UNITS OF THE GRID -- the thing that changes between ladder
+  // rungs -- whereas density is blind to it.
+  //
+  // Split at hydro/mag_diag_sheet_thresh (default 0 => these columns are NEVER REGISTERED and
+  // the OFF state is bit-identical, same convention as the density split). Cells with |B| = 0
+  // are counted as "sheet": s is then formally infinite, and a nonzero J with zero B is a
+  // pure grid artefact by definition.
+  Jsqsheet, // int |J|^2 dV over cells with s >  thresh   (grid-scale current)
+  Jsqsmth,  // int |J|^2 dV over cells with s <= thresh   (resolved current)
+  Vsheet,   // int dV      over cells with s >  thresh   -- the volume carrying Jsqsheet
+  // Concentration probe for Jsq itself. Until now Jsq had NO `sq` companion, so unlike dissO
+  // and dissA its f_eff could not be formed from the history file at all -- it had to be
+  // recomputed offline from 986 GB of ladder snapshots, which is why the reopened WP-8 test
+  // could only be run once and only for Jsq. With this column,
+  //     f_eff(Jsq) = (int |J|^2 dV)^2 / (V_box * int |J|^4 dV)
+  // is available every history row, for free, in every run.
+  Jsqsq // int |J|^4 dV
 };
 
 //! Volume-summed magnetic-transport reduction over interior cells. `need_eta` variants

@@ -65,7 +65,20 @@ export LD_LIBRARY_PATH=/sw/env/gcc-13.3.0_openmpi-5.0.7/pkgsrc/2025Q1/lib:$LD_LI
 # NOTE this is only the FALLBACK default -- stage_switches.sh exports BIN explicitly and is
 # deliberately still pinned to build_gpu_v2 (f181c0a1), because r128_sw and r256_sw already ran on
 # that binary and the WP-7 root-grid ladder must stay a matched comparison. Do not "modernise" it.
-BIN="${BIN:-/beegfs/u/bbg6470/athenapk/build_gpu_v4/bin/athenaPK}"
+#
+# 2026-08-08: default swapped build_gpu_v4 (869c1d34) -> 967fced6 (= commit 6236df4). REASON: this
+# deck sets `diode` boundaries AND radiation, and WP-13b showed `DiodeBC` gave the M1 radiation
+# moments no boundary condition at all, so every restart resumed with zeroed rad ghosts. See
+# docs/validation/WP13b_restart_gpu_amr.md. NOTE build_gpu_v4/bin/athenaPK is the SCRATCH slot of
+# that build dir, not a preserved hardlink; the new default is the preserved copy, which a rebuild
+# cannot overwrite.
+#
+# THIS IS RESULT-CHANGING, not just a restart fix. The completed WP-7 root ladder (r128/r256/r512,
+# jobs through 2449283) ran on v2/v4 and its Richardson errors are quoted at <=0.09% through
+# t<=0.95. Do NOT append a 967fced6 rung to that ladder and call it the same ladder -- a new rung
+# must be compared against rungs from the same binary. Export BIN explicitly to reproduce the old
+# ladder.
+BIN="${BIN:-/beegfs/u/bbg6470/athenapk/build_gpu/bin/athenaPK_PRESERVED_967fced6}"
 DECK=/beegfs/u/bbg6470/athenapk/runs/root_ladder/fhc_rootladder.in
 WRAP=$RUNDIR/wrap_mod.sh
 MCA="--mca mtl ^psm2 --mca btl tcp,self,sm -x LD_LIBRARY_PATH -x PMIX_MCA_gds -x OMP_NUM_THREADS -x OMPI_MCA_io -x TMPDIR"

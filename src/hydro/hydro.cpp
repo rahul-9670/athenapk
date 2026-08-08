@@ -1447,8 +1447,34 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         Real hall_ohmic_floor_code =
             pin->GetOrAddReal("diffusion", "hall_ohmic_floor_code", 0.0);
         // B11: per-cell stabilizer = max(hall_ohmic_floor_code, ratio*|eta_H|). 0 = off.
+        //
+        // DEFAULT FLIPPED 0.0 -> 0.2, 2026-08-08 (all four read sites in this file). WP-16 part 3
+        // measured a REAL 3D instability: at the production floor 0.05 with eta_H = 0.5 a
+        // circularly polarised Hall eigenmode -- which the non-dissipative Hall term must
+        // conserve exactly -- grows by five decades at N=128 and CRASHES at N=256. The onset is
+        // sharp and sits at eta_floor/|eta_H| between 0.100 and 0.125; one step across it moves
+        // the amplitude error from +2.65e5 to +1.6 %. 1D is unaffected at N=128..1024, which is
+        // why the historical "Hall whistler 0.4 %" validation never saw it.
+        //
+        // WP-16b closed as "production is measured to sit inside the stable regime with margin":
+        // max|eta_H| = 4.316e-02 over 78.7 M cells of prod_v9, so floor/|eta_H| >= 1.16 against a
+        // threshold of ~0.11. That is a ~10x margin -- but it is EMPIRICAL, not structural. eta_H
+        // is a local quantity; a run reaching different rho/T/B can exceed the absolute floor with
+        // nothing to catch it. Making the ratio the default converts that empirical safety into a
+        // structural guarantee, and WP-16b's own recommendation is exactly this value.
+        //
+        // IT IS FREE TODAY: 0.2*|eta_H| <= 8.6e-3 < 0.05, so the max() selects the absolute floor
+        // in every production cell. WP-16b gates C (unsplit) and D (rkl2 -- production's actual
+        // integrator, and the path where a naive implementation would have been inert) both
+        // returned PASS byte-identical with the ratio enabled at production's eta_H.
+        //
+        // WHAT IT DOES CHANGE: decks with a large eta_H, i.e. the hall_whistler* validation decks
+        // (eta_H = 0.5 => floor becomes max(0.05, 0.1) = 0.1). Their recorded numbers -- including
+        // the 1D "4.23e-03" -- are for ratio = 0.0. Set diffusion/hall_ohmic_floor_ratio = 0.0
+        // explicitly to reproduce them. That is the intended trade: the stock decks become stable
+        // in 3D by default, and reproducing the historical unstable configuration is opt-in.
         Real hall_ohmic_floor_ratio =
-            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.0);
+            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.2);
         auto hall_diff = HallDiffusivity(
             hall, hall_coeff, hall_coeff_code, hall_ohmic_floor_code, 0.0, 0.0, 0.0,
             Ionization::IonizationModel(), -1, std::numeric_limits<Real>::max(),
@@ -1473,7 +1499,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         auto hall_diff =
             HallDiffusivity(hall, hall_coeff, 0.0, hall_ohmic_floor_code, 0.0, 0.0, 0.0,
                             ion, -1, eta_hall_cap_code,
-                            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.0));
+                            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.2));
         pkg->AddParam<>("hall_diff", hall_diff);
         if (parthenon::Globals::my_rank == 0) {
           std::cout << "## Hall effect: self-consistent ionization model "
@@ -1502,7 +1528,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         auto hall_diff =
             HallDiffusivity(hall, hall_coeff, 0.0, hall_ohmic_floor_code, 0.0, 0.0, 0.0,
                             ion, i_xe_prim, eta_hall_cap_code,
-                            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.0));
+                            pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.2));
         pkg->AddParam<>("hall_diff", hall_diff);
         if (parthenon::Globals::my_rank == 0) {
           std::cout << "## Hall effect: chemistry-coupled x_e (conductivity-tensor sigma_H, "
@@ -1546,7 +1572,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       const Real hall_floor_notice =
           pin->GetOrAddReal("diffusion", "hall_ohmic_floor_code", 0.0);
       const Real hall_floor_ratio_notice =
-          pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.0);
+          pin->GetOrAddReal("diffusion", "hall_ohmic_floor_ratio", 0.2);
       if (parthenon::Globals::my_rank == 0) {
         if (hall_floor_ratio_notice > 0.0) {
           std::cout << "## Hall Ohmic stabilizer: per-cell max("
@@ -1966,6 +1992,19 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // eta|J|^2 is not a convergent diagnostic.
   pkg->AddParam<Real>("mag_diag_rho_split",
                       pin->GetOrAddReal("hydro", "mag_diag_rho_split", 0.0));
+  // WP-8 REOPENED: the CURRENT-SHEET threshold on s = |J|*dx_min/|B| (DIMENSIONLESS -- the
+  // fraction of the local field that reverses across one cell). 0 = OFF, no extra columns, so
+  // the OFF state stays bit-identical exactly as for the density split. Sensible value ~0.1-0.3:
+  // s >= 0.3 means B turns over in ~3 cells, which is the grid-scale limit.
+  //
+  // WHY A SECOND SPLIT. The density split was designed from a smoke-deck measurement showing
+  // 89.6 % of dissO above rho = 1 code, and it works for dissO (eta_O-weighted => core-
+  // dominated). Re-measured on the ladder it FAILS for Jsq: the low-density bin holds 97-99 %
+  // of the integral and keeps f_eff ~ 1e-7, i.e. `Jsq-lo` is the original pathology renamed.
+  // Jsq's concentration is not organised by density at all -- it sits in grid-scale current
+  // sheets in the diffuse envelope, which a density threshold cannot separate by construction.
+  pkg->AddParam<Real>("mag_diag_sheet_thresh",
+                      pin->GetOrAddReal("hydro", "mag_diag_sheet_thresh", 0.0));
   if (mag_diag) {
     using Diagnostics::MagDiag;
     using Diagnostics::MagDiagReduce;
@@ -2012,6 +2051,16 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         add_mag(MagDiag::Vhi, "mag-Vhi");
       }
     }
+    // The current-sheet split is registered OUTSIDE the have_eta block on purpose: Jsq needs
+    // only B and the grid, no eta cache, so an ideal run can measure it too. Same OFF-state
+    // discipline -- thresh = 0 registers nothing and leaves the column set byte-for-byte.
+    const Real sheet_thresh = pkg->Param<Real>("mag_diag_sheet_thresh");
+    if (sheet_thresh > 0.0) {
+      add_mag(MagDiag::Jsqsheet, "mag-Jsq-sheet");
+      add_mag(MagDiag::Jsqsmth, "mag-Jsq-smooth");
+      add_mag(MagDiag::Vsheet, "mag-Vsheet");
+      add_mag(MagDiag::Jsqsq, "mag-Jsqsq");
+    }
     pkg->UpdateParam(parthenon::hist_param_key, hst_mag);
     if (parthenon::Globals::my_rank == 0) {
       std::cout << "## Magnetic-transport diagnostics ON (hydro/mag_diag): hst mag-Jsq, "
@@ -2024,6 +2073,16 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                   << " code): hst mag-dissO-hi/lo, mag-dissA-hi/lo, mag-Vhi. Use these,"
                      " NOT the global mag-dissO/dissA, for convergence work -- WP-8 measured"
                      " 90% of the global integral coming from ~1e-7 of the volume."
+                  << std::endl;
+      }
+      if (sheet_thresh > 0.0) {
+        std::cout << "## mag_diag CURRENT-SHEET split ON (hydro/mag_diag_sheet_thresh="
+                  << sheet_thresh
+                  << ", dimensionless s=|J|dx/|B|): hst mag-Jsq-sheet/smooth, mag-Vsheet,"
+                     " mag-Jsqsq. Use mag-Jsqsq to form f_eff(Jsq) = mag-Jsq^2/(V_box *"
+                     " mag-Jsqsq) each row; f_eff <~ 1e-3 means the number is a point sample."
+                     " The DENSITY split does not work for Jsq -- measured on the ladder, the"
+                     " low-density bin carries 97-99% of it at f_eff ~ 1e-7."
                   << std::endl;
       }
     }

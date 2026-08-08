@@ -1,0 +1,275 @@
+diff --git a/runs/wp13b_gpu_restart/compare_wp13b.py b/runs/wp13b_gpu_restart/compare_wp13b.py
+index 4721766..1d42a58 100755
+--- a/runs/wp13b_gpu_restart/compare_wp13b.py
++++ b/runs/wp13b_gpu_restart/compare_wp13b.py
+@@ -25,9 +25,24 @@ def load(leg):
+         return None, f"MISSING {f}"
+     out = {}
+     with h5py.File(f, "r") as h:
+-        for k in ("prim", "grav.phi", "rad.Er"):
+-            if k in h:
+-                out[k] = np.array(h[k])
++        # Compare EVERY dumped field, not a hardcoded three. The multigroup decks (n_group=3,
++        # which is what the flagship and all 69 production decks run) dump rad.Er_g1/rad.Er_g2
++        # as well, and a hardcoded list would silently skip exactly the fields whose solver is
++        # under test.
++        keys = [k for k in h.keys() if k not in ("Info", "Params", "Blocks", "Locations",
++                                                 "LogicalLocations", "Levels", "SparseInfo",
++                                                 "VolumeLocations")]
++        for k in keys:
++            try:
++                a = np.array(h[k])
++            except Exception:
++                continue
++            if a.dtype.kind == "f":
++                out[k] = a
++        if np.dtype(out.get("prim", np.zeros(1)).dtype) == np.float32:
++            print("  !! WARNING: fields are SINGLE precision (parthenon/output1/"
++                  "single_precision_output=1). Differences below ~1e-7 relative are INVISIBLE; "
++                  "this test is only meaningful with single_precision_output=0.")
+         info = h["Info"].attrs
+         out["_t"] = float(info["Time"])
+         out["_cycle"] = int(info["NCycle"])
+@@ -43,11 +58,13 @@ def cmp(a, b, la, lb):
+     print(f"  t      : {a['_t']:.17e}  vs {b['_t']:.17e}   dt_rel="
+           f"{abs(a['_t']-b['_t'])/max(abs(a['_t']),1e-300):.3e}")
+     print(f"  cycle  : {a['_cycle']} vs {b['_cycle']}    blocks: {a['_nblocks']} vs {b['_nblocks']}")
+-    worst = 0.0
++    out = {}
+     for k in sorted(set(a) & set(b)):
+         if k.startswith("_"):
+             continue
+         x, y = a[k], b[k]
++        if x.size == 0 or y.size == 0:
++            continue  # e.g. an unallocated sparse/swarm field: nothing to compare
+         if x.shape != y.shape:
+             print(f"  {k:10s}: SHAPE {x.shape} vs {y.shape} -- skipped")
+             continue
+@@ -56,8 +73,8 @@ def cmp(a, b, la, lb):
+         rel = np.where(scale > 0, d / np.where(scale > 0, scale, 1.0), 0.0)
+         print(f"  {k:10s}: max|abs|={d.max():.6e}   max|rel|={rel.max():.6e}   "
+               f"{'BIT-IDENTICAL' if d.max() == 0.0 else ''}")
+-        worst = max(worst, rel.max())
+-    return worst
++        out[k] = float(d.max())
++    return out
+ 
+ 
+ def main():
+@@ -72,20 +89,35 @@ def main():
+     floor = cmp(legs["fresh_a"], legs["fresh_b"], "fresh_a", "fresh_b")
+     restart = cmp(legs["fresh_a"], legs["split"], "fresh_a", "split")
+ 
++    # VERDICT, PER FIELD, ON ABSOLUTE SCALES.
++    #
++    # The previous version reduced each comparison to a single global max|rel| and compared the
++    # two numbers. That is not a usable statistic and it returned a FALSE PASS on the multigroup
++    # flagship deck (2026-08-08): |x-y|/max(|x|,|y|) SATURATES at 2.0 whenever x and y have
++    # opposite signs, so the near-empty rad.Fr*_g2 fields (|value| ~ 1e-15 .. 1e-22, pure noise)
++    # pinned BOTH the floor and the restart comparison at ~1.9996 and the ratio test passed --
++    # while rad.Fr1 was actually diverging by 74.1 in absolute terms against a floor of 8.6e-09.
++    # Compare like with like, field by field, and let the worst field decide.
+     print("\n================ VERDICT ================")
+-    print(f"  non-determinism floor (fresh_a vs fresh_b) : max|rel| = {floor:.6e}")
+-    print(f"  restart divergence    (fresh_a vs split)   : max|rel| = {restart:.6e}")
+-    if floor == 0.0 and restart == 0.0:
+-        print("  PASS — the code is deterministic here AND the restart is bit-identical.")
+-    elif floor == 0.0 and restart > 0.0:
+-        print("  FAIL — two fresh runs are bit-identical, so the code IS deterministic in this")
+-        print("         configuration, and the restart is therefore introducing a real difference.")
+-    elif restart <= max(floor * 10.0, floor):
+-        print("  PASS — restart divergence is within the non-determinism floor. Restart is as")
+-        print("         reproducible as this configuration allows; the point012 dt difference is")
+-        print("         explained by non-determinism plus chaotic amplification, not a defect.")
++    print(f"  {'field':12s} {'floor max|abs|':>16s} {'restart max|abs|':>18s} {'ratio':>11s}")
++    worst_ratio, worst_field = 0.0, None
++    for k in sorted(set(floor) & set(restart)):
++        f, r = floor[k], restart[k]
++        ratio = (r / f) if f > 0 else (np.inf if r > 0 else 1.0)
++        print(f"  {k:12s} {f:16.6e} {r:18.6e} {ratio:11.2e}")
++        if r > 0 and ratio > worst_ratio:
++            worst_ratio, worst_field = ratio, k
++    if worst_field is None:
++        print("\n  PASS — the restart is BIT-IDENTICAL to the fresh run in every field.")
++    elif worst_ratio <= 10.0:
++        print(f"\n  PASS — the worst field ({worst_field}) diverges only {worst_ratio:.2f}x beyond")
++        print("         the non-determinism floor. The restart is as reproducible as this")
++        print("         configuration allows.")
+     else:
+-        print(f"  FAIL — restart divergence exceeds the floor by {restart/max(floor,1e-300):.2f}x.")
++        print(f"\n  FAIL — {worst_field} diverges {worst_ratio:.2e}x beyond the non-determinism")
++        print("         floor, so this is a real restart defect and not GPU/MPI reduction order.")
++        if floor.get(worst_field, 0.0) == 0.0:
++            print("         (Its floor is EXACTLY zero: the code is deterministic in that field.)")
+     print("=========================================")
+ 
+ 
+diff --git a/runs/wp13b_gpu_restart/submit_wp13b.sh b/runs/wp13b_gpu_restart/submit_wp13b.sh
+index d418a67..fa32dea 100755
+--- a/runs/wp13b_gpu_restart/submit_wp13b.sh
++++ b/runs/wp13b_gpu_restart/submit_wp13b.sh
+@@ -42,7 +42,15 @@ export LD_LIBRARY_PATH=/sw/env/gcc-13.3.0_openmpi-5.0.7/pkgsrc/2025Q1/lib:$LD_LI
+ #   WP13B_DIFF  = diffusion/integrator   (rkl2 = production; unsplit = what WP-13 actually tested)
+ #   WP13B_NLIM  = final cycle            (60 = default; 31 = one step past the restart)
+ #   WP13B_SPLIT = restart cycle          (30)
++#   WP13B_DECK  = the input deck to test. DEFAULT (wp13_restart/straight/fhc.in) is the GRAY
++#                 radiation path -- it sets no `n_group`, so n_group=1 and MatterCoupling's
++#                 plain linearized Newton runs. The FLAGSHIP and all 69 production decks set
++#                 `n_group = 3`, which dispatches to MatterCouplingMultigroup and its SAFEGUARDED
++#                 rtsafe solve instead. Those are DIFFERENT SOLVERS, so a result on one says
++#                 nothing about the other; use ensemble/design01/point000/fhc_ens.in to test the
++#                 solver production actually runs.
+ R=${WP13B_DIR:-/beegfs/u/bbg6470/athenapk/runs/wp13b_gpu_restart}
++DECK=${WP13B_DECK:-/beegfs/u/bbg6470/athenapk/runs/wp13_restart/straight/fhc.in}
+ DIFFINT=${WP13B_DIFF:-rkl2}
+ NLIM=${WP13B_NLIM:-60}
+ SPLIT=${WP13B_SPLIT:-30}
+@@ -53,16 +61,22 @@ SPLIT=${WP13B_SPLIT:-30}
+ FREEZE=${WP13B_FREEZE:-true}
+ EXTRA=${WP13B_EXTRA:-}
+ mkdir -p $R/fresh_a $R/fresh_b $R/split
++DECKDIR=$(dirname $DECK)
+ for d in fresh_a fresh_b split; do
+-  cp -n /beegfs/u/bbg6470/athenapk/runs/wp13_restart/straight/fhc.in \
+-        /beegfs/u/bbg6470/athenapk/runs/wp13_restart/straight/units.json $R/$d/ 2>/dev/null
++  cp -n $DECK $R/$d/fhc.in 2>/dev/null
++  cp -n $DECKDIR/units.json $R/$d/ 2>/dev/null
+ done
+ cp -n /beegfs/u/bbg6470/athenapk/runs/wp13b_gpu_restart/wrap_mod.sh $R/ 2>/dev/null
+ cp -n /beegfs/u/bbg6470/athenapk/runs/wp13b_gpu_restart/compare_wp13b.py $R/ 2>/dev/null
+ # Same pinned binary the ensemble ran, so this statement covers the ensemble's own restarts.
+ BIN=/beegfs/u/bbg6470/athenapk/build_gpu/bin/athenaPK_PRESERVED_84a6d248
+ WRAP=$R/wrap_mod.sh
++# RAD_PRINT_NSUB / RAD_DISABLE_TRANSPORT are radiation_moments.cpp's own getenv diagnostics
++# (nsub = ceil(dt/dt_rad) is an INTEGER, so it is a candidate discrete branch across a restart).
++# They must be forwarded explicitly: mpirun does not inherit the submitter's environment.
+ MCA="--mca mtl ^psm2 --mca btl tcp,self,sm -x LD_LIBRARY_PATH -x PMIX_MCA_gds -x OMP_NUM_THREADS -x OMPI_MCA_io -x TMPDIR"
++[ -n "$RAD_PRINT_NSUB" ] && MCA="$MCA -x RAD_PRINT_NSUB"
++[ -n "$RAD_DISABLE_TRANSPORT" ] && MCA="$MCA -x RAD_DISABLE_TRANSPORT"
+ # Production physics flags, verbatim from runs/ensemble/submit_point.sh. output2/dn=30 puts a
+ # restart file exactly at the split point; output1/dn=100000 leaves only the final phdf, which is
+ # the artifact being compared.
+diff --git a/src/bvals/boundary_conditions_apk.hpp b/src/bvals/boundary_conditions_apk.hpp
+index 853b89d..c457485 100644
+--- a/src/bvals/boundary_conditions_apk.hpp
++++ b/src/bvals/boundary_conditions_apk.hpp
+@@ -139,6 +139,29 @@ void DiodeBC(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse) {
+             : (X1 ? IndexDomain::outer_x1
+                   : (X2 ? IndexDomain::outer_x2 : IndexDomain::outer_x3));
+ 
++  // WP-13b (2026-08-08). FIRST do the plain zero-gradient copy for EVERY variable, exactly as
++  // Parthenon's stock `outflow` does (same GenericBC, same variable_names::any pack); THEN apply
++  // the diode momentum clamp to `cons` below.
++  //
++  // WHY. This function used to pack ONLY "cons", so with `ix1_bc = diode` the domain-boundary
++  // ghost zones of every OTHER FillGhost field -- in particular all of the M1 radiation moments
++  // rad.Er / rad.Fr1..3 and their per-group copies -- were never written by any boundary
++  // condition at all. A FRESH run got away with it because the problem generator initialises the
++  // whole array, ghosts included, so ghost ~ interior and the face flux stays ~1e-4. A RESTART
++  // does not: restart files store INTERIOR cells only, so the ghosts came up zero-initialised and
++  // the first CalculateRadFluxes after the restart saw a full-amplitude jump across the domain
++  // face. Measured on the flagship deck (job 2491776, ensemble point000, 4xH100, 31 cycles):
++  // restart-vs-fresh differed by 7.41e+01 in rad.Fr1/2/3 against a non-determinism floor of
++  // 8.6e-09 (1e10x), confined EXACTLY to the outermost meshblock layer, and predicted by
++  // chat*Er/2 = 1578*0.104/2 ~ 79. With the radiation package off the same test passes at the
++  // floor, and nsub, block ordering and the restart file were all separately exonerated.
++  // This reaches the flagship and all 24 ensemble members: every one uses `diode` + radiation.
++  //
++  // The cons path is UNCHANGED -- the same copy from the same reference cell, then the same
++  // clamp -- so a radiation-free run is bit-identical to before this fix.
++  parthenon::BoundaryFunction::GenericBC<DIR, SIDE, parthenon::BoundaryFunction::BCType::Outflow,
++                                         parthenon::variable_names::any>(mbd, coarse);
++
+   auto cons = mbd->PackVariables(std::vector<std::string>{"cons"}, coarse);
+   const bool fine = false;
+ 
+diff --git a/src/radiation/radiation_moments.cpp b/src/radiation/radiation_moments.cpp
+index 4699aad..3fe435b 100644
+--- a/src/radiation/radiation_moments.cpp
++++ b/src/radiation/radiation_moments.cpp
+@@ -248,6 +248,26 @@ Real MGResidual(const Real Tt, const Real rho, const Real kdust, const Real arad
+   return (e - e0_ref) - c / chat * S;
+ }
+ 
++//----------------------------------------------------------------------------------------
++//! GRAY gas energy-balance residual R(T), radiation energy eliminated analytically. This is
++//! MGResidual specialised to one group (PlanckFraction == PlanckMult == 1), written as its own
++//! free function so the gray kernel does not have to carry the RadGroups/GroupOpacityTable
++//! objects it otherwise never touches:
++//!     E^new = (E0 + a B)/(1 + a),  a = chat dt rho kappa_P(T) kdust,  B = arad T^4
++//!     R(T)  = [e(T) - e0] - (c/chat) a (E0 - B(T)) / (1 + a)
++//! MONOTONICALLY INCREASING in T (e(T) rises; B rises so -(E0-B) rises), so a bracketed method
++//! on it is guaranteed to converge. Used ONLY as the non-convergence fallback below.
++KOKKOS_INLINE_FUNCTION
++Real GrayResidual(const Real Tt, const Real rho, const Real kdust, const Real arad,
++                  const Real chat, const Real c, const Real dt, const Real gm1,
++                  const Real T_unit, const bool use_h2, const EOSTable::EosTable &eos_tab,
++                  const OpacityParams &op, const Real Er0, const Real e0_ref) {
++  const Real e = use_h2 ? eos_tab.EintFromRhoTk(rho, Tt * T_unit) : rho * Tt / gm1;
++  const Real B = arad * Tt * Tt * Tt * Tt;
++  const Real a = chat * dt * rho * PlanckOpacity(op, rho, Tt) * kdust;
++  return (e - e0_ref) - c / chat * a * (Er0 - B) / (1.0 + a);
++}
++
+ //----------------------------------------------------------------------------------------
+ //! Implicit MULTIGROUP matter coupling (n_group>1). One matter temperature T couples to all
+ //! groups: group g emits B_g = arad*T^4*PlanckFraction(g,T) and absorbs at a_g = chat*dt*rho*
+@@ -528,6 +548,9 @@ TaskStatus MatterCoupling(MeshData<Real> *md, const Real dt) {
+   const Real efloor = pkg->Param<Real>("efloor");
+   const int inner_max = pkg->Param<int>("inner_iteration_max");
+   const Real inner_tol = pkg->Param<Real>("inner_iteration_tol");
++  // Upper bracket for the WP-13b non-convergence fallback (code T), capped inside the
++  // tabulated EOS/opacity range exactly as the multigroup path caps it.
++  const Real coupling_tmax = pkg->Param<Real>("coupling_tmax");
+   const Real Bfloor = arad * tfloor * tfloor * tfloor * tfloor;
+   // Tabulated-EOS coupling: map gas internal-energy DENSITY e <-> code temperature T via
+   // the shared table instead of the ideal e=rho*T/gm1. T (code) = T_phys[K]/T_unit.
+@@ -651,6 +674,48 @@ TaskStatus MatterCoupling(MeshData<Real> *md, const Real dt) {
+         }
+         if (!conv) lnfail += 1; // audit #6: non-silent non-convergence
+ 
++        // WP-13b (2026-08-08): BRACKETED FALLBACK for the cells the Newton above did not
++        // converge. Without it those cells wrote "the last iterate", which is not a function of
++        // the cell's state at all -- it is wherever the stalled iteration happened to be, so a
++        // last-bit change in the input moves it by a FINITE amount. That is the whole mechanism
++        // behind WP-13b's restart divergence: with `radiation/inner_iteration_tol` loosened so
++        // that every cell converged, restart rad.Er divergence fell from 1.7743e-02 to 2.5975e-12
++        // (6.8e9x) at fixed gravity perturbation, while raising `inner_iteration_max` 100 -> 5000
++        // changed nothing bit-for-bit (the iteration is STALLED, not slow).
++        //
++        // Pure bisection on the monotone gray residual: guaranteed to converge, no derivative,
++        // and -- unlike the Newton -- its answer depends only on (rho, e0, Er0, dt). Cells that
++        // already converged are untouched, so this is BIT-IDENTICAL wherever `conv` is true;
++        // only the previously-garbage cells change, and they change to the actual root.
++        // Mirrors what MatterCouplingMultigroup already does via rtsafe; the gray path had been
++        // left on the bare Newton.
++        if (!conv) {
++          Real Tlo = tfloor, Thi = coupling_tmax;
++          if (Thi <= Tlo) Thi = 1.0e5; // ideal EOS: no table cap
++          auto Rof = [&](const Real Tt) {
++            return GrayResidual(Tt, rho, kdust, arad, chat, c, dt, gm1, T_unit, use_h2, eos_tab,
++                                op, Er0, e0_ref);
++          };
++          const Real Rlo = Rof(Tlo), Rhi = Rof(Thi);
++          // Only solve when the root is actually bracketed; otherwise clamp to the end the
++          // monotone residual points at, which is what the multigroup path does too.
++          if (Rlo >= 0.0) {
++            T = Tlo;
++          } else if (Rhi <= 0.0) {
++            T = Thi;
++          } else {
++            // FIXED iteration count, no early exit: on GPU a warp runs until its slowest lane
++            // finishes, so a fixed count is both faster and divergence-free. 80 bisections take
++            // the bracket below the double round-off of any T in range.
++            for (int it = 0; it < 80; ++it) {
++              const Real Tm = 0.5 * (Tlo + Thi);
++              if (Rof(Tm) < 0.0) Tlo = Tm; else Thi = Tm;
++            }
++            T = 0.5 * (Tlo + Thi);
++          }
++          B = std::max(arad * T * T * T * T, Bfloor);
++        }
++
+         // Gas internal-energy change from the converged temperature.
+         T = std::pow(B / arad, 0.25);
+         const Real dEg = (use_h2 ? eos_tab.EintFromRhoTk(rho, T * T_unit)

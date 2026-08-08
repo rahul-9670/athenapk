@@ -158,14 +158,33 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                     "radiation/planck_ross_ratio must be > 0.");
   // Regime-skip-robust Bell&Lin walk (default false = bit-identical; fixes the off-track
   // low-rho/high-T kappa discontinuity). Only meaningful for opacity_model=belllin.
+  // Default flipped false -> true 2026-08-08; see OpacityParams in radiation_opacity.hpp for the
+  // measurement. Bit-identical below ~100 K (the whole ensemble epoch); up to 8.59 decades of
+  // kappa error avoided once the run is hot at low density.
   op.bell_lin_fix_regime_skip =
-      pin->GetOrAddBoolean(bn, "bell_lin_fix_regime_skip", false);
+      pin->GetOrAddBoolean(bn, "bell_lin_fix_regime_skip", true);
   // Tabulated model: load the offline frequency-resolved gray magnitude table (true Planck +
   // Rosseland means; self-consistent, replacing the planck_ross_ratio fudge). The per-group
   // multipliers from the SAME file feed GroupOpacityTable below.
+  // AUDIT N13, DEFAULT CORRECTED 2026-08-08. This default used to be `opacity_table.bin`, which
+  // is a LEGACY v1 file: kappa stored in the generator's own rounded code units. Measured on the
+  // two files directly (all three arrays kP/kR/ks, every one of 60x120 = 7200 nodes, min == max):
+  // v1 is UNIFORMLY +0.13538 % larger than what this run's opacity_unit gives, because the
+  // generator hardcoded rho0 = 5.467e-19 and l0 = 2.81e16 (product 0.01536227) where the exact
+  // BE normalization gives 0.0153415. The two files are otherwise the SAME PHYSICS: v1 divided by
+  // (v2_cgs x the generator's unit) is 1.0000000000 to ten digits, so this switch changes that one
+  // factor and nothing else.
+  //
+  // The production decks (root_ladder/fhc_rootladder.in:203 and all 24 ensemble members) already
+  // name opacity_table_v2.bin explicitly and were never affected. The hazard this fixes is the
+  // SILENT one: a new deck that sets `opacity_model = tabulated` without naming a file inherited
+  // the biased table with nothing in the deck to show it. 28 older decks (wp1_sts, wp2_creduc,
+  // wp18_seed_ensemble, prod_flagship_test, convergence_ladder) still name the v1 file EXPLICITLY
+  // and are deliberately left alone -- they are completed harnesses whose results must stay
+  // reproducible, and their explicit path still resolves to the same file it always did.
   const std::string opac_table_file = pin->GetOrAddString(
       bn, "opacity_table_file",
-      "/beegfs/u/bbg6470/athenapk/src/radiation/opacity_table.bin");
+      "/beegfs/u/bbg6470/athenapk/src/radiation/opacity_table_v2.bin");
   if (op.model == OpacityModel::tabulated) {
     // AUDIT N13 (2026-08-05), FIXED. A v2 table stores kappa in cgs and Load() converts it
     // with THIS run's opacity_unit, so the file is independent of any particular IC. A legacy

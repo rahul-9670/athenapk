@@ -234,3 +234,66 @@ should be retired as a convergence metric in favour of the split dissipation bud
 - Guidance item 1 above ("use `mag-dissO-hi/lo`, not the global") remains sound but is now known to
   be *insufficient on its own*: report `f_eff` per bin, and treat any bin with f_eff ≲ 1e-3 as a
   point sample regardless of which side of the split it is on.
+
+---
+
+# 2026-08-08 — the current-sheet split, implemented
+
+**Status: the remedy the 2026-08-06 reopening ASKED FOR is now in the code. It is a diagnostic
+addition, not a physics change; the OFF state is bit-identical.**
+
+The reopening ended with a specific instruction: *"`Jsq` needs a split on a current-sheet
+indicator, not on density — or it should be retired as a convergence metric."* Density cannot work
+for `Jsq` by construction, because `Jsq`'s pathological concentration sits **below** the density
+threshold (the low-density bin carries 97–99 % of the integral at f_eff ~ 1e-7, i.e. `Jsq-lo` is
+the original pathology renamed).
+
+## What was added
+
+A second, independent split on the **dimensionless grid-scale current**
+
+> s = |J| · dx_min / |B|
+
+= the fraction of the local field that reverses across one cell. `s → 1` means B flips over a
+single zone: the current is at the grid scale, and is a resolution artefact as much as a physical
+structure. `s ≪ 1` means a current spread over many cells — a resolved sheet. This is the right
+variable precisely because it is measured **in units of the grid**, which is the thing that changes
+between ladder rungs; density is blind to it.
+
+| column | meaning |
+|---|---|
+| `mag-Jsq-sheet` | ∫\|J\|²dV over cells with s > `hydro/mag_diag_sheet_thresh` |
+| `mag-Jsq-smooth` | ∫\|J\|²dV over cells with s ≤ threshold |
+| `mag-Vsheet` | volume carrying `mag-Jsq-sheet` |
+| `mag-Jsqsq` | ∫\|J\|⁴dV |
+
+`dx_min = min(dx,dy,dz)`, so on an anisotropic cell the indicator reports the most grid-limited
+direction rather than an average that could hide it. Cells with `|B| = 0` and `J ≠ 0` count as
+sheet: s is then formally infinite, and a current with no field is a pure grid artefact.
+
+## Why `mag-Jsqsq` matters on its own
+
+Until now **`Jsq` had no `sq` companion**, unlike `dissO` and `dissA`. So `f_eff(Jsq)` could not be
+formed from the history file at all — the 2026-08-06 test had to recompute it offline from 986 GB
+of ladder snapshots, which is why that test could be run exactly once and only for `Jsq`. With this
+column,
+
+> f_eff(Jsq) = `mag-Jsq`² / (V_box · `mag-Jsqsq`)
+
+is available on **every history row, for free, in every run**. The pathology that took a dedicated
+offline campaign to measure is now a column.
+
+## Gating
+
+`hydro/mag_diag_sheet_thresh`, default **0 = OFF**, registers no columns — same discipline as the
+density split, so `maxRelDivB` does not move and every existing analysis script and on-disk history
+file stays valid. Registered **outside** the `have_eta` block on purpose: `Jsq` needs only B and the
+grid, so an ideal run can measure it too. Suggested value 0.1–0.3 (s ≥ 0.3 ⇒ B turns over in ~3
+cells).
+
+## What is still open
+
+Unchanged: the split has **not** been applied to `dissO`/`dissA` on the ladder, which needs either a
+ladder re-run with `mag_diag_rho_split` enabled and `nonideal_eta` in the output list, or the
+snapshots regenerated with that field. The current-sheet columns are likewise **implemented and
+gated but not yet measured on the ladder** — this entry claims the instrument, not a result.

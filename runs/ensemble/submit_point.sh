@@ -78,7 +78,24 @@ OUT_DN="${OUT_DN:-50}"
 # with the ones still running -- with nothing in the output to show it happened.
 # 84a6d248 = 0d3a559 (multigroup + tabulated + rtsafe + the 2026-08-05/06 audit batch, incl. the
 # N3 restart fix). Provenance frozen in docs/provenance/binary_84a6d248/.
-BIN=/beegfs/u/bbg6470/athenapk/build_gpu/bin/athenaPK_PRESERVED_84a6d248
+#
+# BINARY SWAPPED 2026-08-08: 84a6d248 -> 967fced6 (= commit 6236df4, provenance frozen in
+# docs/provenance/binary_967fced6/). REASON: WP-13b found that `DiodeBC` packed only "cons", so
+# the M1 radiation moments rad.Er/rad.Fr1..3 had NO domain boundary condition at all. Restart
+# files store INTERIOR cells only, so every restart in this campaign resumed with ZEROED
+# radiation ghosts; measured restart-vs-fresh divergence on THIS deck (point000, job 2491776)
+# was 7.41e+01 in rad.Fr1/2/3 against a non-determinism floor of 8.6e-09. Every one of the 24
+# members uses `diode` + radiation, so every member is affected. See
+# docs/validation/WP13b_restart_gpu_amr.md.
+#
+# CONSEQUENCE YOU MUST NOT FORGET. The fix is also RESULT-CHANGING for a FRESH run (stale pgen
+# ghosts are not a boundary condition either): old-vs-fixed at 31 cycles gives Er_tot +5.5e-05,
+# mass -7e-10, KE -1.5e-06. So a member RESUMED from a 84a6d248 restart with this binary has a
+# two-binary history. 19/24 members ended clean (out2.final.rhdf); point001/002/005/021/022/023
+# were still mid-chain. Resuming those six here mixes binaries within one member. The clean
+# answer for them is a FRESH re-run, which is compute nobody has authorised yet -- decide that
+# before resuming them, and do not silently pair pre- and post-swap epochs of the same member.
+BIN=${BIN:-/beegfs/u/bbg6470/athenapk/build_gpu/bin/athenaPK_PRESERVED_967fced6}
 WRAP=$PDIR/wrap_mod.sh
 MCA="--mca mtl ^psm2 --mca btl tcp,self,sm -x LD_LIBRARY_PATH -x PMIX_MCA_gds -x OMP_NUM_THREADS -x OMPI_MCA_io -x TMPDIR"
 MAX_CHAIN=30; PY=/beegfs/u/bbg6470/venvs/analysis_env/bin/python; RHO0=5.467e-19

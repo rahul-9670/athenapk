@@ -1,0 +1,52 @@
+diff --git a/docs/validation/WP07_root_grid_ladder.md b/docs/validation/WP07_root_grid_ladder.md
+index bbbe287..090ab62 100644
+--- a/docs/validation/WP07_root_grid_ladder.md
++++ b/docs/validation/WP07_root_grid_ladder.md
+@@ -143,3 +143,47 @@ re-read at t ≈ 0.90.** Already applied to WP-2, where it strengthened the resu
+ (+0.49 % at the endpoint → **+0.003 %** at t = 0.90). Production itself is unaffected — it runs
+ AMR, which is precisely the instrument the uniform ladder lacks — but every *study* built on this
+ deck inherits the artifact.
++
++---
++
++## 5. ADDENDUM 2026-08-06 — the absolute energies ARE converged; the failure is an epoch, not the ladder
++
++A parallel record (the 2026-08-06 completion note) reported `ME p = 0.54`, `KE p = 0.29`,
++`tot-E p = 0.22` and concluded *"do NOT quote a converged flux-retention number off this ladder."*
++Those orders are correct **but they are measured at t = 1.0** — the same singular stall at which
++§2 already rules the well-behaved ratio observable unusable (p = 0.21, residual 45.6 %). Read at
++one epoch, the two records look contradictory; read across time they are the same fact.
++
++`docs/validation/scripts/wp7_time_resolved_convergence.py` recomputes the observed order for the
++**absolute** observables at matched time (linear interpolation in `t`, since the three legs take
++different steps). It first reproduces §2's published `MEtor/MEpol` column — 1.21 / 1.14 / 1.15 /
++1.33 / 1.56 / 1.63 / 1.16 / 0.21 against the table's 1.21 / 1.14 / 1.14 / 1.32 / 1.54 / 1.60 /
++1.16 / 0.21 — so the estimator is the same one, not a new convention.
++
++**`p` alone is the wrong metric here, and reading it alone is what produced the pessimistic
++verdict.** `p = log₂(|Δ₁|/|Δ₂|)` is a ratio of two differences; when both are at noise level it
++returns nan, negative values, or 3.07 with no physical content. At t = 0.6–0.8 the residuals are
++0.00–0.09 %, and `p` is duly meaningless there. What bounds the discretization error is the
++Richardson estimate `err₅₁₂ ≈ |v₅₁₂ − v₂₅₆| / (2^p − 1)`, which uses residual and order together:
++
++| t | mass | ME | KE | tot-E |
++|---|---|---|---|---|
++| 0.20 | 0.01 % | 0.01 % | 0.22 % | 0.00 % |
++| 0.90 | 0.02 % | 0.00 % | 0.01 % | 0.00 % |
++| 0.95 | 0.03 % | 0.01 % | 0.09 % | 0.03 % |
++| 0.98 | 0.03 % | 0.11 % | 0.72 % | 0.36 % |
++| **1.00** | 0.03 % | **1.06 %** | **13.27 %** | **11.32 %** |
++
++(entries where `p` is unusable are reported in the script as a bare-residual lower bound, flagged)
++
++**Conclusion.** Through **t ≤ 0.95** every absolute energy is converged to **≤ 0.09 %**, and mass
++to 0.03 % across the whole run. The non-convergence is confined to the final ~2 % of the
++integration, where low `p` and a non-trivial residual combine — worst for KE at 13.3 %. The
++correct statement is therefore an **epoch restriction (read at t ≤ 0.95, as §2 already required
++for the ratio), not a rejection of the ladder.** The blanket warning is superseded.
++
++**What this does NOT license.** It does not make `mag-Jsq` quotable (§2: diverging under
++refinement, ×2.66/×2.84), it does not extend to the AMR flagship (this ladder is three *uniform*
++legs), and it says nothing about a flux-retention value measured *at* the singularity — which is
++precisely the epoch that fails. A flux-retention claim must be read at a matched pre-singular
++epoch and carry the errors above.

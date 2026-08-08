@@ -28,6 +28,11 @@ Real MagDiagReduce(MeshData<Real> *md, MagDiag which) {
   const Real rho_split =
       md->GetBlockData(0)->GetBlockPointer()->packages.Get("Hydro")->Param<Real>(
           "mag_diag_rho_split");
+  // WP-8 current-sheet split (2026-08-08). Dimensionless threshold on s = |J|*dx/|B|; see the
+  // header. 0 (the default) means these columns are never registered, so this is inert then.
+  const Real sheet_thresh =
+      md->GetBlockData(0)->GetBlockPointer()->packages.Get("Hydro")->Param<Real>(
+          "mag_diag_sheet_thresh");
   // Dummy-alias to `prim` when unused: PackVariables on a field that is not registered
   // would throw, and the lambda must still capture *something*.
   const auto &eta =
@@ -117,6 +122,36 @@ Real MagDiagReduce(MeshData<Real> *md, MagDiag which) {
             const bool hi = w(IDN, k, j, i) > rho_split;
             if (hi == (which == MagDiag::dissAhi)) lsum += q * dV;
           }
+          return;
+        }
+
+        // --- WP-8 current-sheet split ----------------------------------------------------
+        // s = |J| * dx_min / |B| = the fraction of the local field that reverses across one
+        // cell. The MINIMUM of the three spacings is used so that on an anisotropic cell the
+        // indicator reports the most grid-limited direction rather than an average that could
+        // hide it. Unlike the density split, this separates the pathological grid-scale part
+        // of Jsq by construction -- that part lives in the diffuse ENVELOPE, which is exactly
+        // where a density threshold puts everything in one bin.
+        if (which == MagDiag::Jsqsheet || which == MagDiag::Jsqsmth ||
+            which == MagDiag::Vsheet) {
+          const Real bmag = std::sqrt(bx * bx + by * by + bz * bz);
+          // Ternary rather than std::fmin: this lambda is compiled for the CUDA device by
+          // nvcc_wrapper, and the CPU build cannot catch a host-only std:: overload. The
+          // surrounding code sticks to std::sqrt/std::pow, which nvcc does map; fmin is not
+          // worth the risk for a two-way minimum.
+          const Real dmin = (dx < dy ? (dx < dz ? dx : dz) : (dy < dz ? dy : dz));
+          // |B| == 0 with J != 0 is a pure grid artefact, so it counts as sheet (s = inf).
+          const bool sheet =
+              (bmag > 0.0) ? (std::sqrt(Jsq) * dmin / bmag > sheet_thresh) : (Jsq > 0.0);
+          if (which == MagDiag::Vsheet) {
+            if (sheet) lsum += dV;
+          } else if (sheet == (which == MagDiag::Jsqsheet)) {
+            lsum += Jsq * dV;
+          }
+          return;
+        }
+        if (which == MagDiag::Jsqsq) {
+          lsum += Jsq * Jsq * dV; // int |J|^4 dV -- gives f_eff(Jsq); see the header
           return;
         }
 

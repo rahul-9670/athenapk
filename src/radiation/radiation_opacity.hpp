@@ -153,11 +153,30 @@ struct OpacityParams {
   // => bit-identical to the pre-split single-opacity behavior. A full (log rho, log T) ->
   // (kappa_P, kappa_R) table (Semenov et al. 2003) is the follow-on increment.
   Real planck_ross_ratio = 1.0;
-  // Regime-skip-robust Bell&Lin walk (fixes the low-rho/high-T kappa discontinuity). Default
-  // false -> the plain walk (bit-identical to the shipped behavior AND to the fixed walk on the
-  // collapse track; the two differ only in the off-track low-rho/high-T corner). Opt in via
-  // <radiation> bell_lin_fix_regime_skip = true.
-  bool bell_lin_fix_regime_skip = false;
+  // Regime-skip-robust Bell&Lin walk (fixes the low-rho/high-T kappa discontinuity).
+  //
+  // DEFAULT FLIPPED false -> true, 2026-08-08. The old comment justified `false` by saying the
+  // two walks are identical "on the collapse track", quoting rho >= 1e-10 g/cm^3. That bound is
+  // real but it describes the WRONG DOMAIN: this problem has rho0 = 5.467e-19 g/cm^3 and
+  // rhocrit = 1e-13, so the flagship lives at rho ~ 1e-21 .. 1e-12 -- entirely BELOW the range
+  // over which the walks were checked to agree. The agreement was never evidence about this run.
+  //
+  // Re-measured over the domain the flagship actually occupies (both walks evaluated directly,
+  // 121x121 log grids):
+  //   rho 1e-21..1e-13, T   5..100 K  (pre-first-core; the ENTIRE ensemble epoch)  0/14641 differ
+  //   rho 1e-21..1e-12, T   5..2000 K (through first core)      3/14641 = 0.02 %, worst 0.09 dex
+  //   rho 1e-21..1e-10, T   5..1e4 K  (into second core)     1442/14641 = 9.85 %, worst 8.59 dex
+  //                                                          (plain 0.348 vs fixed 8.87e-10)
+  // So `true` is BIT-IDENTICAL for everything measured to date, and prevents an up-to-8.6-decade
+  // kappa error the moment a run gets hot at low density -- which is precisely where the flagship
+  // is headed. Making the correct branch the default is therefore free today and load-bearing
+  // later; leaving it opt-in meant 148 belllin decks and 0 of them setting it.
+  //
+  // Canonical values are preserved by the fixed walk: 0.02 @ 10 K, 2.0 @ 100 K, 0.348 e-scattering.
+  // The tabulated model is unaffected either way -- gen_opacity_table.py already bakes in the
+  // fixed walk, so `opacity_model = tabulated` (the flagship) never used the plain one.
+  // Set <radiation> bell_lin_fix_regime_skip = false to reproduce the historical behaviour.
+  bool bell_lin_fix_regime_skip = true;
   // model == tabulated: gray kappa_P/kappa_R/kappa_s come from this device table (frequency-
   // resolved dust+gas physics precomputed offline). Inactive for the other models (View handles
   // default-constructed, never dereferenced). This gives a SELF-CONSISTENT Planck mean (not the
