@@ -980,15 +980,29 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       // unmaintained deck, not an intentional choice. Warn loudly rather than degrade quietly.
       // Not a hard failure: the coarse table is legitimate for smoke tests and cheap gates.
       const bool tabfile_given = pin->DoesParameterExist("hydro", "eos_table_file");
+      // DEFAULT CORRECTED 2026-08-08, exactly as for the opacity table (audit N13): this pointed
+      // at eos_table.bin, a LEGACY v1 file whose axes and arrays are in the generator's own
+      // rounded code units. The runtime warning quantifies the error it causes -- measured on the
+      // gate deck: "rho0 = 5.467e-19 vs this run's rho_unit = 5.46683e-19, rel diff 3.14915e-05,
+      // so the table is consulted at slightly wrong (rho, esp)". eos_table_v2.bin is the SAME
+      // TABLE stored in cgs, converted by Load() with the run's own units, so it is correct for
+      // any normalization. Verified v2 by magic: first int64 == 0x454F535441424C31 ("EOSTABL1").
+      //
+      // The production decks were never affected -- root_ladder/fhc_rootladder.in:91 and all 24
+      // ensemble members name eos_table_hires_v2.bin explicitly. This closes the SILENT path, the
+      // one where a deck that omits the key inherits a biased table with nothing in the deck to
+      // show it. Paired with the opacity default in radiation.cpp; changing one without the other
+      // would leave half the hazard open.
       const auto tabfile = pin->GetOrAddString(
           "hydro", "eos_table_file",
-          "/beegfs/u/bbg6470/athenapk/src/eos/eos_table.bin");
+          "/beegfs/u/bbg6470/athenapk/src/eos/eos_table_v2.bin");
       if (!tabfile_given) {
         PARTHENON_WARN(
             "<hydro> eos_table_file was not set, so eos=hydrogen is falling back to the COARSE "
-            "built-in table (src/eos/eos_table.bin, 180x220x200). Measured interpolation error "
-            "vs eos_table_hires.bin: 8.3% p99 / 37.6% max in cs^2. This is FINE for smoke tests "
-            "and NOT fine for production -- set eos_table_file=.../src/eos/eos_table_hires.bin.");
+            "built-in table (src/eos/eos_table_v2.bin, 180x220x200). Measured interpolation error "
+            "vs the hires table: 8.3% p99 / 37.6% max in cs^2. This is FINE for smoke tests "
+            "and NOT fine for production -- set "
+            "eos_table_file=.../src/eos/eos_table_hires_v2.bin.");
       }
       // AUDIT N14 (2026-08-05), FIXED. A v2 table stores axes and arrays in cgs and Load()
       // converts them with THIS run's units, so the file is independent of any particular IC.
@@ -1994,8 +2008,22 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                       pin->GetOrAddReal("hydro", "mag_diag_rho_split", 0.0));
   // WP-8 REOPENED: the CURRENT-SHEET threshold on s = |J|*dx_min/|B| (DIMENSIONLESS -- the
   // fraction of the local field that reverses across one cell). 0 = OFF, no extra columns, so
-  // the OFF state stays bit-identical exactly as for the density split. Sensible value ~0.1-0.3:
-  // s >= 0.3 means B turns over in ~3 cells, which is the grid-scale limit.
+  // the OFF state stays bit-identical exactly as for the density split.
+  //
+  // SENSIBLE VALUE: 0.05-0.1. This originally said "~0.1-0.3"; that was MEASURED WRONG the same
+  // day. On the njeans ladder at the matched epoch (rho_max = 1e-12), a threshold of 0.3 selects
+  // 0.49 % of Jsq at nj4 and **exactly 0 %** at nj8 and nj16 -- a run configured with 0.3 would
+  // emit an empty mag-Jsq-sheet column and a mag-Jsq-smooth identical to the global, i.e. a null
+  // diagnostic that looks like a working one. Only 0.1 discriminates at production resolution,
+  // and even it falls to 1.12 % by nj16. The coarse A_multipole smoke deck DOES populate the
+  // sheet bin at 0.3 (5.67 of 7.72), which is precisely how a threshold that fails at production
+  // resolution passes a smoke test.
+  //
+  // WHAT THE SPLIT ACTUALLY SHOWED (docs/validation/WP08_dissipation_nonconvergence.md): it does
+  // NOT restore convergence -- no bin converges, so WP-8 stays open -- but the share of Jsq
+  // carried by grid-scale current collapses 83.22 % -> 15.65 % -> 1.12 % across the ladder, which
+  // is what a NUMERICAL current sheet does. That is the diagnostic's real value: it measures how
+  // much of Jsq is mesh artefact, not how to make Jsq converge.
   //
   // WHY A SECOND SPLIT. The density split was designed from a smoke-deck measurement showing
   // 89.6 % of dissO above rho = 1 code, and it works for dissO (eta_O-weighted => core-

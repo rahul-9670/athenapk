@@ -19,8 +19,16 @@
 > (t = 0 and one restart row). They must be filtered; including them makes the reported minimum
 > nonsensical, which the first pass of this analysis did.*
 
-**Status: instrument IMPLEMENTED + gated; invariance sweep PASSED at smoke scale.
-Deep-leg measurement still open (GPU-blocked). 2026-07-31.**
+**Status: CLOSED — PASS. Instrument implemented + gated, invariance sweep passed at smoke scale,
+and the deep-leg measurement was taken at production depth on 2026-08-04 (job 2453201; see the
+banner above). 2026-08-08.**
+
+> *Header corrected 2026-08-08. It previously read "Deep-leg measurement still open
+> (GPU-blocked). 2026-07-31." — which was already false when the 2026-08-04 banner was added
+> directly above it: that banner IS the deep-leg measurement (0 non-convergence events over 202
+> solves, 64 → 792 blocks, 6 % of the iteration budget). A reader who trusted the Status line
+> would have concluded WP-5 was outstanding and re-run a GPU campaign that had already been done.
+> When a result is appended to a doc, the status line is part of the result.*
 Source pair: `docs/provenance/binary_5ebddce0/` + the WP-5 diff (uncommitted, see below).
 
 ## The problem, confirmed at source

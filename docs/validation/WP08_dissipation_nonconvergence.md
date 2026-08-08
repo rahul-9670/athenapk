@@ -297,3 +297,64 @@ Unchanged: the split has **not** been applied to `dissO`/`dissA` on the ladder, 
 ladder re-run with `mag_diag_rho_split` enabled and `nonideal_eta` in the output list, or the
 snapshots regenerated with that field. The current-sheet columns are likewise **implemented and
 gated but not yet measured on the ladder** — this entry claims the instrument, not a result.
+
+---
+
+# 2026-08-08 (later) — the current-sheet split MEASURED on the ladder: it does NOT restore convergence
+
+**Status: NEGATIVE RESULT, reported as such. The split I added earlier today does not fix `Jsq`'s
+convergence. It does deliver the sharpest evidence yet about WHY, and it invalidates the threshold
+I recommended in the code.**
+
+`docs/validation/scripts/wp8_sheet_convergence.py`, matched epoch rho_max = 1e-12 g/cm^3, computed
+offline from the existing ladder snapshots (same stencil, same interior-only differencing, same
+epoch selection as `wp8_split_convergence.py`, so the two are directly comparable).
+**Script validated:** it reproduces the published global numbers exactly, -52.3 % / -39.3 %.
+
+| bin | nj4 share / f_eff | nj8 | nj16 | nj4→nj8 | nj8→nj16 |
+|---|---|---|---|---|---|
+| global | 100 % / 1.14e-07 | 100 % / 1.38e-07 | 100 % / 3.10e-07 | -52.3 % | -39.3 % |
+| `rho_hi` | 2.58 % / 5.74e-01 | 1.03 % / 4.65e-01 | 2.14 % / 6.42e-01 | -80.9 % | **+25.6 %** |
+| `rho_lo` | 97.42 % / 1.11e-07 | 98.97 % / 1.37e-07 | 97.86 % / 3.30e-07 | -51.6 % | -39.9 % |
+| `sheet@0.1` | **83.22 %** / 6.14e-06 | **15.65 %** / 1.54e-06 | **1.12 %** / 1.60e-06 | -91.0 % | -95.7 % |
+| `smooth@0.1` | 16.78 % / 3.59e-08 | 84.35 % / 1.18e-07 | 98.88 % / 3.08e-07 | +139.6 % | -28.8 % |
+| `sheet@0.3` | 0.49 % | **0 %** | **0 %** | — | — |
+| `smooth@0.3` | 99.51 % | 100 % | 100 % | -52.1 % | -39.3 % |
+
+## Three things this settles
+
+**1. The split does not rescue `Jsq`.** No bin converges. `sheet@0.1` falls 91 % then 96 %;
+`smooth@0.1` is not even monotone (+139.6 %, then -28.8 %); `smooth@0.3` simply reproduces the
+global result to within 0.2 percentage points because its sheet bin is empty. Every bin except
+`rho_hi` still has f_eff <= 3e-07, i.e. is still a point sample. **WP-8's convergence failure
+remains OPEN.** The instrument is not the remedy it was proposed as.
+
+**2. But it identifies the mechanism, which the density split never did.** The share of `Jsq`
+carried by grid-scale current collapses monotonically with refinement:
+
+> **83.22 % → 15.65 % → 1.12 %**, roughly two decades over two rungs.
+
+That is what a *numerical* current sheet does: it is a feature of the mesh, and it resolves away.
+The complementary `smooth` bin grows 16.78 % → 84.35 % → 98.88 %. So the non-convergence of the
+global `Jsq` is now attributable: at coarse resolution the integral is dominated by grid-scale
+current that does not survive refinement, and the global number is tracking the disappearance of
+that artefact rather than converging to a physical value. This is a much more specific statement
+than "the integral is concentrated", and it is the first direct evidence for it.
+
+**3. The threshold I put in the code is WRONG for production resolution.** `mag_diag_sheet_thresh`
+is documented in `hydro.cpp` as "sensible value ~0.1-0.3". At the ladder's production resolution
+**0.3 selects nothing at all** (0.49 % at nj4, then exactly 0 %), so a run configured with 0.3
+would silently produce an empty `mag-Jsq-sheet` column and a `mag-Jsq-smooth` identical to the
+global -- a null diagnostic that looks like a working one. Only 0.1 discriminates, and even it
+falls to 1.12 % by nj16. **The recommendation is corrected to 0.05-0.1, and the code comment now
+says that 0.3 empties at high resolution.** (Note the A_multipole smoke deck DID show a populated
+sheet bin at 0.3 -- 5.67 of 7.72 -- which is exactly how a threshold that fails at production
+resolution can pass a smoke test.)
+
+## What is still open, unchanged
+
+`dissO`/`dissA` have still never been split on the ladder -- that needs `nonideal_eta` in the
+snapshots, i.e. a ladder re-run. And `Jsq` now has *two* splits that do not restore its
+convergence. On the evidence above the right move is probably not a third split but to **retire
+`Jsq` as a convergence metric** and report the split dissipation budgets plus `f_eff` instead, as
+guidance item 1 already says -- with the grid-scale share (83 % → 1 %) quoted as the reason.

@@ -3,3 +3,8 @@
 # regenerable via gen_eos_table.py and too large to version.
 *.h5
 eos_table_hires.bin
+# 2026-08-08: eos_table_hires_v2.bin is the FLAGSHIP's table (root_ladder + all 24 ensemble
+# members name it explicitly) and is the same 12.5 MB class as the v1 hires file above, so it
+# follows the same policy. Its dimensions, md5 and exact regeneration command are recorded in
+# TABLE_PROVENANCE.md -- without that record "regenerable" is an assertion, not a procedure.
+eos_table_hires_v2.bin
