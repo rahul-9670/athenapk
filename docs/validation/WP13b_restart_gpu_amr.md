@@ -221,3 +221,74 @@ untouched, so this is bit-identical wherever `conv` is true. This mirrors what
 * `athenaPK_PRESERVED_84a6d248` — the binary the ensemble ran (= source `0d3a559`). Unchanged.
 * `athenaPK_PRESERVED_967fced6` — candidate carrying both fixes, built from the working tree on
   top of `5761651`. This is the binary all "FIXED" rows above were measured with.
+
+---
+
+# 2026-08-08 — LONG-BASELINE A/B: does the fix move the science?
+
+**Status: ANSWERED at ~500 cycles / 4.4x rho_crit. The DiodeBC fix is INDISTINGUISHABLE from
+run-to-run non-determinism on every conserved integral. This does NOT bound the full 1e4-1e5
+cycle production baseline.**
+
+## Why this was needed
+
+The fix's fresh-run effect had only ever been measured at **31 cycles** (Er_tot +5.5e-05, mass
+-7.0e-10, KE -1.5e-06). Those numbers are tiny and they are also **useless as a bound**: the
+defect is a BOUNDARY FLUX error, so it accumulates every step. Nothing said whether 5.5e-05 at
+cycle 31 becomes 5e-05 or 5e-01 at cycle 1e4.
+
+## Design — three legs, and the third is the whole point
+
+`runs/wp13b_ab/submit_ab.sh`, jobs 2492236 / 2492237 / 2492238, all COMPLETED, 2h15m each,
+4x H100, ensemble point000 deck, **fresh from t=0 and restart-free** (a restart in the old-binary
+leg would confound the fresh-run change with the zeroed-ghost corruption, which is exactly what
+this test separates).
+
+| leg | binary | end cycle | rho_max reached |
+|---|---|---|---|
+| `old_a` | `84a6d248` (what the 24-member ensemble ran) | 514 | 4.44e-13 g/cm3 = **4.44x** rho_crit |
+| `old_b` | `84a6d248`, IDENTICAL to old_a | 476 | 3.81e-13 = 3.81x |
+| `new` | `967fced6` (the fix) | 489 | 4.33e-13 = 4.33x |
+
+`old_a` vs `old_b` is the **non-determinism floor**; the legs already diverge in cycle count
+(514/476/489), which is what makes the floor leg indispensable.
+
+## Result
+
+Full-precision `.hst`, all 515 rows matched between legs to within |dt| < 2e-4 with **no
+interpolation**:
+
+| column | scale | FLOOR (a vs b) | SIGNAL (a vs new) | ratio | signal/scale |
+|---|---|---|---|---|---|
+| mass | 2.053e+03 | 0 | **0 (bit-identical)** | — | 0 |
+| KE | 3.354e+03 | 1.544e+01 | 2.305e+01 | **1.49** | 6.9e-03 |
+| tot-E | 6.574e+03 | 9.818e+01 | 4.520e+01 | **0.46** | 6.9e-03 |
+| ME | 7.167e+01 | 1.875e-01 | 3.420e-01 | **1.82** | 4.8e-03 |
+| 1/2/3-mom | — | — | — | 0.91–1.10 | ≤2.1e-04 |
+
+**Every ratio is <= 1.82, and tot-E moves LESS than the floor.** Mass is bit-identical in all
+three legs. At this depth two *identical* runs already differ by 0.46 % in KE; the fix adds
+nothing beyond that.
+
+For scale: the ensemble's turbulent-seed CoV on mu_core is **57.6 %**. A <=0.7 % shift is ~80x
+smaller and cannot move the published distribution.
+
+### The interpolation trap, checked and cleared
+
+The first pass interpolated all three legs onto a common time grid and reported a mass signal of
+3.9e-06 against a floor of exactly 0. That was an **interpolation artifact**: recomputed by
+nearest-row matching with no interpolation, the mass difference is exactly 0. Every other ratio is
+unchanged to two digits (KE 1.48 -> 1.49, tot-E 0.46 -> 0.46, ME 1.82 -> 1.82), so the conclusion
+does not rest on the interpolation scheme -- but the one number that looked anomalous was entirely
+produced by it.
+
+## What this does and does not license
+
+**Licensed:** the 24-member ensemble's published `mu_core` statistics do not need to be
+re-measured on account of the DiodeBC defect. The effect is below the floor at 16x the previously
+tested baseline, and ~80x below the seed scatter that already dominates those numbers.
+
+**NOT licensed:** this reaches cycle ~500 and 4.4x rho_crit. A production member runs 1e4-1e5
+cycles and to 1e5 x rho_crit. The accumulation question is *bounded much better than before* and
+is *not closed*. The legs carry no restart files by construction, so this baseline cannot be
+extended -- a deeper answer needs a new, longer pair.

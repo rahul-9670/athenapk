@@ -335,3 +335,57 @@ restored explicitly on the command line, on `A_multipole.in` (32³, `hall_coeff 
 `hall_ohmic_floor_code = 0.05`, radiation on). Includes a falsification leg
 (`hall_ohmic_floor_ratio = 5.0`) so that a bit-identical result cannot be produced by the parameter
 name simply being ignored.
+
+## Verification of the default flip (jobs 2492381 / 2492597 / 2492626)
+
+**Result: the flip is INERT at production-like eta_H, and the mechanism is demonstrably live.
+Verified, but only after a falsification leg failed and had to be explained.**
+
+`A_multipole.in`, 32^3, `hall_coeff = ionization`, `hall_ohmic_floor_code = 0.05`,
+`diffusion/integrator = unsplit`, 12 cycles. Measured `max|eta_H|` on the deck itself:
+**2.82e-02** (cycle 6) rising to **5.73e-02** (cycle 12).
+
+| comparison | result |
+|---|---|
+| ratio 0.2 vs 0.0 (the flip) | **bit-identical** in `prim`, `grav.phi`, `rad.Er` |
+| ratio 0.2 vs 5.0 | **bit-identical** |
+| ratio 0.2 vs 1.0e4 | differs, rel 8.98e-01, all 3 670 016 cells |
+| ratio 0.2 vs 1.0e6 | differs, rel 8.96e-01 |
+| floor 0, ratio 0 vs 0.2 | differs (12 hst rows) |
+| floor 0, ratio 0 vs 1e4 | differs (13 hst rows) |
+
+### The falsification leg failed first, and that was informative
+
+`ratio = 5.0` gives `EffectiveOhmicFloor = 5.0 x 5.73e-02 = 0.286`, comfortably above the 0.05
+absolute floor, so it *should* have changed the answer — and it did not, in the fields, not merely
+in the 6-significant-figure `.hst`. Three things were checked before accepting it:
+
+1. **The parameter reaches the code.** The startup banner in that leg reads
+   `per-cell max(0.05, 5*|eta_H|)`.
+2. **The plumbing is complete.** The `ionization` branch passes the ratio into `HallDiffusivity`;
+   the EMF kernels (`hall.cpp` 238/311/380, `ct.cpp` 1845/1894/1937) and **both** dt estimators
+   (`diffusion.cpp` 177-179 and 290-293/305-308) apply the per-cell
+   `fmax(eta_floor, ratio*|eta_H|)`. *(An earlier reading of this file that claimed the dt
+   estimators used only the absolute `GetOhmicFloor()` was WRONG — it looked at the fetch lines
+   124/228 and missed the per-cell application below them. §5's table is accurate.)*
+3. **The zero-floor discriminator.** With `hall_ohmic_floor_code = 0` there is no absolute floor
+   left to mask the ratio, and `ratio = 0` vs `0.2` then differs. So the ratio does reach the
+   solution.
+
+**Explanation.** The floor enters as `eta_floor * J`. On this deck the field is still nearly the
+uniform `B0z` after 12 cycles, so `J ~ 0` precisely in the low-density envelope where `|eta_H|` is
+largest — the EMF contribution is negligible at both 0.05 and 0.286 and cancels to the last bit.
+What does change at `ratio = 1e4` is the **parabolic timestep**: `dt_par = cfl*dx^2/eta_floor`
+with `eta_floor = 573` binds hard, dt collapses, and the whole trajectory moves — which is exactly
+the *global* signature observed (all 3.67 M cells, not a localised set).
+
+So `0.2` is inert here for the same reason it is inert in production — `0.2*|eta_H| << 0.05` — and
+the guard only engages once `|eta_H| > floor/ratio = 0.25`, about **5x production's measured
+maximum**. That is the runaway case the flip exists to catch.
+
+### What this does NOT establish
+
+The instability itself is not re-tested here; §3/§5 did that. This confirms only that the new
+default perturbs nothing at present `eta_H` and that the knob acts when `eta_H` is large enough.
+A deck that is both hot and strongly Hall-dominated would exercise the EMF path directly; none
+exists in the suite.
