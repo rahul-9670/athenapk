@@ -91,7 +91,7 @@ OUT_DN="${OUT_DN:-50}"
 # CONSEQUENCE YOU MUST NOT FORGET. The fix is also RESULT-CHANGING for a FRESH run (stale pgen
 # ghosts are not a boundary condition either): old-vs-fixed at 31 cycles gives Er_tot +5.5e-05,
 # mass -7e-10, KE -1.5e-06. So a member RESUMED from a 84a6d248 restart with this binary has a
-# two-binary history. 19/24 members ended clean (out2.final.rhdf); point001/002/005/021/022/023
+# two-binary history. 18/24 members ended clean (out2.final.rhdf); point001/002/005/021/022/023
 # were still mid-chain. Resuming those six here mixes binaries within one member. The clean
 # answer for them is a FRESH re-run, which is compute nobody has authorised yet -- decide that
 # before resuming them, and do not silently pair pre- and post-swap epochs of the same member.
