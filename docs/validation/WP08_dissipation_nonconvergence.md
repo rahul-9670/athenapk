@@ -441,3 +441,99 @@ its perturbation on the cheap nj4 leg first.
 Harness: `runs/wp8_dissplit/` (`submit_dissplit.sh`, `check_split.py`). The gate script prints an
 explicit "do NOT launch nj8/nj16" on failure, which is what stopped this at 0.8 GPU-h instead of
 ~11.
+
+---
+
+# MEASURED: the dissipation split, all three rungs (2026-08-09)
+
+Jobs 2495356 (nj4), 2495420 (nj8), 2495434 (nj16), on the WP-0 reproduction of the ladder binary
+`5ebddce0` with only the read-only `mag_diag` split columns backported (`d2afb9d8`). ~11 GPU-h
+total. All three read at the ladder's own matched epoch from `epoch_scan.txt`
+(nj4 0.009 dex, nj8 0.088 dex, nj16 0.021 dex from rho = 1e-12 g/cm^3).
+
+## THE HEADLINE: `dissO` DOES converge. The original non-monotonicity was a SAMPLING ARTEFACT.
+
+This document has said since 2026-07-31 that `mag-dissO` is *"not even monotonic (-76.5 %, then
++40.5 %)"*. **That is wrong, and the cause is the history cadence, not the physics.**
+
+| | nj4 | nj8 | nj16 | per-rung change |
+|---|---|---|---|---|
+| `dissO` global, **ladder .hst** | 3.4043e-03 | 6.3717e-04 | 9.5142e-04 | **-81.3 %, +49.3 %** |
+| `dissO` global, **per-cycle .hst** | 3.5047e-03 | 3.7670e-04 | 3.3294e-04 | **-89.3 %, -11.6 %** |
+
+The ladder's `parthenon.out0.hst` has a median row spacing of **5.70e-03**; these restarts write
+one row per cycle, **2.00e-05** — 285x finer. The matched epoch therefore sits 5.2e-04 from the
+nearest ladder row, at a moment when `dissO` is climbing by an order of magnitude. Sampling three
+rungs at three *different* offsets from their epochs manufactures exactly the scatter that was
+read as non-convergence.
+
+It is a sampling difference and nothing else, proven by comparing at IDENTICAL times where the
+two overlap:
+
+```
+nj8  t=1.085110   ladder 5.1215e-05   restart 5.1215e-05   rel 0.00e+00
+nj8  t=1.090020   ladder 6.3717e-04   restart 6.3736e-04   rel 3.03e-04   (6-sig-fig printing)
+```
+
+The restarts also reproduce the ladder's rho(t) to every printed digit
+(nj8: 2.7349e-13 vs 2.734867e-13 at t=1.086959; 8.1700e-13 vs 8.170046e-13 at t=1.089499), so the
+trajectory is the ladder's own, not a perturbed variant.
+
+## The split, at the matched epoch
+
+| bin | nj4 | nj8 | nj16 | nj4->nj8 | nj8->nj16 | verdict |
+|---|---|---|---|---|---|---|
+| `dissO` global | 3.5047e-03 | 3.7670e-04 | 3.3294e-04 | -89.3 % | **-11.6 %** | CONVERGING |
+| `dissO` core | 88.32 % | 70.94 % | 74.29 % | -91.4 % | **-7.4 %** | CONVERGING |
+| `dissO` envelope | 11.68 % | 29.06 % | 25.71 % | -73.3 % | -21.8 % | monotone, not converged |
+| `dissA` global | 4.6923e+02 | 1.0813e+02 | 3.1615e+01 | -77.0 % | -70.8 % | monotone, not converged |
+| `dissA` core | 0.01 % | 0.01 % | 0.02 % | -89.3 % | **-9.7 %** | CONVERGING |
+| `dissA` envelope | 99.99 % | 100.00 % | 99.98 % | -77.0 % | -70.8 % | monotone, not converged |
+| `Jsq` global | 2.5360e+04 | 1.1216e+04 | 6.7848e+03 | -55.8 % | -39.5 % | monotone, not converged |
+| `Jsq` sheet | 84.53 % | 16.32 % | 1.36 % | -91.5 % | -95.0 % | monotone, not converged |
+| `Jsq` smooth | 15.47 % | 83.68 % | 98.64 % | +139.2 % | -28.7 % | not monotone |
+
+**What the split bought.** It separates a CONVERGING core budget from a NON-CONVERGING envelope
+budget, which the global numbers could not do:
+
+* **Ohmic** is core-dominated (70-88 %) and its core budget converges to **-7.4 %** per rung.
+  This is now a quotable number.
+* **Ambipolar** is envelope-dominated (99.98 %) and its envelope budget does **not** converge
+  (-70.8 % on the last rung), so neither does the `dissA` global. But its *core* budget converges
+  to -9.7 %. The AD envelope heating is still falling steeply with resolution — consistent with
+  the `Jsq` sheet result below, i.e. it is being driven by grid-scale current that resolves away.
+* So the old guidance "never quote dissA/dissO as a physical ratio" stands, and gains a reason:
+  the numerator does not converge even though the denominator does.
+
+**Independent confirmation of the sheet split.** The in-code kernel gives a grid-scale share of
+84.53 % -> 16.32 % -> 1.36 %, against the offline Python's 83.22 % -> 15.65 % -> 1.12 %. Two
+implementations, agreeing to ~1.5 %; the residual is expected because the `.phdf` carries no
+ghosts, so the Python must drop one cell layer per block face while the kernel differences across
+real ghosts. The "numerical sheet resolving away" mechanism is confirmed by the code itself.
+
+## The honest caveat: `f_eff` cannot judge the bins
+
+`f_eff` flags every quantity as a point sample (`dissO` ~1.4-2.2e-09, `dissA` ~5e-08-1.3e-07,
+`Jsq` ~1.2-3.2e-07), and the core bin occupies a volume fraction of only
+`V_hi/V_box` = 5.5e-09 -> 2.2e-09. **But `mag-dissOsq`/`dissAsq` are GLOBAL integrals** -- there
+are no per-bin `sq` columns -- so f_eff is a global concentration measure and cannot discriminate
+core from envelope. A converging bin that is also tiny is not a contradiction: refinement puts
+resolution exactly where the core is. Adding per-bin `sq` columns is the obvious next increment
+if criterion (ii) is to be evaluated per bin.
+
+## Analysis traps found while doing this (all fixed in the scripts)
+
+1. **The restart's first history row has an EMPTY eta cache**, so `mag-dissO`, `mag-dissA` and all
+   four split bins read exactly `0.0` there (`Jsq` is unaffected -- it needs no eta). This bites
+   hardest on nj4, whose restart sits ON the matched epoch: an unguarded nearest-row search
+   returns row 0 and reports a zero dissipation budget that looks physical. Row 0 only, in both
+   legs; the next row is fully populated.
+2. **The epoch matters a lot.** nj8's `dissO` core share is 70.94 % at its matched epoch and
+   93.40 % at its last row. A convenience readout is not a science readout.
+3. **`.hst` is six significant figures**, so `hi + lo` can only reconstruct the global to ~1e-6.
+   A 1e-10 tolerance reads the print format as a masking error.
+
+**Status: WP-08 CLOSED for `dissO`** -- it converges, and the prescribed density split delivers a
+quotable core budget. **`dissA` and `Jsq` remain non-convergent**, now with a mechanism rather
+than a puzzle: both are dominated by envelope/grid-scale current that disappears under refinement.
+Harness: `runs/wp8_dissplit/`, analysis `docs/validation/scripts/wp8_diss_convergence.py`.
