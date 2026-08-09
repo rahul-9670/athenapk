@@ -607,3 +607,58 @@ Caveat: sheet/smooth bins have no `sq` companions, so their f_eff cannot be form
   needs a 4th rung (nj32), which requires a full ladder leg from t=0 (~60-100 GPU-h, no restart
   exists) and dropping nj4 as under-resolved (84.5 % of its current is grid-scale).
 * **`Jsq`: unchanged and OPEN**, same reasoning.
+
+---
+
+# The fourth rung, nj32 — launched, and validated mid-flight (2026-08-09)
+
+Job 2496328 (chained, self-stopping at rho = 2e-12). A full leg from t=0: there is no njeans=32
+checkpoint and one cannot be faked, because restarting nj16 at higher njeans would carry nj16's
+refinement history through the whole earlier collapse. A ladder rung is defined by its criterion
+applied from t=0.
+
+## Sizing was measured, not assumed
+
+nj16 used **43.7 GiB/GPU with 1373 blocks on 5 ranks = 275 blocks/rank = 0.159 GiB/block/rank**,
+which is exactly the D1 memory law -- so that law does apply to this deck, and the ceiling is
+~500 blocks/rank on an 80 GiB H100. Block count barely grows with njeans (nj8 -> nj16 at the
+matched epoch: 1317 -> 1373, +4 %) because a finer Jeans criterion DEEPENS refinement rather than
+widening it. Memory was never the constraint; time is.
+
+## A scare that turned out to be the physics
+
+Mid-flight, nj32 at t=1.0986 sat at rho = 2.80e-15 while nj16 at t=1.0989 had 5.37e-13 -- nearly
+200x lower -- and at maxlev 4 against nj16's 7. That looks like a broken rung.
+
+It is not. Two checks settle it.
+
+**1. The IC and early evolution are bit-comparable to the ladder.** Despite running the backported
+binary `9a9ee292` rather than the ladder's `5ebddce0`:
+
+| | t = 0 | t = 0.378968 |
+|---|---|---|
+| ladder nj4 (5ebddce0) | 2.732114e-18 | 3.360342e-18 |
+| nj32 (9a9ee292) | 2.7321e-18 | 3.3603e-18 |
+
+**2. The slowing is MONOTONE across the whole ladder.** At fixed time, higher njeans gives lower
+density:
+
+| t ~ | nj8 | nj16 | nj32 |
+|---|---|---|---|
+| 1.062-1.066 | 5.46e-15 | 2.23e-15 | 5.74e-16 |
+| 1.081-1.087 | 6.15e-14 | 8.27e-15 | 1.40e-15 |
+| 1.090-1.093 | -- | 2.36e-14 | 1.96e-15 |
+
+Each doubling of njeans lowers the density at fixed time by ~an order of magnitude (nj8->nj16
+x7.4, nj16->nj32 x12). nj32 lands exactly where the sequence predicts, and it refines EARLIER as
+it should (maxlev 1 by t=0.73, where nj4 is still maxlev 0 at t=0.99). Physically coherent: a
+better-resolved collapse loses less angular momentum numerically and proceeds more slowly.
+
+**This is why WP-8 matches rungs at fixed DENSITY and never at fixed time.** The rungs reach
+rho = 1e-12 at genuinely different epochs -- nj4 t=1.0937, nj8 t=1.0895, nj16 t=1.0995, nj32 later
+still -- and comparing them at a common time would be comparing different physical states. The
+error is easy to make: it is what made this rung look broken for a few minutes.
+
+**A finding in its own right:** the collapse TIMING is not converged even at nj16. That is a
+resolution dependence of the solution, not of the diagnostic, and it is exactly what the
+density-matched epoch exists to control for.
