@@ -358,3 +358,86 @@ snapshots, i.e. a ladder re-run. And `Jsq` now has *two* splits that do not rest
 convergence. On the evidence above the right move is probably not a third split but to **retire
 `Jsq` as a convergence metric** and report the split dissipation budgets plus `f_eff` instead, as
 guidance item 1 already says -- with the grid-scale share (83 % → 1 %) quoted as the reason.
+
+---
+
+# The `dissO`/`dissA` split: it does NOT need a ladder re-run (2026-08-09)
+
+The section above says the split needs a ladder re-run. **That is wrong, and the correction
+matters because it turns a ~180 GPU-h job into a ~11 GPU-h one.**
+
+## Why no re-run is needed
+
+`nonideal_eta` is registered `{Cell, Derived, OneCopy}` (`hydro.cpp:1741`) with **no `Restart`
+flag**, so eta is in neither the `.phdf` nor the `.rhdf` — which is why it cannot be recovered
+offline. But `Derived` is exactly what makes it cheap: eta is **recomputed from state at init**,
+so simply *restarting* a rung regenerates it. The ladder's restarts are all on disk.
+
+Offline reconstruction was checked and is genuinely blocked, so this is not laziness: the deck
+sets `diffusion/dust_coupling=true`, so eta depends on the **evolved** grain state `(f_dg, a_c)`,
+and no dust field appears in any output block. `x_e` alone (`prim_scalar_4`) is not enough.
+
+Cost, measured against each rung's own throughput and its nearest restart:
+
+| rung | restart | its time | matched epoch (rho=1e-12) | cycles needed | ~GPU-h |
+|---|---|---|---|---|---|
+| nj4 | `out2.00001` (cyc 250) | 1.093652 | 1.093652 — **exactly on it** | ~6 | 0.8 |
+| nj8 | `out2.00001` (cyc 250) | 1.081307 | ~1.0898 | ~213 | 5.9 |
+| nj16 | `out2.00002` (cyc 500) | 1.098885 | ~1.09949 | ~107 | 4.3 |
+
+(nj8's `out2.00002` and nj16's later restarts sit *past* the epoch — nj8's is already at
+4.66e-12, 4.7x past — so the earlier restart is the right one for nj8.)
+
+## The nj4 leg was run, and it FAILED — on my own error, not the code's
+
+Job **2495290**, 7 cycles from `nj4/out2.00001`, ~4 min wall. Staged deliberately as
+gate-before-spend: nj4 restarts *on* the matched epoch, so it costs 0.8 GPU-h and still tests the
+premise the other two rungs depend on. Verdict: **all seven WP-8 split columns absent**, and the
+code never printed `## mag_diag density split ON`.
+
+My stated hypothesis was that the restart's stored deck beat the CLI override — the D1
+restart-hostile-guard failure mode (`GetOrAdd` defaults get baked into the restart, which killed
+job 2461421 in 9 s). **That hypothesis is FALSIFIED.** The override reached the input fine:
+
+> `Parameter 'mag_diag_rho_split' in block 'hydro' on command line not found in input/restart
+> file. Parameter will be added.`
+
+The real cause: **the binary cannot produce the columns.** I ran `athenaPK_PRESERVED_5ebddce0`,
+the ladder's own binary, chosen for exact physics reproducibility. It was built **2026-07-30**;
+the WP-8 split columns were written **2026-07-31 or later**. Confirmed by `strings`:
+
+| binary | built | `mag_diag_rho_split` |
+|---|---|---|
+| `5ebddce0` (the ladder's) | 2026-07-30 19:50 | **ABSENT** |
+| `5654eac4` (earliest with it) | 2026-08-02 10:14 | PRESENT |
+| `ca979b6d` (current) | 2026-08-08 16:38 | PRESENT |
+
+`ParameterInput` accepts any key and merely *warns* that it is adding it, so an unknown key is
+**silently inert** — indistinguishable, in the log, from a key that was accepted and honoured.
+Choosing "the run's own binary for reproducibility" was self-defeating here: **the binary that
+reproduces the ladder is by construction the one that predates the diagnostic.**
+
+## What a fix has to deal with
+
+A binary change is unavoidable — the earliest binary with the columns is 3 days newer than the
+ladder's. One drift source is already excluded: `fhc_ladder.in` names **both** tables explicitly
+(`eos_table_hires.bin`, `opacity_table.bin`, both v1), so the N13/N14 default flips cannot reach
+it. What remains between `5ebddce0` and any newer binary is the audit-fix chain, and **A1 changes
+the refinement criterion** — block structure is precisely the variable a convergence study is
+about, so that is not a drift to wave through.
+
+The clean option is available and already proven: **WP-0 rebuilt this exact binary from
+`docs/provenance/binary_5ebddce0/` (commit `29a7174` + `tracked.patch` + Parthenon `fe22627` + its
+patch + the `src/diagnostics` tarball) and got a BYTE-IDENTICAL `parthenon.out0.hst`**
+(see `REPRODUCTION_RESULT.md`). Porting the split columns onto that tree is ~175 changed lines
+across `mag_diag.{hpp,cpp}` plus the param and registration in `hydro.cpp`, and they are
+read-only reductions that are bit-identical when off. That yields ladder physics *and* the
+diagnostic, with no audit-fix confound.
+
+**Status: still OPEN.** The measurement is now cheap and the obstacle is understood; what remains
+is a binary decision — rebuild ladder-commit + diagnostic, or accept a newer binary and quantify
+its perturbation on the cheap nj4 leg first.
+
+Harness: `runs/wp8_dissplit/` (`submit_dissplit.sh`, `check_split.py`). The gate script prints an
+explicit "do NOT launch nj8/nj16" on failure, which is what stopped this at 0.8 GPU-h instead of
+~11.

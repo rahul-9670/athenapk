@@ -292,3 +292,64 @@ tested baseline, and ~80x below the seed scatter that already dominates those nu
 cycles and to 1e5 x rho_crit. The accumulation question is *bounded much better than before* and
 is *not closed*. The legs carry no restart files by construction, so this baseline cannot be
 extended -- a deeper answer needs a new, longer pair.
+
+---
+
+# Long-baseline A/B: the DiodeBC fix does not move the science to 55-65x rhocrit (2026-08-09)
+
+## The question this closes
+
+The shallow A/B (jobs 2492236/7/8) found the fix indistinguishable from the non-determinism floor
+at 476-514 cycles / 4.4x rhocrit. That was explicitly **not** a bound: the defect is a BOUNDARY
+FLUX error, so it accumulates, and a production member runs 1e4-1e5 cycles. Nothing said whether
+5.5e-05 at cycle 31 becomes 5e-05 or 5e-01 later.
+
+## Result — jobs 2492767 (old_a), 2492768 (old_b), 2493189 (new)
+
+All three ran their full internal `-t 05:10:00` and ended COMPLETED 0:0, reaching **1031 / 1023 /
+1026 cycles** and **54.66x / 55.41x / 64.91x rhocrit** — a factor ~12 deeper in density than the
+shallow test and past every epoch the ensemble measures at.
+
+| column | scale | FLOOR (a-b) | SIGNAL (a-new) | ratio | tight-subset ratio | verdict |
+|---|---|---|---|---|---|---|
+| mass | 2.05267e+03 | 0.00000e+00 | 0.00000e+00 | 1.00 | 1.00 | within floor |
+| KE | 3.46851e+03 | 5.21000e+00 | 8.99000e+00 | 1.73 | 1.73 | within floor |
+| tot-E | 6.63224e+03 | 2.66400e+01 | 5.72400e+01 | 2.15 | 3.10 | within floor |
+| ME | 7.30853e+01 | 7.72000e-02 | 1.69600e-01 | 2.20 | 2.08 | within floor |
+| 1-mom | 3.92386e+01 | 6.40000e-03 | 8.40000e-03 | 1.31 | 1.30 | within floor |
+| 2-mom | 1.79991e+01 | 5.00000e-03 | 1.03000e-02 | 2.06 | 1.66 | within floor |
+| 3-mom | 1.09241e+02 | 3.00000e-03 | 2.00000e-03 | 0.67 | 0.67 | within floor |
+
+**No quantity moves as much as 4x the run-to-run non-determinism floor**, against a flag threshold
+of 10x, and `mass` is bit-identical in all three legs. The largest shift is 0.86 % of tot-E
+against a 0.40 % floor — ~67x below the ensemble's 57.6 % seed CoV. **The published ensemble
+mu_core statistics do not need re-measuring**, and the caveat that they were produced with the
+defective binary `84a6d248` is now quantified rather than merely acknowledged.
+
+The old_a-vs-old_b floor leg is what makes this readable: 4-rank GPU reductions are not
+order-deterministic, and ~1000 cycles of a collapsing turbulent flow amplify a last-bit
+difference. "The fix does not move the science" only means "old-vs-new sits inside old-vs-old".
+
+## Two analysis corrections made while producing this
+
+1. **Interpolation fabricates signal.** The original script interpolated all three legs onto a
+   synthetic time grid, which produced a `mass` signal of 3.9e-06 against a floor of exactly 0 —
+   on a quantity the code conserves bit-for-bit. Each leg gets a different blend of its own
+   neighbouring rows, so the difference is built by the analysis. Nearest-row matching removed it
+   (mass exactly 0.0) and moved no other ratio by more than two digits. This is now in
+   `analyze_ab.py` rather than being done ad hoc alongside it.
+
+2. **The match-quality guard cried wolf.** Judging the match offset against the *median* `.hst`
+   cadence flagged this run `MATCH NOT SAFE` at "650 % of one row". The spacing here spans 0 to
+   6.5e-3 — sparse early, one row per cycle once the collapse drives dt down — so the median
+   (2.0e-5, set by the dense late rows) is not a valid denominator for an offset occurring early.
+   Judged against *local* spacing the worst case is 2.00x, and the independent falsifier settles
+   it: restricting to the 661 of 999 rows matched within 10 % of local spacing leaves every ratio
+   essentially unchanged (column above). A false alarm on a sound result is its own failure mode,
+   so the guard now uses local spacing and always prints the tight-subset cross-check.
+
+## What this does NOT claim
+
+The legs stop at ~1030 cycles. Production runs 1e4-1e5. This bounds accumulation over the epoch
+where the ensemble is *measured* (1e-12 to 2e-12 g/cm3, passed here by a factor of ~30), not over
+a full second-core run.
