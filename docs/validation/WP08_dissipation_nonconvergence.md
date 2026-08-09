@@ -537,3 +537,73 @@ if criterion (ii) is to be evaluated per bin.
 quotable core budget. **`dissA` and `Jsq` remain non-convergent**, now with a mechanism rather
 than a puzzle: both are dominated by envelope/grid-scale current that disappears under refinement.
 Harness: `runs/wp8_dissplit/`, analysis `docs/validation/scripts/wp8_diss_convergence.py`.
+
+---
+
+# ROUND 3: the sheet split rescues Ohmic completely, and fails for ambipolar (2026-08-09)
+
+Jobs 2495823/2495824/2495825 on binary `9a9ee292` (the ladder physics + backported diagnostics,
+now including sheet-split dissipation and per-bin concentration probes). All three rungs from one
+identical code path, read at the ladder's own matched epoch (0.009 / 0.088 / 0.021 dex).
+
+## 1. Ohmic dissipation is now CONVERGED in every useful bin
+
+| bin | nj4 | nj8 | nj16 | nj4->nj8 | nj8->nj16 | verdict |
+|---|---|---|---|---|---|---|
+| `dissO` global | 3.5047e-03 | 3.7670e-04 | 3.3294e-04 | -89.3 % | **-11.6 %** | CONVERGING |
+| `dissO` core | 88.32 % | 70.94 % | 74.29 % | -91.4 % | **-7.4 %** | CONVERGING |
+| `dissO` **smooth** | 79.07 % | 97.51 % | **99.97 %** | -86.7 % | **-9.4 %** | CONVERGING |
+| `dissO` sheet | 20.93 % | 2.49 % | **0.03 %** | -98.7 % | -98.8 % | vanishing (artefact) |
+
+The sheet bin collapses to 0.03 % while the smooth bin converges to -9.4 % and carries 99.97 % of
+the total. **Ohmic dissipation is a quotable, converged quantity**, and we can now say why the
+global converges: the artefact it once contained has become negligible.
+
+## 2. Ambipolar: the CORE converges, the envelope does not -- even with grid-scale current removed
+
+| bin | nj4 | nj8 | nj16 | nj4->nj8 | nj8->nj16 | verdict |
+|---|---|---|---|---|---|---|
+| `dissA` core | 5.1794e-02 | 5.5253e-03 | 4.9907e-03 | -89.3 % | **-9.7 %** | CONVERGING |
+| `dissA` global | 4.6923e+02 | 1.0813e+02 | 3.1615e+01 | -77.0 % | -70.8 % | not converged |
+| `dissA` sheet | 90.83 % | 29.32 % | **3.04 %** | -92.6 % | -97.0 % | vanishing (artefact) |
+| `dissA` **smooth** | 9.17 % | 70.68 % | 96.96 % | **+77.6 %** | **-59.9 %** | **NOT MONOTONE** |
+
+The sheet indicator does exactly what it was built for -- it identifies and removes the grid-scale
+AD heating, which falls from 90.83 % to 3.04 % of the total. **But the remaining smooth part is
+still not converged**: it rises 77.6 % then falls 59.9 %, the same non-monotone shape `Jsq` smooth
+shows (+139.2 %, -28.7 %). So the answer to "can dissA's convergence be fixed by a better split"
+is measured and **NO**. What is quotable is the AD **core** budget (-9.7 %/rung).
+
+Physically this is coherent: refinement resolves current that was previously grid-scale, moving
+heating out of the sheet bin and into the smooth bin (hence the +77.6 % rise), while the genuine
+envelope heating simultaneously declines. Three rungs cannot separate those two motions.
+
+## 3. The instrumentation win: per-bin f_eff settles criterion (ii)
+
+Round 2 recorded an explicit caveat -- f_eff could only be formed GLOBALLY, so it flagged every
+bin as a point sample and could not say whether a converging bin was genuinely resolved. That
+verdict was **preordained**: it measures concentration against the whole box while the core
+occupies `V_hi/V_box` ~ 2e-9. With per-bin `sq` columns and carrying volumes:
+
+| f_eff within its own bin | nj4 | nj8 | nj16 |
+|---|---|---|---|
+| `dissO`-hi (core) | 2.649e-01 | 3.119e-01 | **3.611e-01** |
+| `dissA`-hi (core) | 2.905e-01 | 2.928e-01 | **4.661e-01** |
+| `dissO`-lo (envelope) | 6.4e-09 | 1.1e-08 | 9.2e-09 |
+| `dissA`-lo (envelope) | 6.6e-08 | 5.4e-08 | 1.3e-07 |
+
+**The core bins are resolved (f_eff ~ 0.26-0.47) and IMPROVING with refinement**; the envelope
+bins are the point samples. The density split therefore satisfies criterion (ii) for the core, and
+the old blanket statement "these integrals are point samples" applies to the envelope only.
+Caveat: sheet/smooth bins have no `sq` companions, so their f_eff cannot be formed -- adding
+`dissO/Asheetsq` etc. is the obvious next increment if that is ever needed.
+
+## Verdict
+
+* **Ohmic dissipation: WP-8 CLOSED.** Global, core and smooth budgets all converge (-11.6 %,
+  -7.4 %, -9.4 %), the artefact bin is 0.03 %, and the core is resolved within its own bin.
+* **Ambipolar: core CLOSED (-9.7 %, f_eff 0.47), envelope OPEN.** Not fixable by splitting -- the
+  smooth bin is non-monotone. Distinguishing "not yet asymptotic" from "genuinely divergent"
+  needs a 4th rung (nj32), which requires a full ladder leg from t=0 (~60-100 GPU-h, no restart
+  exists) and dropping nj4 as under-resolved (84.5 % of its current is grid-scale).
+* **`Jsq`: unchanged and OPEN**, same reasoning.
