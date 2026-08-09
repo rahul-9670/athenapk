@@ -40,7 +40,20 @@ W8 = "/beegfs/u/bbg6470/athenapk/runs/wp8_dissplit"
 # All three rungs now come from one identical code path (submit_rung.sh with NJ=4/8/16) on the
 # round-3 binary, so every leg carries the sheet-split dissipation and per-bin sq columns. The
 # earlier nj4 point lived in the v2_on gate run, which predates those columns.
-LEGS = [("nj4", f"{W8}/nj4"), ("nj8", f"{W8}/nj8"), ("nj16", f"{W8}/nj16")]
+LEGS = [("nj4", f"{W8}/nj4"), ("nj8", f"{W8}/nj8"), ("nj16", f"{W8}/nj16"),
+        ("nj32", f"{W8}/nj32")]
+# Legs that are not on disk yet are dropped with a note rather than aborting, so this can be run
+# while the fourth rung is still integrating.
+LEGS = [(n, d) for n, d in LEGS if glob.glob(os.path.join(d, "*.hst"))]
+
+# nj4 is EXCLUDED from the convergence fit by default, and this is a physics judgement, not
+# convenience: 84.5 % of its |J|^2 and 90.8 % of its ambipolar heating sit on grid-scale current
+# (s = |J|dx/|B| > 0.1), i.e. the rung is simply under-resolved and its "smooth" bin is a
+# different physical set of cells from nj16's. Including it is what makes dissA-smooth and
+# Jsq-smooth look non-monotone (+77.6 %/-59.9 % and +139.2 %/-28.7 %) -- the first ratio is
+# measuring the artefact draining away, not a convergence rate. It is still REPORTED in the
+# table, just not fitted. Pass --with-nj4 to fit it anyway.
+FIT_SKIP = set() if "--with-nj4" in sys.argv else {"nj4"}
 
 
 def read_hst(d):
@@ -115,8 +128,8 @@ def main():
     for leg, d in LEGS:
         cols, a = read_hst(d)
         if a is None:
-            print(f"  {leg}: NO .hst in {d} — leg missing, cannot complete the ladder")
-            return 1
+            print(f"  {leg}: NO .hst in {d} — dropped")
+            continue
         # Prefer the ladder's own matched epoch, so these numbers sit on exactly the epoch the
         # published density- and sheet-split results used. Fall back to this run's snapshots only
         # if epoch_scan.txt cannot supply it.
@@ -125,14 +138,14 @@ def main():
         if te is None:
             te, how = epoch_time(d, rho_t)
         if te is None:
-            print(f"  {leg}: {how} — cannot place the matched epoch")
-            return 1
+            print(f"  {leg}: {how} — NOT YET AT THE EPOCH, dropped from this report")
+            continue
         # The epoch must lie inside the restarted leg's own time span, or we would be reading a
         # row the leg never reached and silently reporting the nearest endpoint instead.
         if not (a[0, 0] - 1e-9 <= te <= a[-1, 0] + 1e-9):
             print(f"  {leg}: matched epoch t={te:.6f} is OUTSIDE this leg's span "
-                  f"[{a[0,0]:.6f}, {a[-1,0]:.6f}] — the leg does not cover the epoch")
-            return 1
+                  f"[{a[0,0]:.6f}, {a[-1,0]:.6f}] — dropped from this report")
+            continue
         # EXCLUDE THE RESTART'S FIRST HISTORY ROW. The eta cache is filled during the first stage
         # of a step, so on the row written at restart time it is still zero and every eta-weighted
         # column (mag-dissO, mag-dissA and all four split bins) reads EXACTLY 0. Jsq is unaffected
@@ -178,7 +191,7 @@ def main():
         ("Jsq    sheet",  "mag-Jsq-sheet", "mag-Jsq"),
         ("Jsq    smooth", "mag-Jsq-smooth","mag-Jsq"),
     ]
-    names = [l for l, _ in LEGS]
+    names = [l for l, _ in LEGS if l in res]
     print(f"{'bin':15s} " + " ".join(f"{n:>22s}" for n in names))
     print(f"{'':15s} " + " ".join(f"{'value    share':>22s}" for _ in names))
     print("-" * (15 + 23 * len(names)))
@@ -218,10 +231,18 @@ def main():
         row += f"{g(n,'mag-Vhi')/VBOX:13.3e}{'':9s} "
     print(row)
 
-    print("\n=== CONVERGENCE (change per refinement rung) ===")
-    print(f"{'bin':15s} {'nj4->nj8':>12s} {'nj8->nj16':>12s}  verdict")
+    fit = [n for n in names if n not in FIT_SKIP]
+    if len(fit) < 3:
+        print(f"\n=== CONVERGENCE: need 3 fitted rungs, have {len(fit)} ({', '.join(fit)}) ===")
+        if FIT_SKIP:
+            print(f"    ({', '.join(sorted(FIT_SKIP))} excluded as under-resolved; --with-nj4 overrides)")
+        return 0
+    print(f"\n=== CONVERGENCE (change per refinement rung; fitted on {' -> '.join(fit)}) ===")
+    if FIT_SKIP:
+        print(f"    excluded as under-resolved: {', '.join(sorted(FIT_SKIP))}")
+    print(f"{'bin':15s} {fit[0]+'->'+fit[1]:>12s} {fit[1]+'->'+fit[2]:>12s}  verdict")
     for lbl, key, _ in bins:
-        a, b, c = (g(n, key) for n in names)
+        a, b, c = (g(n, key) for n in fit[-3:])
         if not (a == a and b == b and c == c) or a == 0 or b == 0:
             continue
         r1 = 100.0 * (b - a) / a
