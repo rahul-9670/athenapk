@@ -2054,6 +2054,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     const bool have_cap = pkg->AllParams().hasKey("nonideal_cap_diag") &&
                           pkg->Param<bool>("nonideal_cap_diag");
     const Real rho_split = pkg->Param<Real>("mag_diag_rho_split");
+    const Real sheet_thresh = pkg->Param<Real>("mag_diag_sheet_thresh");
     if (have_eta) {
       add_mag(MagDiag::dissO, "mag-dissO");
       add_mag(MagDiag::dissA, "mag-dissA");
@@ -2067,6 +2068,16 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       // both the existing analysis scripts and any comparison against the history files
       // already on disk from the njeans ladder. With rho_split=0 (the default) the column
       // set is byte-for-byte what it was.
+      // WP-8 round 3: the sheet split applied to the DISSIPATION. Needs eta (hence this block)
+      // and a sheet threshold. Measured motivation: dissA is envelope-dominated (99.98 %) and
+      // its envelope falls as dx^1.77 -- still shedding grid-scale current -- while the same
+      // indicator cleanly isolated that current for Jsq (84.53 % -> 1.36 % across the ladder).
+      if (sheet_thresh > 0.0) {
+        add_mag(MagDiag::dissOsheet, "mag-dissO-sheet");
+        add_mag(MagDiag::dissOsmth, "mag-dissO-smooth");
+        add_mag(MagDiag::dissAsheet, "mag-dissA-sheet");
+        add_mag(MagDiag::dissAsmth, "mag-dissA-smooth");
+      }
       if (rho_split > 0.0) {
         // The carrying volume -- what makes the ill-conditioning visible: 90% of the global
         // integral was measured to come from a volume fraction of ~1e-7.
@@ -2077,12 +2088,20 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         add_mag(MagDiag::dissAhi, "mag-dissA-hi");
         add_mag(MagDiag::dissAlo, "mag-dissA-lo");
         add_mag(MagDiag::Vhi, "mag-Vhi");
+        // PER-BIN concentration probes + the -lo carrying volume (WP-8 round 3). Without these
+        // f_eff can only be formed GLOBALLY, which cannot answer whether a converging bin is
+        // genuinely resolved or merely a smaller point sample -- and the core bin was measured
+        // at V_hi/V_box ~ 2e-9, so that question is not rhetorical.
+        add_mag(MagDiag::dissOhisq, "mag-dissOhisq");
+        add_mag(MagDiag::dissOlosq, "mag-dissOlosq");
+        add_mag(MagDiag::dissAhisq, "mag-dissAhisq");
+        add_mag(MagDiag::dissAlosq, "mag-dissAlosq");
+        add_mag(MagDiag::Vlo, "mag-Vlo");
       }
     }
     // The current-sheet split is registered OUTSIDE the have_eta block on purpose: Jsq needs
     // only B and the grid, no eta cache, so an ideal run can measure it too. Same OFF-state
     // discipline -- thresh = 0 registers nothing and leaves the column set byte-for-byte.
-    const Real sheet_thresh = pkg->Param<Real>("mag_diag_sheet_thresh");
     if (sheet_thresh > 0.0) {
       add_mag(MagDiag::Jsqsheet, "mag-Jsq-sheet");
       add_mag(MagDiag::Jsqsmth, "mag-Jsq-smooth");

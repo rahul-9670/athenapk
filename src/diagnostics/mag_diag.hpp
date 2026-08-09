@@ -148,8 +148,56 @@ enum class MagDiag {
   // could only be run once and only for Jsq. With this column,
   //     f_eff(Jsq) = (int |J|^2 dV)^2 / (V_box * int |J|^4 dV)
   // is available every history row, for free, in every run.
-  Jsqsq // int |J|^4 dV
+  Jsqsq, // int |J|^4 dV
+  // --- WP-8 ROUND 3 (2026-08-09): the CURRENT-SHEET split applied to the DISSIPATION ---------
+  // Measured on the ladder: with the density split, dissO's CORE budget converges (q ~ dx^0.11)
+  // but dissA is envelope-dominated (99.98 %) and its envelope declines as dx^1.77 -- i.e. it is
+  // still shedding grid-scale current rather than approaching a limit. That is the same
+  // pathology the sheet indicator was built for, and the sheet indicator is what separated it
+  // for Jsq (grid-scale share 84.53 % -> 16.32 % -> 1.36 % across the rungs). Density cannot:
+  // the offending current lives in the diffuse envelope, so a density threshold puts it all in
+  // one bin. These columns apply s = |J|*dx_min/|B| to eta|J|^2 instead, isolating the AD
+  // heating carried by RESOLVED current from the part carried by the grid.
+  // Registered only when BOTH hydro/mag_diag_sheet_thresh > 0 and the eta cache exists.
+  dissOsheet, // int eta_O |J|^2   dV over cells with s >  thresh
+  dissOsmth,  // int eta_O |J|^2   dV over cells with s <= thresh
+  dissAsheet, // int eta_A |J_perp|^2 dV over cells with s >  thresh
+  dissAsmth,  // int eta_A |J_perp|^2 dV over cells with s <= thresh
+  // PER-BIN concentration probes. Until now the only `sq` companions were GLOBAL, so f_eff could
+  // be formed for the whole box but NOT for a bin -- which made it impossible to answer the
+  // question the split exists to answer: "does this bin converge because it is resolved, or is
+  // it just a smaller point sample?". The core bin occupies V_hi/V_box ~ 2e-9, so that question
+  // is not rhetorical. With these, f_eff(bin) = (int q dV)^2 / (V_bin * int q^2 dV).
+  dissOhisq, // int (eta_O |J|^2)^2 dV over cells with rho >  rho_split
+  dissOlosq, // int (eta_O |J|^2)^2 dV over cells with rho <= rho_split
+  dissAhisq, // int (eta_A |J_perp|^2)^2 dV over cells with rho >  rho_split
+  dissAlosq, // int (eta_A |J_perp|^2)^2 dV over cells with rho <= rho_split
+  Vlo        // int dV over cells with rho <= rho_split -- the denominator for the -lo f_eff
 };
+
+//! The current-sheet indicator, in ONE place.
+//!
+//! s = |J| * dx_min / |B| = the fraction of the local field that reverses across a single cell.
+//! s -> 1 means the current is at the grid scale and is a resolution artefact as much as a
+//! structure; s << 1 means it is spread over many cells and is resolved.
+//!
+//! Shared by the Jsq, Ohmic and ambipolar sheet columns ON PURPOSE. The whole point of the
+//! comparison is that all three bins are cut by the SAME mask -- if the Ohmic and ambipolar
+//! columns silently used slightly different indicators, their sheet/smooth shares would not be
+//! comparable and the difference would look physical.
+//!
+//! dx_min, not an average: on an anisotropic cell the indicator must report the most
+//! grid-limited direction rather than hide it in a mean. |B| == 0 with J != 0 counts as sheet
+//! (s is then formally infinite, and a current with no field is a pure grid artefact).
+//! Ternary rather than std::fmin -- this is compiled for the CUDA device by nvcc_wrapper, and
+//! the CPU build cannot catch a host-only std:: overload.
+KOKKOS_INLINE_FUNCTION bool IsSheet(const Real bx, const Real by, const Real bz, const Real Jsq,
+                                    const Real dx, const Real dy, const Real dz,
+                                    const Real thresh) {
+  const Real bmag = std::sqrt(bx * bx + by * by + bz * bz);
+  const Real dmin = (dx < dy ? (dx < dz ? dx : dz) : (dy < dz ? dy : dz));
+  return (bmag > 0.0) ? (std::sqrt(Jsq) * dmin / bmag > thresh) : (Jsq > 0.0);
+}
 
 //! Volume-summed magnetic-transport reduction over interior cells. `need_eta` variants
 //! read the cached "nonideal_eta" field; the `*cap` variants additionally read

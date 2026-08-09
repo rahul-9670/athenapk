@@ -37,8 +37,10 @@ import numpy as np
 RHO0 = 5.467e-19          # code density unit [g/cm^3]
 VBOX = 16.0 ** 3          # ladder domain [-8,8]^3 in code units; AMR does not change it
 W8 = "/beegfs/u/bbg6470/athenapk/runs/wp8_dissplit"
-# nj4's measurement lives in the gate run (v2_on), which restarted exactly on the epoch.
-LEGS = [("nj4", f"{W8}/v2_on"), ("nj8", f"{W8}/nj8"), ("nj16", f"{W8}/nj16")]
+# All three rungs now come from one identical code path (submit_rung.sh with NJ=4/8/16) on the
+# round-3 binary, so every leg carries the sheet-split dissipation and per-bin sq columns. The
+# earlier nj4 point lived in the v2_on gate run, which predates those columns.
+LEGS = [("nj4", f"{W8}/nj4"), ("nj8", f"{W8}/nj8"), ("nj16", f"{W8}/nj16")]
 
 
 def read_hst(d):
@@ -168,6 +170,10 @@ def main():
         ("dissA  global", "mag-dissA",    None),
         ("dissA  core",   "mag-dissA-hi", "mag-dissA"),
         ("dissA  envel",  "mag-dissA-lo", "mag-dissA"),
+        ("dissO  sheet",  "mag-dissO-sheet",  "mag-dissO"),
+        ("dissO  smooth", "mag-dissO-smooth", "mag-dissO"),
+        ("dissA  sheet",  "mag-dissA-sheet",  "mag-dissA"),
+        ("dissA  smooth", "mag-dissA-smooth", "mag-dissA"),
         ("Jsq    global", "mag-Jsq",       None),
         ("Jsq    sheet",  "mag-Jsq-sheet", "mag-Jsq"),
         ("Jsq    smooth", "mag-Jsq-smooth","mag-Jsq"),
@@ -195,6 +201,18 @@ def main():
             fe = I * I / (VBOX * Isq) if Isq and Isq == Isq and Isq > 0 else float("nan")
             row += f"{fe:13.3e}{'  PT' if fe == fe and fe < 1e-3 else '    '}{'':5s} "
         print(row)
+    # PER-BIN f_eff, now formable: each density bin has its own sq column and carrying volume.
+    # This is what decides whether a CONVERGING bin is genuinely resolved or just a smaller
+    # point sample -- the question global f_eff could not answer.
+    print(f"\n{'f_eff per bin':15s} " + " ".join(f"{n:>22s}" for n in names))
+    for base in ("dissO", "dissA"):
+        for tag, vol in (("hi", "mag-Vhi"), ("lo", "mag-Vlo")):
+            row = f"{base+'-'+tag:15s} "
+            for n in names:
+                I = g(n, f"mag-{base}-{tag}"); Isq = g(n, f"mag-{base}{tag}sq"); V = g(n, vol)
+                fe = I * I / (V * Isq) if (Isq == Isq and Isq > 0 and V == V and V > 0) else float("nan")
+                row += f"{fe:13.3e}{'  PT' if fe == fe and fe < 1e-3 else '    '}{'':5s} "
+            print(row)
     row = f"{'V_hi/V_box':15s} "
     for n in names:
         row += f"{g(n,'mag-Vhi')/VBOX:13.3e}{'':9s} "

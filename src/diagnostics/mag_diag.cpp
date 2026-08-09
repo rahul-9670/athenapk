@@ -21,7 +21,14 @@ Real MagDiagReduce(MeshData<Real> *md, MagDiag which) {
                          which == MagDiag::dissOcap || which == MagDiag::dissAcap ||
                          which == MagDiag::dissOhi || which == MagDiag::dissOlo ||
                          which == MagDiag::dissAhi || which == MagDiag::dissAlo ||
-                         which == MagDiag::dissOsq || which == MagDiag::dissAsq);
+                         which == MagDiag::dissOsq || which == MagDiag::dissAsq ||
+                         // WP-8 round 3. MISSING ENTRIES HERE ARE SILENT AND WRONG: when
+                         // need_eta is false the pack is aliased to `prim`, so the kernel would
+                         // read density/velocity as if they were eta and still return a number.
+                         which == MagDiag::dissOsheet || which == MagDiag::dissOsmth ||
+                         which == MagDiag::dissAsheet || which == MagDiag::dissAsmth ||
+                         which == MagDiag::dissOhisq || which == MagDiag::dissOlosq ||
+                         which == MagDiag::dissAhisq || which == MagDiag::dissAlosq);
   const bool need_cap = (which == MagDiag::dissOcap || which == MagDiag::dissAcap);
   // WP-8 density split. Read here rather than passed in so every call site stays unchanged.
   // 0 (the default) means the split columns are never registered, so this is inert then.
@@ -96,18 +103,34 @@ Real MagDiagReduce(MeshData<Real> *md, MagDiag which) {
           return;
         }
         if (which == MagDiag::dissOhi || which == MagDiag::dissOlo ||
-            which == MagDiag::dissOsq) {
+            which == MagDiag::dissOsq || which == MagDiag::dissOhisq ||
+            which == MagDiag::dissOlosq || which == MagDiag::dissOsheet ||
+            which == MagDiag::dissOsmth) {
           const Real q = eta(b, NonidealEtaIdx::O, k, j, i) * Jsq;
           if (which == MagDiag::dissOsq) {
             lsum += q * q * dV;
+          } else if (which == MagDiag::dissOsheet || which == MagDiag::dissOsmth) {
+            if (IsSheet(bx, by, bz, Jsq, dx, dy, dz, sheet_thresh) ==
+                (which == MagDiag::dissOsheet))
+              lsum += q * dV;
           } else {
             const bool hi = w(IDN, k, j, i) > rho_split;
-            if (hi == (which == MagDiag::dissOhi)) lsum += q * dV;
+            // -hi/-lo take q; -hisq/-losq take q^2, over the SAME cell mask, so analysis can
+            // form a per-bin f_eff without a second pass.
+            const bool want_hi =
+                (which == MagDiag::dissOhi || which == MagDiag::dissOhisq);
+            if (hi == want_hi) {
+              const bool sq =
+                  (which == MagDiag::dissOhisq || which == MagDiag::dissOlosq);
+              lsum += (sq ? q * q : q) * dV;
+            }
           }
           return;
         }
         if (which == MagDiag::dissAhi || which == MagDiag::dissAlo ||
-            which == MagDiag::dissAsq) {
+            which == MagDiag::dissAsq || which == MagDiag::dissAhisq ||
+            which == MagDiag::dissAlosq || which == MagDiag::dissAsheet ||
+            which == MagDiag::dissAsmth) {
           const Real b2s = bx * bx + by * by + bz * bz;
           Real Jp2 = Jsq;
           if (b2s > 0.0) {
@@ -118,10 +141,28 @@ Real MagDiagReduce(MeshData<Real> *md, MagDiag which) {
           const Real q = eta(b, NonidealEtaIdx::A, k, j, i) * Jp2;
           if (which == MagDiag::dissAsq) {
             lsum += q * q * dV;
+          } else if (which == MagDiag::dissAsheet || which == MagDiag::dissAsmth) {
+            // NB the indicator uses the FULL |J|, not |J_perp|: s measures how much of the field
+            // reverses across a cell, which is a property of the current itself and of the grid,
+            // not of the ambipolar projection. Using J_perp here would make the sheet mask
+            // differ between the Ohmic and ambipolar columns and destroy the comparison.
+            if (IsSheet(bx, by, bz, Jsq, dx, dy, dz, sheet_thresh) ==
+                (which == MagDiag::dissAsheet))
+              lsum += q * dV;
           } else {
             const bool hi = w(IDN, k, j, i) > rho_split;
-            if (hi == (which == MagDiag::dissAhi)) lsum += q * dV;
+            const bool want_hi =
+                (which == MagDiag::dissAhi || which == MagDiag::dissAhisq);
+            if (hi == want_hi) {
+              const bool sq =
+                  (which == MagDiag::dissAhisq || which == MagDiag::dissAlosq);
+              lsum += (sq ? q * q : q) * dV;
+            }
           }
+          return;
+        }
+        if (which == MagDiag::Vlo) {
+          if (!(w(IDN, k, j, i) > rho_split)) lsum += dV;
           return;
         }
 
@@ -134,15 +175,9 @@ Real MagDiagReduce(MeshData<Real> *md, MagDiag which) {
         // where a density threshold puts everything in one bin.
         if (which == MagDiag::Jsqsheet || which == MagDiag::Jsqsmth ||
             which == MagDiag::Vsheet) {
-          const Real bmag = std::sqrt(bx * bx + by * by + bz * bz);
-          // Ternary rather than std::fmin: this lambda is compiled for the CUDA device by
-          // nvcc_wrapper, and the CPU build cannot catch a host-only std:: overload. The
-          // surrounding code sticks to std::sqrt/std::pow, which nvcc does map; fmin is not
-          // worth the risk for a two-way minimum.
-          const Real dmin = (dx < dy ? (dx < dz ? dx : dz) : (dy < dz ? dy : dz));
-          // |B| == 0 with J != 0 is a pure grid artefact, so it counts as sheet (s = inf).
-          const bool sheet =
-              (bmag > 0.0) ? (std::sqrt(Jsq) * dmin / bmag > sheet_thresh) : (Jsq > 0.0);
+          // Shared helper -- see IsSheet in mag_diag.hpp. Deliberately the same mask the
+          // Ohmic and ambipolar sheet columns use, so the three are comparable.
+          const bool sheet = IsSheet(bx, by, bz, Jsq, dx, dy, dz, sheet_thresh);
           if (which == MagDiag::Vsheet) {
             if (sheet) lsum += dV;
           } else if (sheet == (which == MagDiag::Jsqsheet)) {
