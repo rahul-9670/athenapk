@@ -62,15 +62,22 @@
 //   * Use the density-split columns below instead: each is an integral over a region
 //     defined by PHYSICS rather than by the grid, so the core and envelope budgets converge
 //     (or fail to) independently and visibly.
-//   * mag-Vhi / mag-dissOV / mag-dissAV report the volume actually carrying the
-//     dissipation, so this ill-conditioning is never again invisible in the output.
+//   * mag-Vhi and the concentration probes mag-dissOsq / mag-dissAsq expose the
+//     ill-conditioning directly in the output, so it is never again invisible.
 //
 // Density-split columns (registered only when hydro/mag_diag_rho_split > 0; default 0 keeps
 // the OFF state and the original column set bit-identical):
 //   mag-dissO-hi / mag-dissO-lo   Ohmic dissipation above / below the density split
 //   mag-dissA-hi / mag-dissA-lo   ambipolar dissipation above / below the split
 //   mag-Vhi                       volume with rho > split
-//   mag-dissOV / mag-dissAV       volume of all cells with nonzero Ohmic / ambipolar heating
+//   mag-dissOsq / mag-dissAsq     int q^2 dV, q = the local heating-rate density, from which
+//                                 analysis forms f_eff = (int q dV)^2 / (V_box * int q^2 dV)
+// CORRECTED 2026-08-09: this block used to advertise `mag-dissOV / mag-dissAV`, columns that
+// DO NOT EXIST -- the literal "volume where q>0" was implemented first, found useless (eta and
+// J are nonzero almost everywhere, so it just returns the box volume) and replaced by the sq
+// probes recorded in the enum below. The stale names were copied into a gate script, which then
+// reported a FALSE failure on a completely sound run (job 2495356). Column names must be taken
+// from the registration in hydro.cpp, not from prose.
 //========================================================================================
 #ifndef DIAGNOSTICS_MAG_DIAG_HPP_
 #define DIAGNOSTICS_MAG_DIAG_HPP_
