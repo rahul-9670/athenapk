@@ -662,3 +662,85 @@ error is easy to make: it is what made this rung look broken for a few minutes.
 **A finding in its own right:** the collapse TIMING is not converged even at nj16. That is a
 resolution dependence of the solution, not of the diagnostic, and it is exactly what the
 density-matched epoch exists to control for.
+
+---
+
+# THE FOURTH RUNG FALSIFIES THE THREE-RUNG CONVERGENCE (2026-08-09/10)
+
+nj32 completed in one slot (job 2496328, RUN_EXIT 0, 1036 cycles, 11:31, ~58 GPU-h) and reached
+rho = 8.55e-12, i.e. +0.93 dex past the measurement epoch. Its epoch is placed by interpolation
+(the ladder's `epoch_scan.txt` has no nj32) and was verified independently by binary search:
+rho = 1e-12 is crossed between t=1.126525 (-0.080 dex) and t=1.126771 (+0.055 dex), and the value
+used, t=1.126671, lies inside that bracket. **The point is sound.**
+
+## RETRACTION
+
+The round-2/round-3 sections above conclude *"Ohmic dissipation is a quotable, converged
+quantity"* and *"WP-8 CLOSED for dissO"*. **Both are WRONG.** They rest on three rungs, and the
+fourth reverses the sign:
+
+| bin | nj8->nj16 | nj16->nj32 | verdict |
+|---|---|---|---|
+| `dissO` global | -11.6 % | **+106.9 %** | NOT MONOTONE |
+| `dissO` core | -7.4 % | **+117.7 %** | NOT MONOTONE |
+| `dissO` smooth | -9.4 % | **+107.0 %** | NOT MONOTONE |
+
+`dissO` roughly DOUBLES from nj16 to nj32 after appearing to settle. What looked like convergence
+was a minimum: the integral falls while the grid-scale artefact drains out, then rises again as
+genuinely resolved current appears at finer scales. Fitting a "converged" value to the flat part
+of a non-monotone curve is exactly the error the extra rung was commissioned to test for.
+
+Ambipolar is monotone but not converged, and no closer than before:
+
+| bin | nj8->nj16 | nj16->nj32 |
+|---|---|---|
+| `dissA` global | -70.8 % | -82.5 % |
+| `dissA` core | -9.7 % | **-23.4 %** |
+| `dissA` smooth | -59.9 % | -82.1 % |
+
+The AD core's per-rung change GREW (-9.7 % -> -23.4 %), so the round-2 claim that the AD core
+budget converges is also withdrawn.
+
+`Jsq` now declines at a near-CONSTANT rate -- global -39.5 %/-28.0 %, smooth -28.7 %/-27.1 % --
+which is the signature of a power law, not of approach to a limit.
+
+## What the four rungs DO establish, robustly
+
+**1. The current-sheet indicator works, monotonically and across four rungs.** The grid-scale
+share of every quantity collapses:
+
+| sheet share | nj4 | nj8 | nj16 | nj32 |
+|---|---|---|---|---|
+| `Jsq` | 84.53 % | 16.32 % | 1.36 % | **0.18 %** |
+| `dissA` | 90.83 % | 29.32 % | 3.04 % | **0.91 %** |
+| `dissO` | 20.93 % | 2.49 % | 0.03 % | **0.00 %** |
+
+By nj32 the numerical current is gone. This is a clean, quantitative demonstration that the
+sheet indicator identifies a resolution artefact and that the artefact resolves away.
+
+**2. The core bins are genuinely resolved, and improving monotonically.** Per-bin f_eff:
+
+| f_eff within its bin | nj4 | nj8 | nj16 | nj32 |
+|---|---|---|---|---|
+| `dissO`-hi | 2.649e-01 | 3.119e-01 | 3.611e-01 | **4.185e-01** |
+| `dissA`-hi | 2.905e-01 | 2.928e-01 | 4.661e-01 | **5.177e-01** |
+
+(envelope bins stay at 1e-9..1e-7, i.e. they are the point samples). So the DIAGNOSTICS are sound
+and the density split does what it was designed to do. It is the physical integrals that refuse
+to converge.
+
+## Verdict: WP-8 remains OPEN, and is not closable by more of the same
+
+Four rungs spanning a factor of 8 in Jeans resolution do not give a converged dissipation budget.
+The obstruction is not the metric, not the epoch matching, and not the sampling -- all three were
+found and fixed along the way, and the diagnostics behave exactly as designed. `dissO` is
+non-monotone because two effects (artefact draining out, resolved current coming in) cross near
+njeans=16; separating them needs resolution beyond njeans=32, i.e. a rung that costs more than
+all four to date combined.
+
+**Recommendation: stop refining and change the claim.** Report the dissipation budgets as
+resolution-dependent with the measured trend, quote the sheet fractions (84.5 % -> 0.18 %) as the
+quantitative statement about numerical current, and do NOT quote a converged eta|J|^2. The
+honest result of WP-8 is that these integrals are not converged at achievable resolution -- which
+is a finding, not a failure, and it is now backed by four rungs instead of an extrapolation from
+three.
