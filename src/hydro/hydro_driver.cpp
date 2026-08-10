@@ -19,8 +19,6 @@
 #include <parthenon/parthenon.hpp>
 // AthenaPK headers
 #include "../eos/adiabatic_hydro.hpp"
-#include "../pgen/cluster/agn_triggering.hpp"
-#include "../pgen/cluster/magnetic_tower.hpp"
 #include "../tracers/tracers.hpp"
 #include "../sinks/sinks.hpp"
 #include "ct/ct.hpp"
@@ -465,41 +463,12 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
 
   const int num_partitions = pmesh->DefaultNumPartitions();
 
-  // calculate agn triggering accretion rate
-  if ((stage == 1) &&
-      hydro_pkg->AllParams().hasKey("agn_triggering_reduce_accretion_rate") &&
-      hydro_pkg->Param<bool>("agn_triggering_reduce_accretion_rate")) {
-
-    // need to make sure that there's only one region in order to MPI_reduce to work
-    TaskRegion &single_task_region = tc.AddRegion(1);
-    auto &tl = single_task_region[0];
-    // First globally reset triggering quantities
-    auto prev_task =
-        tl.AddTask(none, cluster::AGNTriggeringResetTriggering, hydro_pkg.get());
-
-    // Adding one task for each partition. Given that they're all in one task list
-    // they'll be executed sequentially. Given that a par_reduce to a host var is
-    // blocking it's also save to store the variable in the Params for now.
-    for (int i = 0; i < num_partitions; i++) {
-      auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
-      auto new_agn_triggering =
-          tl.AddTask(prev_task, cluster::AGNTriggeringReduceTriggering, mu0.get(), tm.dt);
-      prev_task = new_agn_triggering;
-    }
-#ifdef MPI_PARALLEL
-    auto reduce_agn_triggering =
-        tl.AddTask(prev_task, cluster::AGNTriggeringMPIReduceTriggering, hydro_pkg.get());
-    prev_task = reduce_agn_triggering;
-#endif
-
-    // Remove accreted gas
-    for (int i = 0; i < num_partitions; i++) {
-      auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
-      auto new_remove_accreted_gas =
-          tl.AddTask(prev_task, cluster::AGNTriggeringFinalizeTriggering, mu0.get(), tm);
-      prev_task = new_remove_accreted_gas;
-    }
-  }
+  // (2026-08-10) The AGN-triggering accretion-rate task region that used to sit here
+  // belonged to the `cluster` problem generator, which is not part of the flagship
+  // build.  It was guarded on `agn_triggering_reduce_accretion_rate`, a Param only
+  // cluster::ProblemInitPackageData ever registered, so it was unreachable code for
+  // every collapse_be run.  Restored together with the pgen if ever needed --
+  // git tag validation-complete-2026-08-10.
 
   for (int i = 0; i < blocks.size(); i++) {
     auto &pmb = blocks[i];
@@ -514,47 +483,9 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     }
   }
 
-  // calculate magnetic tower scaling
-  if ((stage == 1) && hydro_pkg->AllParams().hasKey("magnetic_tower_power_scaling") &&
-      hydro_pkg->Param<bool>("magnetic_tower_power_scaling")) {
-    const auto &magnetic_tower =
-        hydro_pkg->Param<cluster::MagneticTower>("magnetic_tower");
-
-    // need to make sure that there's only one region in order to MPI_reduce to work
-    TaskRegion &single_task_region = tc.AddRegion(1);
-    auto &tl = single_task_region[0];
-    // First globally reset magnetic_tower_linear_contrib and
-    // magnetic_tower_quadratic_contrib
-    auto prev_task =
-        tl.AddTask(none, cluster::MagneticTowerResetPowerContribs, hydro_pkg.get());
-
-    // Adding one task for each partition. Given that they're all in one task list
-    // they'll be executed sequentially. Given that a par_reduce to a host var is
-    // blocking it's also save to store the variable in the Params for now.
-    for (int i = 0; i < num_partitions; i++) {
-      auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
-      auto new_magnetic_tower_power_contrib =
-          tl.AddTask(prev_task, cluster::MagneticTowerReducePowerContribs, mu0.get(), tm);
-      prev_task = new_magnetic_tower_power_contrib;
-    }
-#ifdef MPI_PARALLEL
-    auto reduce_magnetic_tower_power_contrib = tl.AddTask(
-        prev_task,
-        [](StateDescriptor *hydro_pkg) {
-          Real magnetic_tower_contribs[] = {
-              hydro_pkg->Param<Real>("magnetic_tower_linear_contrib"),
-              hydro_pkg->Param<Real>("magnetic_tower_quadratic_contrib")};
-          PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, magnetic_tower_contribs, 2,
-                                            MPI_PARTHENON_REAL, MPI_SUM, MPI_COMM_WORLD));
-          hydro_pkg->UpdateParam("magnetic_tower_linear_contrib",
-                                 magnetic_tower_contribs[0]);
-          hydro_pkg->UpdateParam("magnetic_tower_quadratic_contrib",
-                                 magnetic_tower_contribs[1]);
-          return TaskStatus::complete;
-        },
-        hydro_pkg.get());
-#endif
-  }
+  // (2026-08-10) The magnetic-tower power-scaling task region that used to sit here was
+  // likewise cluster-only, guarded on `magnetic_tower_power_scaling`.  Removed with the
+  // cluster pgen; see the note above.
 
   // First add split sources before the main time integration
   if (stage == 1) {

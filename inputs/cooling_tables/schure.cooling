@@ -1,5 +1,0 @@
-# The original cooling curve in this file was from unknown origin/using unknown conventions
-# and has thus been removed.
-# This file is kept empty to make runs crash loud that assume/use this table.
-# The updated_schure.cooling table contains Lambda for 1, 0.5 and 0.3 solar
-# metallicity calculated with the notebook in docs/cooling/cooling.ipynb

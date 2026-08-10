@@ -1,8 +1,0 @@
- M docs/provenance/freeze.sh
- M docs/validation/WP02_creduc_semantics.md
- M docs/validation/WP14_order_of_accuracy.md
-?? docs/provenance/binary_f181c0a1/
-?? docs/validation/WP07_root_grid_ladder.md
-?? docs/validation/WP16_ambipolar_convergence.md
-?? docs/validation/WP22_numerical_vs_physical_resistivity.md
-?? docs/validation/scripts/wp22_eta_physical.py

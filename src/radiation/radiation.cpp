@@ -308,11 +308,96 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   if (use_h2diss) {
     // Same units as the hydro package's load (audit N14): a v2 cgs table is converted with
     // this run's scales, a legacy table is consumed verbatim. hydro.cpp does the warning.
+    // DEFAULT MUST MATCH hydro.cpp:996-998 EXACTLY. Parthenon records the default passed to
+    // GetOrAddString and hard-aborts ("has at least two inconsistent default values") when the
+    // same (block, key) is registered twice with different defaults -- and it does so even when
+    // the deck sets the key explicitly, so an explicit production deck is NOT immune.
+    //
+    // 2026-08-10: this was live on HEAD. Commit a97b6673 (2026-08-08, audit N14) flipped the
+    // hydro side to the v2 cgs table and left this one at the legacy v1 path, which aborted
+    // every `hydro/eos = hydrogen` + `physics/radiation = true` run at startup -- the flagship
+    // configuration. hydro.cpp:994 had already written down the rule this broke ("Paired with
+    // the opacity default in radiation.cpp; changing one without the other would leave half the
+    // hazard open"); the opacity pair was updated, this EOS pair was not. Neither GPU binary
+    // carried the defect (both predate a97b6673 -- verified: neither contains the string
+    // "src/eos/eos_table_v2.bin"), so no production result is affected; only a rebuild from
+    // HEAD would have been, and it would have died in the first seconds.
     eos_tab.Load(pin->GetOrAddString("hydro", "eos_table_file",
-                                     "/beegfs/u/bbg6470/athenapk/src/eos/eos_table.bin"),
+                                     "/beegfs/u/bbg6470/athenapk/src/eos/eos_table_v2.bin"),
                  U.rho_unit, U.v_unit);
   }
   pkg->AddParam("eos_tab", eos_tab);
+
+  // --- A3 (2026-08-10): the opacity-table domain must not be a SILENT ceiling ---------
+  // OpacityTable::bilin (radiation_opacity.hpp:62-77) clamps BOTH the index and the
+  // interpolation weight, so a lookup past an edge returns the edge opacity: no warning,
+  // no error, no NaN, nothing in the output to show it happened. That made a real ceiling
+  // invisible -- opacity_table_v2.bin stops at rho = 1e-2 g/cm^3 and T = 1e5 K, while
+  // eos_table_hires_v2.bin covers rho <= 1 g/cm^3 and T <= 3.0e5 K. The EOS is therefore
+  // valid through second collapse and the opacity is not, and nothing said so.
+  //
+  // Measured cost of the clamp at corners v2 could not represent (bilin ported to python,
+  // compared against gen_opacity_table.group_opacities directly):
+  //   rho = 1e0  g/cm^3, T = 2e3 K : kappa_R 3.74e0 vs 8.00e1 exact  (-95.3 %)
+  //   rho = 1e-6 g/cm^3, T = 2e5 K : kappa_R 4.84e1 vs 8.39e0 exact  (+477 %)
+  // The T ceiling is the broader of the two: it binds at EVERY density, not just the
+  // second-core densities, so it is not only a deep-collapse concern.
+  //
+  // Fix has two halves. (1) opacity_table_v3.bin extends the grid to the full EOS domain
+  // (see src/eos/TABLE_PROVENANCE.md). (2) this report, so the domain is in every run log
+  // and a short table announces itself at startup instead of at analysis time. WARN, never
+  // abort: a hard failure here would be restart-hostile for every completed deck that
+  // legitimately names a narrower table.
+  if (op.model == OpacityModel::tabulated && parthenon::Globals::my_rank == 0) {
+    const auto &ot = op.table;
+    const Real op_rlo = std::pow(10.0, ot.lr0_);
+    const Real op_rhi = std::pow(10.0, ot.lr0_ + (ot.nr_ - 1) * ot.dlr_);
+    const Real op_tlo = std::pow(10.0, ot.lT0_);
+    const Real op_thi = std::pow(10.0, ot.lT0_ + (ot.nT_ - 1) * ot.dlT_);
+    std::cout << "### Radiation opacity table: " << opac_table_file << "\n"
+              << "###   domain rho[g/cm^3] " << op_rlo << " .. " << op_rhi << "  (nr = "
+              << ot.nr_ << ", dlogrho = " << ot.dlr_ << ")\n"
+              << "###   domain T[K]        " << op_tlo << " .. " << op_thi << "  (nT = "
+              << ot.nT_ << ", dlogT = " << ot.dlT_ << ")\n"
+              << "###   lookups outside this box are CLAMPED to the edge value."
+              << std::endl;
+    if (eos_tab.loaded_) {
+      // EosTable stores its rho axis in CODE units (eos_table.hpp:151 shifts a cgs file by
+      // log10(rho_unit)); a legacy file carries the generator's own code units, which differ
+      // by 0.14 % -- irrelevant against a domain check spanning decades. Its T axis is log10
+      // K in both cases. Put both tables in cgs and compare.
+      const Real eos_rlo = std::pow(10.0, eos_tab.lr0_) * U.rho_unit;
+      const Real eos_rhi =
+          std::pow(10.0, eos_tab.lr0_ + (eos_tab.nr_ - 1) * eos_tab.dlr_) * U.rho_unit;
+      const Real eos_tlo = std::pow(10.0, eos_tab.lT0_);
+      const Real eos_thi =
+          std::pow(10.0, eos_tab.lT0_ + (eos_tab.nT_ - 1) * eos_tab.dlT_);
+      const bool short_rho = op_rhi < eos_rhi * 0.999;
+      const bool short_T = op_thi < eos_thi * 0.999;
+      if (short_rho || short_T) {
+        std::cout << "### WARNING Radiation (A3): the opacity table does NOT cover the "
+                     "thermodynamic range the EOS table claims. The EOS stays valid where "
+                     "the opacity is silently clamped to its edge value.\n";
+        if (short_rho)
+          std::cout << "###   rho: opacity ends at " << op_rhi << " g/cm^3, EOS reaches "
+                    << eos_rhi << " g/cm^3 (short by "
+                    << std::log10(eos_rhi / op_rhi) << " decades)\n";
+        if (short_T)
+          std::cout << "###   T:   opacity ends at " << op_thi << " K, EOS reaches "
+                    << eos_thi << " K (short by " << std::log10(eos_thi / op_thi)
+                    << " decades)\n";
+        std::cout << "###   If this run can reach those conditions, regenerate the table:\n"
+                     "###     gen_opacity_table.py --out <file> --nr 101 --nT 201 "
+                     "--rho_min 1e-20 --rho_max 1e0 --T_min 3.0 --T_max 3.0e5\n"
+                     "###   and record it in src/eos/TABLE_PROVENANCE.md."
+                  << std::endl;
+      } else {
+        std::cout << "###   covers the EOS table domain (rho <= " << eos_rhi
+                  << " g/cm^3, T <= " << eos_thi << " K): OK." << std::endl;
+      }
+    }
+  }
+
   pkg->AddParam("tfloor", pin->GetOrAddReal(bn, "tfloor_code", 1.0e-3)); // T floor (code)
   pkg->AddParam("inner_iteration_max", pin->GetOrAddInteger(bn, "inner_iteration_max", 100));
   pkg->AddParam("inner_iteration_tol", pin->GetOrAddReal(bn, "inner_iteration_tol", 1.0e-8));

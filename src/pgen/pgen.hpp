@@ -5,28 +5,21 @@
 // Copyright (c) 2020, Athena-Parthenon Collaboration. All rights reserved.
 // Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
+//
+// Flagship build: the only problem generator compiled in is `collapse_be`, the
+// magnetized Bonnor-Ebert sphere / first-hydrostatic-core collapse used by every
+// production deck (runs/root_ladder, runs/ensemble).
+//
+// The 23 upstream and validation problem generators that used to be declared here
+// were moved to /beegfs/u/bbg6470/validation/code/pgen/ on 2026-08-10, together
+// with their input decks and the regression suite.  Nothing was deleted: git tag
+// `validation-complete-2026-08-10` holds the full tree.  Re-enabling one means
+// restoring its .cpp, re-declaring its namespace here, adding it to
+// pgen/CMakeLists.txt and adding its branch to main.cpp -- see
+// /beegfs/u/bbg6470/validation/README.md.
 
 #include <parthenon/driver.hpp>
 #include <parthenon/package.hpp>
-
-namespace linear_wave {
-using namespace parthenon::driver::prelude;
-
-void InitUserMeshData(Mesh *mesh, ParameterInput *pin);
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void UserWorkAfterLoop(Mesh *mesh, parthenon::ParameterInput *pin,
-                       parthenon::SimTime &tm);
-} // namespace linear_wave
-
-namespace linear_wave_mhd {
-using namespace parthenon::driver::prelude;
-
-void InitUserMeshData(Mesh *mesh, ParameterInput *pin);
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void UserWorkAfterLoop(Mesh *mesh, parthenon::ParameterInput *pin,
-                       parthenon::SimTime &tm);
-void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
-} // namespace linear_wave_mhd
 
 namespace collapse_be {
 void ProblemGenerator(parthenon::MeshBlock *pmb, parthenon::ParameterInput *pin);
@@ -39,163 +32,5 @@ parthenon::TaskStatus ApplyBarotropicCooling(parthenon::MeshData<parthenon::Real
                                               const parthenon::SimTime &tm,
                                               const parthenon::Real dt);
 } // namespace collapse_be
-
-namespace poisson_test {
-using namespace parthenon::driver::prelude;
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace poisson_test
-
-namespace rad_pulse {
-using namespace parthenon::driver::prelude;
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace rad_pulse
-
-namespace rad_shadow {
-using namespace parthenon::driver::prelude;
-void InitUserMeshData(Mesh *mesh, parthenon::ParameterInput *pin);
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void InflowBeamX1(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse);
-} // namespace rad_shadow
-
-namespace rad_shock {
-using namespace parthenon::driver::prelude;
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace rad_shock
-
-namespace cpaw {
-using namespace parthenon::driver::prelude;
-
-void InitUserMeshData(Mesh *mesh, ParameterInput *pin);
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void UserWorkAfterLoop(Mesh *mesh, parthenon::ParameterInput *pin,
-                       parthenon::SimTime &tm);
-} // namespace cpaw
-
-namespace cloud {
-using namespace parthenon::driver::prelude;
-
-void InitUserMeshData(Mesh *mesh, ParameterInput *pin);
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void InflowWindX2(std::shared_ptr<MeshBlockData<Real>> &mbd, bool coarse);
-parthenon::AmrTag ProblemCheckRefinementBlock(MeshBlockData<Real> *mbd);
-} // namespace cloud
-
-namespace blast {
-using namespace parthenon::driver::prelude;
-
-void InitUserMeshData(Mesh *mesh, ParameterInput *pin);
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void UserWorkAfterLoop(Mesh *mesh, parthenon::ParameterInput *pin,
-                       parthenon::SimTime &tm);
-} // namespace blast
-
-namespace advection {
-using namespace parthenon::driver::prelude;
-
-void InitUserMeshData(Mesh *mesh, ParameterInput *pin);
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace advection
-
-namespace orszag_tang {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace orszag_tang
-
-namespace diffusion {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void UserWorkAfterLoop(Mesh *mesh, parthenon::ParameterInput *pin,
-                       parthenon::SimTime &tm);
-} // namespace diffusion
-
-namespace cshock {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace cshock
-
-namespace field_loop {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
-} // namespace field_loop
-
-namespace kh {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(Mesh *pm, parthenon::ParameterInput *pin, MeshData<Real> *md);
-} // namespace kh
-
-namespace lw_implode {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace lw_implode
-
-namespace rand_blast {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
-void RandomBlasts(MeshData<Real> *md, const parthenon::SimTime &tm, const Real);
-} // namespace rand_blast
-
-namespace cluster {
-using namespace parthenon::driver::prelude;
-
-void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
-void InitUserMeshData(ParameterInput *pin);
-void ProblemGenerator(Mesh *pmesh, ParameterInput *pin, MeshData<Real> *md);
-void UserWorkBeforeOutput(MeshBlock *pmb, ParameterInput *pin,
-                          const parthenon::SimTime &tm);
-void ClusterUnsplitSrcTerm(MeshData<Real> *md, const parthenon::SimTime &tm,
-                           const Real beta_dt);
-void ClusterSplitSrcTerm(MeshData<Real> *md, const parthenon::SimTime &tm,
-                         const Real beta_dt);
-parthenon::Real ClusterEstimateTimestep(MeshData<Real> *md);
-} // namespace cluster
-
-namespace shattering {
-using namespace parthenon::driver::prelude;
-
-void InitUserMeshData(Mesh *mesh, ParameterInput *pin);
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace shattering
-
-namespace sod {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace sod
-
-namespace jeans {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace jeans
-
-namespace polytrope {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-} // namespace polytrope
-
-namespace turbulence {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(Mesh *pm, parthenon::ParameterInput *pin, MeshData<Real> *md);
-void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
-void ProblemInitTracerData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
-void Driving(MeshData<Real> *md, const parthenon::SimTime &tm, const Real dt);
-void SetPhases(MeshBlock *pmb, ParameterInput *pin);
-void UserWorkBeforeOutput(MeshBlock *pmb, ParameterInput *pin,
-                          const parthenon::SimTime &tm);
-TaskStatus ProblemFillTracers(MeshData<Real> *md, const parthenon::SimTime &tm,
-                              const Real dt);
-void Cleanup();
-} // namespace turbulence
 
 #endif // PGEN_PGEN_HPP_

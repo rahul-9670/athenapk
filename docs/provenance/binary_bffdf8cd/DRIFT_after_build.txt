@@ -1,8 +1,0 @@
-2026-07-31+13:41:07.0000000000  src/diagnostics/mag_diag.hpp
-2026-07-31+13:41:18.0000000000  src/diagnostics/mag_diag.cpp
-2026-07-31+15:56:49.0000000000  src/diagnostics/cons_diag.cpp
-2026-07-31+19:14:16.0000000000  src/diagnostics/cons_diag.hpp
-2026-07-31+19:17:46.0000000000  src/diagnostics/angmom_diag.hpp
-2026-07-31+19:18:24.0000000000  src/hydro/hydro.cpp
-2026-08-02+08:49:59.0000000000  src/diagnostics/angmom_diag.cpp
--rw-r--r-- 1 bbg6470 bbg6470 1882 2026-07-31_14:50:50 src/CMakeLists.txt

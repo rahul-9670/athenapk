@@ -1,37 +1,16 @@
 # Copyright (c) 2020-2021, Athena Parthenon Collaboration. All rights reserved.
 # Licensed under the 3-Clause License (the "LICENSE");
 
+# Flagship problem generator only.
+#
+# The 23 upstream/validation problem generators (advection, blast, cloud, cluster,
+# cpaw, cshock, diffusion, field_loop, jeans, kh, linear_wave, linear_wave_mhd,
+# lw_implode, orszag_tang, poisson_test, polytrope, rad_pulse, rad_shadow,
+# rad_shock, rand_blast, shattering, sod, turbulence) were moved out of the build
+# on 2026-08-10 -- see /beegfs/u/bbg6470/validation/code/pgen/ for the sources and
+# /beegfs/u/bbg6470/validation/README.md for how to put one back.  They are also
+# preserved in git at tag `validation-complete-2026-08-10`.
+
 target_sources(athenaPK PRIVATE
-    advection.cpp
-    blast.cpp
-    cloud.cpp
-    cluster.cpp
-    cluster/agn_feedback.cpp
-    cluster/agn_triggering.cpp
-    cluster/cluster_clips.cpp
-    cluster/cluster_reductions.cpp
-    cluster/hydrostatic_equilibrium_sphere.cpp
-    cluster/magnetic_tower.cpp
-    cluster/snia_feedback.cpp
-    cluster/stellar_feedback.cpp
-    cpaw.cpp
-    cshock.cpp
-    diffusion.cpp
-    field_loop.cpp
-    kh.cpp
-    linear_wave.cpp
-    linear_wave_mhd.cpp
-    jeans.cpp
-    polytrope.cpp
-    lw_implode.cpp
-    orszag_tang.cpp
-    rand_blast.cpp
-    sod.cpp
-    shattering.cpp
-    turbulence.cpp
     collapse_be.cpp
-    poisson_test.cpp
-    rad_pulse.cpp
-    rad_shadow.cpp
-    rad_shock.cpp
     )

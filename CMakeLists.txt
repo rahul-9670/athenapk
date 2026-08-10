@@ -80,8 +80,22 @@ endif()
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_subdirectory(src)
 
+# The upstream regression suite moved to /beegfs/u/bbg6470/validation/tst on 2026-08-10,
+# together with the problem generators and input decks it drives. It is not part of the
+# flagship build (the flagship compiles only the collapse_be pgen, so most of the suite
+# has nothing to run against). Point AthenaPK_REGRESSION_DIR at a restored tst/regression
+# to re-enable it. See /beegfs/u/bbg6470/validation/README.md.
+set(AthenaPK_REGRESSION_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tst/regression"
+    CACHE PATH "Path to the regression test suite (moved out of tree 2026-08-10)")
 if (AthenaPK_ENABLE_TESTING)
-  include(CTest)
-  add_subdirectory(tst/regression)
+  if (EXISTS ${AthenaPK_REGRESSION_DIR}/CMakeLists.txt)
+    include(CTest)
+    add_subdirectory(${AthenaPK_REGRESSION_DIR} tst_regression)
+  else()
+    message(STATUS
+      "AthenaPK_ENABLE_TESTING is ON but no regression suite at "
+      "${AthenaPK_REGRESSION_DIR} -- skipping. The suite lives in "
+      "/beegfs/u/bbg6470/validation/tst.")
+  endif()
 endif()
 

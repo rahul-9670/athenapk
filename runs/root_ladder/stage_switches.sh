@@ -24,7 +24,7 @@ WRAPSRC=/beegfs/u/bbg6470/athenapk/runs/wrap_mod.sh
 # it. Do not "modernise" this line -- flipping it silently makes the 512 rung incomparable to the
 # other two, which is exactly the class of error rule 6 (paired artifacts stay paired) exists for.
 export CLAMP=false
-BIN=/beegfs/u/bbg6470/athenapk/build_gpu_v2/bin/athenaPK
+BIN=/beegfs/u/bbg6470/validation/builds/build_gpu_v2/bin/athenaPK  # moved 2026-08-10
 [ -r "$WRAPSRC" ] || { echo "FATAL: no GPU-pinning wrapper at $WRAPSRC"; exit 1; }
 [ -x "$BIN" ]     || { echo "FATAL: no binary at $BIN"; exit 1; }
 echo "binary: $(md5sum $BIN)"
