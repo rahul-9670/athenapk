@@ -49,10 +49,13 @@ tlim       = 1.5
 nlim       = -1
 
 <hydro>
-fluid          = euler
+# 2026-08-10: was fluid=euler / riemann=hllc. This deck is the flagship's minimal example
+# and the flagship is MHD, so it now matches: glmmhd + HLLD. The pure-hydro path was
+# removed from the build on the same day (see src/main.hpp).
+fluid          = glmmhd
 eos            = adiabatic
 gamma          = 1.4
-riemann        = hllc
+riemann        = hlld
 reconstruction = plm
 
 <refinement>

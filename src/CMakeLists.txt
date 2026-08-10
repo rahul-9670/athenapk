@@ -9,7 +9,6 @@ add_executable(
         units/physical_units.hpp
         units/ionization_environment.hpp
         bvals/boundary_conditions_apk.hpp
-        eos/adiabatic_hydro.cpp
         hydro/diffusion/ambipolar.cpp
         hydro/diffusion/conduction.cpp
         hydro/diffusion/diffusion.cpp
@@ -31,8 +30,6 @@ add_executable(
         hydro/ct/ct.hpp
         hydro/glmmhd/dedner_source.cpp
         hydro/prolongation/custom_ops.hpp
-        hydro/srcterms/tabular_cooling.hpp
-        hydro/srcterms/tabular_cooling.cpp
         refinement/gradient.cpp
         refinement/other.cpp
         refinement/jeans.cpp

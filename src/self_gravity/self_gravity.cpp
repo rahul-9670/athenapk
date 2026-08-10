@@ -447,7 +447,7 @@ void FillPoissonRHS(MeshData<Real> *md) {
   // inter-package FillDerived ordering dependency entirely. `cons` is Independent and is
   // restored directly from the restart file, so it is valid before any derived quantity is.
   // The density floor ConsToPrim applies (adiabatic_glmmhd.hpp:152 /
-  // adiabatic_hydro.hpp:81 do `u_d = max(u_d, density_floor_)`). Applying it here is what
+  // adiabatic_glmmhd.hpp (EquationOfState base) do `u_d = max(u_d, density_floor_)`). Applying it here is what
   // makes reading `cons` EXACTLY equivalent to reading `prim`: without it the RHS uses
   // unfloored (possibly sub-floor or negative) densities and the trajectory changes -- which
   // it measurably did, diverging from the pre-fix fresh run by cycle 2. A no-op fix must

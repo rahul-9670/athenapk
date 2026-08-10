@@ -32,11 +32,17 @@ enum {
 // array indices for 1D primitives: velocity, transverse components of field
 enum { IV1 = 1, IV2 = 2, IV3 = 3, IPR = 4 };
 
-enum class RiemannSolver { undefined, none, hlle, llf, hllc, hlld };
+// 2026-08-10, flagship reduction: `hllc` and `Fluid::euler` are gone. They were the
+// pure-hydro path -- the flagship is MHD (glmmhd + CT) and no production deck ever set
+// `hydro/fluid = euler`. Removing euler also removed the three hydro-only Riemann solvers
+// (hydro_hlle/hydro_hllc/hydro_dc_llf) and ~14 template instantiations of the flux kernel.
+// `Cooling` went with the tabular optically-thin cooling, which was cluster/ISM physics;
+// the flagship cools barotropically and through M1 radiation.
+// All of it is restorable from git tag `validation-complete-2026-08-10`.
+enum class RiemannSolver { undefined, none, hlle, llf, hlld };
 enum class Reconstruction { undefined, dc, plm, ppm, wenoz, weno3, limo3 };
 enum class Integrator { undefined, rk1, rk2, vl2, rk3 };
-enum class Fluid { undefined, euler, glmmhd };
-enum class Cooling { none, tabular };
+enum class Fluid { undefined, glmmhd };
 enum class Conduction { none, isotropic, anisotropic };
 enum class ConductionCoeff { none, fixed, spitzer };
 enum class Viscosity { none, isotropic };

@@ -9,7 +9,6 @@
 // Parthenon headers
 #include <parthenon/package.hpp>
 
-#include "../eos/adiabatic_hydro.hpp"
 
 using namespace parthenon::package::prelude;
 
@@ -66,7 +65,7 @@ TaskStatus CalculateFluxesTight(std::shared_ptr<MeshData<Real>> &md);
 template <Fluid fluid, Reconstruction recon, RiemannSolver rsolver>
 TaskStatus CalculateFluxes(std::shared_ptr<MeshData<Real>> &md);
 using FluxFun_t =
-    decltype(CalculateFluxes<Fluid::euler, Reconstruction::dc, RiemannSolver::hlle>);
+    decltype(CalculateFluxes<Fluid::glmmhd, Reconstruction::dc, RiemannSolver::hlle>);
 
 template <Fluid fluid>
 TaskStatus FirstOrderFluxCorrect(MeshData<Real> *u0_data, MeshData<Real> *u1_data,
@@ -85,11 +84,6 @@ void add_flux_fun(std::map<FluxFunKey_t, FluxFun_t *> &flux_functions) {
 // Get number of "fluid" variable used
 template <Fluid fluid>
 constexpr size_t GetNVars();
-
-template <>
-constexpr size_t GetNVars<Fluid::euler>() {
-  return 5; // rho, u_x, u_y, u_z, E
-}
 
 template <>
 constexpr size_t GetNVars<Fluid::glmmhd>() {

@@ -804,15 +804,33 @@ Real RadDtMesh(Mesh *pmesh) {
 void AddRadiationTasks(TaskCollection &tc, Mesh *pmesh, const Real dt) {
   using namespace parthenon;
   TaskID none(0);
-  if (getenv("RAD_DISABLE_TRANSPORT") != nullptr) return; // diagnostic: no-op transport
+  auto pkg = pmesh->packages.Get("radiation");
+
+  // 2026-08-10: these two were environment variables (RAD_DISABLE_TRANSPORT,
+  // RAD_PRINT_NSUB). An env var can silently change the physics with nothing in the deck,
+  // the log header or the output to record it -- the same silent-inertness class as an
+  // unknown CLI key or the opacity-table edge clamp. They are deck keys now, so a run that
+  // disables transport says so in its own input file and in its restart's stored deck.
+  // Both default false => unchanged behaviour.
+  if (pkg->Param<bool>("disable_transport")) {
+    if (parthenon::Globals::my_rank == 0) {
+      static bool warned = false;
+      if (!warned) {
+        std::cout << "### WARNING Radiation: radiation/disable_transport = true -- M1 "
+                     "transport is a NO-OP for this run. Diagnostic use only."
+                  << std::endl;
+        warned = true;
+      }
+    }
+    return;
+  }
 
   const Real dt_rad = RadDtMesh(pmesh);
   const int nsub = std::max(1, static_cast<int>(std::ceil(dt / (dt_rad + RadFuzz()))));
   const Real dts = dt / static_cast<Real>(nsub);
-  if (getenv("RAD_PRINT_NSUB") != nullptr && parthenon::Globals::my_rank == 0)
+  if (pkg->Param<bool>("print_nsub") && parthenon::Globals::my_rank == 0)
     printf("[RAD_NSUB] nsub=%d dt=%.3e dt_rad=%.3e\n", nsub, dt, dt_rad), fflush(stdout);
 
-  auto pkg = pmesh->packages.Get("radiation");
   const bool do_coupling = pkg->Param<bool>("matter_coupling");
 
   // Multigroup: the rad-only sub-container (flux correction + ghost exchange) must carry

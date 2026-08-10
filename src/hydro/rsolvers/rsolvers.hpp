@@ -23,30 +23,14 @@ using parthenon::Real;
 template <Fluid fluid, RiemannSolver rsolver>
 struct Riemann;
 
-// now include the specializations
+// now include the specializations.
+// The pure-hydro solvers (hydro_hlle, hydro_hllc, hydro_dc_llf) were removed on
+// 2026-08-10 with Fluid::euler -- see main.hpp. The flagship is MHD.
 #include "glmmhd_dc_llf.hpp"
 #include "glmmhd_hlld.hpp"
 #include "glmmhd_hlle.hpp"
-#include "hydro_dc_llf.hpp"
-#include "hydro_hllc.hpp"
-#include "hydro_hlle.hpp"
 
-// "none" solvers for runs/testing without fluid evolution, i.e., just reset fluxes
-template <>
-struct Riemann<Fluid::euler, RiemannSolver::none> {
-  static KOKKOS_INLINE_FUNCTION void
-  Solve(parthenon::team_mbr_t const &member, const int k, const int j, const int il,
-        const int iu, const int ivx, const parthenon::ScratchPad2D<Real> &wl,
-        const parthenon::ScratchPad2D<Real> &wr, VariableFluxPack<Real> &cons,
-        const AdiabaticHydroEOS &eos, const Real c_h) {
-    parthenon::par_for_inner(member, il, iu, [&](const int i) {
-      for (size_t v = 0; v < Hydro::GetNVars<Fluid::euler>(); v++) {
-        cons.flux(ivx, v, k, j, i) = 0.0;
-      }
-    });
-  }
-};
-
+// "none" solver for runs/testing without fluid evolution, i.e., just reset fluxes
 template <>
 struct Riemann<Fluid::glmmhd, RiemannSolver::none> {
   static KOKKOS_INLINE_FUNCTION void

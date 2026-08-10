@@ -17,7 +17,6 @@
 
 // AthenaPK headers
 #include "../eos/adiabatic_glmmhd.hpp"
-#include "../eos/adiabatic_hydro.hpp"
 #include "../main.hpp"
 #include "../pgen/pgen.hpp"
 #include "../recon/dc_simple.hpp"
@@ -44,7 +43,6 @@
 #include "outputs/outputs.hpp"
 #include "prolongation/custom_ops.hpp"
 #include "rsolvers/rsolvers.hpp"
-#include "srcterms/tabular_cooling.hpp"
 #include "utils/error_checking.hpp"
 #include "../self_gravity/self_gravity.hpp"
 #include "../radiation/radiation.hpp"
@@ -62,7 +60,6 @@ using namespace parthenon::package::prelude;
 
 namespace Hydro {
 
-using cooling::TabularCooling;
 using parthenon::HistoryOutputVar;
 
 parthenon::Packages_t ProcessPackages(std::unique_ptr<ParameterInput> &pin) {
@@ -473,14 +470,6 @@ TaskStatus AddUnsplitSources(MeshData<Real> *md, const SimTime &tm, const Real b
       !hydro_pkg->Param<bool>("ct_glm_inert")) {
     hydro_pkg->Param<GLMMHD::SourceFun_t>("glmmhd_source")(md, beta_dt);
   }
-  const auto &enable_cooling = hydro_pkg->Param<Cooling>("enable_cooling");
-
-  if (enable_cooling == Cooling::tabular) {
-    const TabularCooling &tabular_cooling =
-        hydro_pkg->Param<TabularCooling>("tabular_cooling");
-
-    tabular_cooling.SrcTerm(md, beta_dt);
-  }
   if (ProblemSourceUnsplit != nullptr) {
     ProblemSourceUnsplit(md, tm, beta_dt);
   }
@@ -599,15 +588,15 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     pkg->AddParam<Real>("phys_units/mu_n", envprov.mu_n, RM::Restart);
   }
 
-  const auto fluid_str = pin->GetOrAddString("hydro", "fluid", "euler");
+  // Flagship build: MHD only. `euler` was removed on 2026-08-10 (see main.hpp), so the
+  // default is glmmhd and a deck asking for euler fails loudly below rather than silently
+  // running a different fluid.
+  const auto fluid_str = pin->GetOrAddString("hydro", "fluid", "glmmhd");
   auto fluid = Fluid::undefined;
   bool calc_c_h = false; // calculate hyperbolic divergence cleaning speed
   int nhydro = -1;
 
-  if (fluid_str == "euler") {
-    fluid = Fluid::euler;
-    nhydro = GetNVars<Fluid::euler>();
-  } else if (fluid_str == "glmmhd") {
+  if (fluid_str == "glmmhd") {
     fluid = Fluid::glmmhd;
     nhydro = GetNVars<Fluid::glmmhd>();
     // TODO(pgrete) reeval default value based on testing
@@ -625,7 +614,9 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     pkg->AddParam<Real>("glmmhd_alpha", glmmhd_alpha);
     calc_c_h = true;
   } else {
-    PARTHENON_FAIL("AthenaPK hydro: Unknown fluid method.");
+    PARTHENON_FAIL("AthenaPK hydro: Unknown fluid method. This is the flagship build, "
+                   "which supports hydro/fluid = glmmhd only; the pure-hydro (euler) path "
+                   "was removed 2026-08-10 (git tag validation-complete-2026-08-10).");
   }
   pkg->AddParam<>("fluid", fluid);
   pkg->AddParam<>("nhydro", nhydro);
@@ -824,8 +815,6 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                       "LLF Riemann solver only implemented with DC reconstruction.")
   } else if (riemann_str == "hlle") {
     riemann = RiemannSolver::hlle;
-  } else if (riemann_str == "hllc") {
-    riemann = RiemannSolver::hllc;
   } else if (riemann_str == "hlld") {
     riemann = RiemannSolver::hlld;
   } else if (riemann_str == "none") {
@@ -857,19 +846,6 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // TODO(?) The following line could potentially be set by configure-time options
   // so that the resulting binary can only contain a subset of included flux functions
   // to reduce size.
-  add_flux_fun<Fluid::euler, Reconstruction::dc, RiemannSolver::hlle>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::dc, RiemannSolver::none>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::plm, RiemannSolver::hlle>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::ppm, RiemannSolver::hlle>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::weno3, RiemannSolver::hlle>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::limo3, RiemannSolver::hlle>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::wenoz, RiemannSolver::hlle>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::dc, RiemannSolver::hllc>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::plm, RiemannSolver::hllc>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::ppm, RiemannSolver::hllc>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::weno3, RiemannSolver::hllc>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::limo3, RiemannSolver::hllc>(flux_functions);
-  add_flux_fun<Fluid::euler, Reconstruction::wenoz, RiemannSolver::hllc>(flux_functions);
   add_flux_fun<Fluid::glmmhd, Reconstruction::dc, RiemannSolver::hlle>(flux_functions);
   add_flux_fun<Fluid::glmmhd, Reconstruction::dc, RiemannSolver::none>(flux_functions);
   add_flux_fun<Fluid::glmmhd, Reconstruction::plm, RiemannSolver::hlle>(flux_functions);
@@ -884,8 +860,6 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   add_flux_fun<Fluid::glmmhd, Reconstruction::limo3, RiemannSolver::hlld>(flux_functions);
   add_flux_fun<Fluid::glmmhd, Reconstruction::wenoz, RiemannSolver::hlld>(flux_functions);
   // Add first order recon with LLF fluxes (implemented for testing as tight loop)
-  flux_functions[std::make_tuple(Fluid::euler, Reconstruction::dc, RiemannSolver::llf)] =
-      Hydro::CalculateFluxesTight<Fluid::euler>;
   flux_functions[std::make_tuple(Fluid::glmmhd, Reconstruction::dc, RiemannSolver::llf)] =
       Hydro::CalculateFluxesTight<Fluid::glmmhd>;
 
@@ -947,10 +921,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       pin->GetOrAddBoolean("hydro", "first_order_flux_correct", false);
   pkg->AddParam<>("first_order_flux_correct", first_order_flux_correct);
   if (first_order_flux_correct) {
-    if (fluid == Fluid::euler) {
-      pkg->AddParam<FirstOrderFluxCorrectFun_t *>("first_order_flux_correct_fun",
-                                                  FirstOrderFluxCorrect<Fluid::euler>);
-    } else if (fluid == Fluid::glmmhd) {
+    if (fluid == Fluid::glmmhd) {
       pkg->AddParam<FirstOrderFluxCorrectFun_t *>("first_order_flux_correct_fun",
                                                   FirstOrderFluxCorrect<Fluid::glmmhd>);
     }
@@ -1859,14 +1830,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       }
     }
 
-    if (fluid == Fluid::euler) {
-      PARTHENON_REQUIRE(!use_h2diss,
-                        "H2-dissociation EOS (eos=hydrogen) is wired for fluid=glmmhd only.");
-      AdiabaticHydroEOS eos(pfloor, dfloor, efloor, vceil, eceil, gamma);
-      pkg->AddParam<>("eos", eos);
-      pkg->FillDerivedMesh = ConsToPrim<AdiabaticHydroEOS>;
-      pkg->EstimateTimestepMesh = EstimateTimestep<Fluid::euler>;
-    } else if (fluid == Fluid::glmmhd) {
+    if (fluid == Fluid::glmmhd) {
       // Boris / semi-relativistic Alfven-speed limiter: cap c_b on the Alfven speed used in
       // the Maxwell-stress FORCE + signal speeds (via the EOS + a per-interface LLF-Boris
       // branch in the HLLD solver). Relaxes the timestep / tames the vA runaway in evacuated
@@ -1888,25 +1852,19 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     PARTHENON_FAIL("AthenaPK hydro: Unknown EOS");
   }
 
-  /************************************************************
-   * Read Tabular Cooling
-   ************************************************************/
-
-  const auto enable_cooling_str =
-      pin->GetOrAddString("cooling", "enable_cooling", "none");
-
-  auto cooling = Cooling::none;
-  if (enable_cooling_str == "tabular") {
-    cooling = Cooling::tabular;
-  } else if (enable_cooling_str != "none") {
-    PARTHENON_FAIL("AthenaPK hydro: Unknown cooling string. Supported options are "
-                   "'none' and 'tabular'");
-  }
-  pkg->AddParam<>("enable_cooling", cooling);
-
-  if (cooling == Cooling::tabular) {
-    TabularCooling tabular_cooling(pin, pkg);
-    pkg->AddParam<>("tabular_cooling", tabular_cooling);
+  // Tabular optically-thin cooling was removed on 2026-08-10: it was cluster/ISM physics
+  // (Townsend exact integration / operator-split subcycling over a Lambda(T) table) and no
+  // flagship deck ever enabled it. The flagship cools barotropically (collapse_be's
+  // ApplyBarotropicCooling) and radiatively (the M1 package). A deck that still sets
+  // <cooling> enable_cooling is caught here rather than silently ignored.
+  {
+    const auto enable_cooling_str =
+        pin->GetOrAddString("cooling", "enable_cooling", "none");
+    PARTHENON_REQUIRE(
+        enable_cooling_str == "none",
+        "cooling/enable_cooling is set, but tabular cooling was removed from this "
+        "flagship build on 2026-08-10 (git tag validation-complete-2026-08-10). "
+        "Remove the key, or restore src/hydro/srcterms/tabular_cooling.*");
   }
 
   auto scratch_level = pin->GetOrAddInteger("hydro", "scratch_level", 0);
@@ -2355,8 +2313,7 @@ Real EstimateHyperbolicTimestep(MeshData<Real> *md) {
   const auto &cfl_hyp = hydro_pkg->Param<Real>("cfl");
   const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
   const auto &eos_ =
-      hydro_pkg->Param<typename std::conditional<fluid == Fluid::euler, AdiabaticHydroEOS,
-                                                 AdiabaticGLMMHDEOS>::type>("eos");
+      hydro_pkg->Param<AdiabaticGLMMHDEOS>("eos");
 
   IndexRange ib = md->GetBlockData(0)->GetBoundsI(IndexDomain::interior);
   IndexRange jb = md->GetBlockData(0)->GetBoundsJ(IndexDomain::interior);
@@ -2386,12 +2343,7 @@ Real EstimateHyperbolicTimestep(MeshData<Real> *md) {
         w[IV3] = prim(IV3, k, j, i);
         w[IPR] = prim(IPR, k, j, i);
         Real lambda_max_x, lambda_max_y, lambda_max_z;
-        if constexpr (fluid == Fluid::euler) {
-          lambda_max_x = eos.SoundSpeed(w);
-          lambda_max_y = lambda_max_x;
-          lambda_max_z = lambda_max_x;
-
-        } else if constexpr (fluid == Fluid::glmmhd) {
+        if constexpr (fluid == Fluid::glmmhd) {
           lambda_max_x = eos.FastMagnetosonicSpeed(
               w[IDN], w[IPR], prim(IB1, k, j, i), prim(IB2, k, j, i), prim(IB3, k, j, i));
           if (ndim > 1) {
@@ -2444,15 +2396,6 @@ Real EstimateTimestep(MeshData<Real> *md) {
   if (calc_dt_hyp) {
     dt_hyp = EstimateHyperbolicTimestep<fluid>(md);
     min_dt = std::min(min_dt, dt_hyp);
-  }
-
-  const auto &enable_cooling = hydro_pkg->Param<Cooling>("enable_cooling");
-
-  if (enable_cooling == Cooling::tabular) {
-    const TabularCooling &tabular_cooling =
-        hydro_pkg->Param<TabularCooling>("tabular_cooling");
-
-    min_dt = std::min(min_dt, tabular_cooling.EstimateTimeStep(md));
   }
 
   auto dt_diff = std::numeric_limits<Real>::max();
@@ -2556,8 +2499,7 @@ TaskStatus CalculateFluxesTight(std::shared_ptr<MeshData<Real>> &md) {
   auto pkg = pmb->packages.Get("Hydro");
 
   const auto &eos =
-      pkg->Param<typename std::conditional<fluid == Fluid::euler, AdiabaticHydroEOS,
-                                           AdiabaticGLMMHDEOS>::type>("eos");
+      pkg->Param<AdiabaticGLMMHDEOS>("eos");
 
   // Hyperbolic divergence cleaning speed for GLM MHD
   Real c_h = 0.0;
@@ -2612,8 +2554,7 @@ TaskStatus CalculateFluxes(std::shared_ptr<MeshData<Real>> &md) {
   const auto nscalars = pkg->Param<int>("nscalars");
 
   const auto &eos =
-      pkg->Param<typename std::conditional<fluid == Fluid::euler, AdiabaticHydroEOS,
-                                           AdiabaticGLMMHDEOS>::type>("eos");
+      pkg->Param<AdiabaticGLMMHDEOS>("eos");
 
   auto num_scratch_vars = nhydro + nscalars;
 
@@ -2820,8 +2761,7 @@ TaskStatus FirstOrderFluxCorrect(MeshData<Real> *u0_data, MeshData<Real> *u1_dat
   auto pkg = pmb->packages.Get("Hydro");
 
   const auto &eos =
-      pkg->Param<typename std::conditional<fluid == Fluid::euler, AdiabaticHydroEOS,
-                                           AdiabaticGLMMHDEOS>::type>("eos");
+      pkg->Param<AdiabaticGLMMHDEOS>("eos");
 
   // Hyperbolic divergence cleaning speed for GLM MHD
   Real c_h = 0.0;

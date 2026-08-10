@@ -8,7 +8,6 @@
 #include <limits>
 
 #include "../eos/adiabatic_glmmhd.hpp"
-#include "../eos/adiabatic_hydro.hpp"
 #include "../hydro/hydro.hpp"
 #include "../main.hpp"
 #include "refinement.hpp"
@@ -98,15 +97,11 @@ parthenon::AmrTag Jeans(MeshBlockData<Real> *rc) {
 
   auto hydro_pkg = pmb->packages.Get("Hydro");
   const Real njeans = hydro_pkg->Param<Real>("refinement/njeans");
-  const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
-
-  // eos=hydrogen is wired for fluid=glmmhd only (hydro.cpp), so the euler branch can only
-  // ever hold the gamma-law EOS -- but it is fetched by its own type either way, so both
-  // paths go through the same SoundSpeed the integrator uses.
-  const Real njmin = mhd ? MinJeansLengthInCells(
-                               pmb, hydro_pkg->Param<AdiabaticGLMMHDEOS>("eos"), true)
-                         : MinJeansLengthInCells(
-                               pmb, hydro_pkg->Param<AdiabaticHydroEOS>("eos"), false);
+  // The flagship build is MHD-only (Fluid::euler removed 2026-08-10), so the EOS is always
+  // the GLMMHD one and the Jeans length uses the fast magnetosonic speed -- the same speed
+  // the integrator's timestep uses.
+  const Real njmin =
+      MinJeansLengthInCells(pmb, hydro_pkg->Param<AdiabaticGLMMHDEOS>("eos"), true);
 
   if (njmin < njeans) return parthenon::AmrTag::refine;
   if (njmin > 2.5 * njeans) return parthenon::AmrTag::derefine;

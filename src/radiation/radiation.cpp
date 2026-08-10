@@ -297,6 +297,14 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // units (c_s,iso = 1 at 10 K), pressure p = rho*T_code with T_code = 1 <=> 10 K,
   // so e_int = rho*T/(gamma-1) and the heat capacity per volume Cv = rho/(gamma-1).
   pkg->AddParam("matter_coupling", pin->GetOrAddBoolean(bn, "matter_coupling", true));
+
+  // Diagnostics, promoted from environment variables to deck keys on 2026-08-10 (they were
+  // RAD_DISABLE_TRANSPORT / RAD_PRINT_NSUB). Both default false, so behaviour is unchanged;
+  // the point is that setting one now leaves a record in the deck and in the restart file,
+  // instead of living only in the submitting shell's environment.
+  // disable_transport makes M1 transport a NO-OP -- it is a diagnostic, not a physics switch.
+  pkg->AddParam("disable_transport", pin->GetOrAddBoolean(bn, "disable_transport", false));
+  pkg->AddParam("print_nsub", pin->GetOrAddBoolean(bn, "print_nsub", false));
   pkg->AddParam("gamma", pin->GetReal("hydro", "gamma"));
   // H2-dissociation general EOS: when active, RT owns the gas energy and must use the
   // SAME Saha EOS as the hydro to map internal-energy <-> temperature (else RT and hydro

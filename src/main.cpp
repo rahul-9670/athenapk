@@ -80,22 +80,13 @@ int main(int argc, char *argv[]) {
     PARTHENON_THROW(msg);
   }
 
-  const std::string REFLECTING = "reflecting";
+  // The "reflecting" BC was removed on 2026-08-10 with the pure-hydro path. Its
+  // implementation opened with PARTHENON_REQUIRE_THROWS(fluid == Fluid::euler,
+  // "Reflecting boundary conditions for MHD need special treatment.") -- so in an MHD-only
+  // build it could only ever abort. Production uses `diode` (registered below) or
+  // Parthenon's built-in `outflow`/`periodic`.
   using BF = parthenon::BoundaryFace;
-  using Hydro::BoundaryFunction::ReflectBC;
   using parthenon::BoundaryFunction::BCSide;
-  pman.app_input->RegisterBoundaryCondition(BF::inner_x1, REFLECTING,
-                                            ReflectBC<X1DIR, BCSide::Inner>);
-  pman.app_input->RegisterBoundaryCondition(BF::outer_x1, REFLECTING,
-                                            ReflectBC<X1DIR, BCSide::Outer>);
-  pman.app_input->RegisterBoundaryCondition(BF::inner_x2, REFLECTING,
-                                            ReflectBC<X2DIR, BCSide::Inner>);
-  pman.app_input->RegisterBoundaryCondition(BF::outer_x2, REFLECTING,
-                                            ReflectBC<X2DIR, BCSide::Outer>);
-  pman.app_input->RegisterBoundaryCondition(BF::inner_x3, REFLECTING,
-                                            ReflectBC<X3DIR, BCSide::Inner>);
-  pman.app_input->RegisterBoundaryCondition(BF::outer_x3, REFLECTING,
-                                            ReflectBC<X3DIR, BCSide::Outer>);
 
   // VALIDATION B1: inflow-suppressing outflow ("diode"). Parthenon's `outflow` is a plain
   // zero-gradient copy and admits inflow -- measured as ~-178 per face in WP-6's cons-Mout,

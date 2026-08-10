@@ -18,7 +18,6 @@
 #include "utils/error_checking.hpp"
 #include <parthenon/parthenon.hpp>
 // AthenaPK headers
-#include "../eos/adiabatic_hydro.hpp"
 #include "../tracers/tracers.hpp"
 #include "../sinks/sinks.hpp"
 #include "ct/ct.hpp"
