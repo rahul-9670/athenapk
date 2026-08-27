@@ -25,7 +25,11 @@ using parthenon::Real;
 
 constexpr parthenon::TopologicalElement te = parthenon::TopologicalElement::CC;
 
-// Implements A.x = y and diag(A) for A = -grad^2 in conservative flux form.
+// Implements A.x = y and diag(A) for A = +grad^2 (the POSITIVE discrete Laplacian)
+// in conservative flux form, so that A.phi = rhs with rhs = +4piG(rho - rho_mean)
+// is the standard Poisson equation; see the sign-convention note on CalculateFluxes
+// below. Note this differs from the Parthenon poisson_gmg example and from Artemis,
+// which both pose A = -grad^2 (and hence a positive diagonal).
 // Templated only on var_t (the solution variable type). D = 1 is hard-coded
 // (no variable-coefficient diffusion); alpha = 0 is hard-coded (no Helmholtz shift).
 // This is a stripped Parthenon poisson_gmg PoissonEquation.
@@ -34,8 +38,8 @@ class PoissonEquation {
  public:
   using IndependentVars = parthenon::TypeList<var_t>;
 
-  // Flux correction: on for AMR base grid, off inside MG two-level composite grids.
-  // Matches the Artemis gating exactly.
+  // No configurable state; pin/label are part of the interface the Parthenon solvers
+  // construct this with. (The AMR flux-correction gating lives in Ax below.)
   PoissonEquation(parthenon::ParameterInput *pin, const std::string &label) {}
 
   // y = A.x
