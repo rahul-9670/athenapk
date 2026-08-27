@@ -17,13 +17,24 @@ Parthenon's geometric-multigrid (GMG) infrastructure.
 - The Poisson equation is solved with a **BiCGSTAB Krylov solver preconditioned by
   geometric multigrid** (`parthenon::solvers::BiCGSTABSolver` +
   `MGSolver`), which converges robustly on the block-AMR hierarchy.
-- The solve is **stage-consistent**: the Poisson equation is solved from each stage's
-  updated density, and the Artemis-style flux-weighted gravitational source term
-  (`ApplyGravitySource`) carries that stage's $\beta\,\Delta t$ weight, exactly like the
-  hydro flux update and the other unsplit sources. Both the predictor and the corrector
-  of the VL2 integrator therefore feel gravity, which keeps the coupling second order in
-  time; solving once on the final stage with the full $\Delta t$ instead makes it fully
-  operator-split and first order. The cost is one extra elliptic solve per step.
+- The solve is **stage-consistent**: the Poisson equation is solved once per integrator
+  stage from that stage's density, and the Artemis-style flux-weighted gravitational
+  source term (`ApplyGravitySource`) carries the stage's $\beta\,\Delta t$ weight, exactly
+  like the hydro flux update and the other unsplit sources. Both the predictor and the
+  corrector of the VL2 integrator therefore feel gravity. The cost is one extra elliptic
+  solve per step.
+- **Measured temporal order.** On the unstable Jeans mode (128 cells, $c_s=0.1$, $t=5$),
+  Richardson extrapolation of the final modal amplitude over a CFL ladder gives ratios
+  2.28, 2.15, 2.08 for the triples 0.2/0.1/0.05, 0.1/0.05/0.025 and 0.05/0.025/0.0125 —
+  monotonically approaching 2, i.e. **the gravitational coupling converges at first order
+  in $\Delta t$**, not second, even though the surrounding VL2 scheme is second order.
+  Stage-consistency still matters a great deal for the error *coefficient*: evaluating the
+  source from the already-updated conserved state instead of the start-of-stage
+  primitives costs a further factor of ~30 in temporal error at fixed CFL. The mechanism
+  behind the order reduction has not been identified; a useful next step is to check
+  whether a non-gravitational source enrolled through the same `ProblemSourceUnsplit`
+  path shows the same behaviour, which would make this a property of the unsplit-source
+  placement rather than of self-gravity.
 - The source term writes interior cells only and runs after the stage's boundary
   exchange (the solve is global, so it cannot sit inside the stage task list), so the
   ghost zones are re-communicated before `FillDerived`. Without that, the next stage's
