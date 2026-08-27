@@ -28,8 +28,13 @@ constexpr parthenon::TopologicalElement te = parthenon::TopologicalElement::CC;
 // Implements A.x = y and diag(A) for A = +grad^2 (the POSITIVE discrete Laplacian)
 // in conservative flux form, so that A.phi = rhs with rhs = +4piG(rho - rho_mean)
 // is the standard Poisson equation; see the sign-convention note on CalculateFluxes
-// below. Note this differs from the Parthenon poisson_gmg example and from Artemis,
-// which both pose A = -grad^2 (and hence a positive diagonal).
+// below. This matches the Parthenon poisson_gmg example and Artemis exactly: all three
+// store the face flux as (phi[i-1] - phi[i])/dx and take the divergence as
+// (F_l A_l - F_r A_r)/V, which is +grad^2, with a correspondingly NEGATIVE diagonal.
+// (A = -grad^2 would be the positive-definite choice classical multigrid theory is
+// written for, but since the operator and its diagonal carry the same sign the
+// weighted-Jacobi smoother is unchanged, and this is the convention the Parthenon
+// solvers are built around.)
 // Templated only on var_t (the solution variable type). D = 1 is hard-coded
 // (no variable-coefficient diffusion); alpha = 0 is hard-coded (no Helmholtz shift).
 // This is a stripped Parthenon poisson_gmg PoissonEquation.
