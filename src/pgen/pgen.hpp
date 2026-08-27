@@ -146,7 +146,7 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
 namespace jeans {
 using namespace parthenon::driver::prelude;
 
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+void ProblemGenerator(Mesh *pmesh, parthenon::ParameterInput *pin, MeshData<Real> *md);
 } // namespace jeans
 
 namespace turbulence {

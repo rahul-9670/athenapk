@@ -67,7 +67,7 @@ int main(int argc, char *argv[]) {
     pman.app_input->UserWorkAfterLoop = linear_wave_mhd::UserWorkAfterLoop;
     Hydro::ProblemInitPackageData = linear_wave_mhd::ProblemInitPackageData;
   } else if (problem == "jeans") {
-    pman.app_input->ProblemGenerator = jeans::ProblemGenerator;
+    pman.app_input->MeshProblemGenerator = jeans::ProblemGenerator;
   } else if (problem == "collapse_be") {
     pman.app_input->ProblemGenerator = collapse_be::ProblemGenerator;
     Hydro::ProblemInitPackageData = collapse_be::ProblemInitPackageData;

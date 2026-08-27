@@ -1,6 +1,6 @@
 //========================================================================================
 // AthenaPK - a performance portable block structured AMR astrophysical MHD
-// code. Copyright (c) 2025, Athena-Parthenon Collaboration. All rights
+// code. Copyright (c) 2026, Athena-Parthenon Collaboration. All rights
 // reserved. Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
 
@@ -41,10 +41,18 @@ parthenon::AmrTag Jeans(MeshBlockData<Real> *rc) {
   const Real gam = pmb->packages.Get("Hydro")->Param<Real>("AdiabaticIndex");
   const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
 
-  // Use the LARGEST cell spacing so the criterion is conservative on non-cubic
-  // cells (for the usual cubic cells this is just dx).
-  const Real dx =
-      std::max({pmb->coords.Dxc<1>(0), pmb->coords.Dxc<2>(0), pmb->coords.Dxc<3>(0)});
+  // Cubic cells are the norm for collapse problems but are not required, so take the
+  // LARGEST spacing: lambda_J/dx is then smallest, i.e. the criterion errs towards
+  // refining rather than under-resolving. Guard against strongly anisotropic cells,
+  // where a single scalar dx stops being a meaningful resolution measure at all.
+  const Real dx1 = pmb->coords.Dxc<1>(0);
+  const Real dx2 = pmb->coords.Dxc<2>(0);
+  const Real dx3 = pmb->coords.Dxc<3>(0);
+  const Real dx = std::max({dx1, dx2, dx3});
+  PARTHENON_DEBUG_REQUIRE_THROWS(
+      std::max({dx1, dx2, dx3}) <= 2.0 * std::min({dx1, dx2, dx3}),
+      "refinement/type=jeans assumes near-cubic cells, but this block's cell aspect "
+      "ratio exceeds 2, so a single Jeans-length-per-cell measure is ill-defined.");
 
   // 4 pi G in code units; 1 when self-gravity is not active (external potential).
   const auto &pkgs = pmb->packages.AllPackages();
@@ -64,17 +72,17 @@ parthenon::AmrTag Jeans(MeshBlockData<Real> *rc) {
       KOKKOS_LAMBDA(const int k, const int j, const int i, Real &lnjmin) {
         const Real rho = w(IDN, k, j, i);
         const Real p = w(IPR, k, j, i);
-        const Real cs = std::sqrt(gam * p / rho);
+        const Real cs = Kokkos::sqrt(gam * p / rho);
         Real v = cs;
         if (mhd) {
           const Real bsq = w(IB1, k, j, i) * w(IB1, k, j, i) +
                            w(IB2, k, j, i) * w(IB2, k, j, i) +
                            w(IB3, k, j, i) * w(IB3, k, j, i);
-          const Real va = std::sqrt(bsq / rho);
+          const Real va = Kokkos::sqrt(bsq / rho);
           v += va;
         }
-        const Real nj = v / std::sqrt(rho);
-        lnjmin = std::min(lnjmin, nj);
+        const Real nj = v / Kokkos::sqrt(rho);
+        lnjmin = Kokkos::fmin(lnjmin, nj);
       },
       Kokkos::Min<Real>(njmin));
 
