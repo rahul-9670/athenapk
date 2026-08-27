@@ -9,19 +9,31 @@
 //         (multipole BCs not yet supported in AthenaPK self-gravity).
 //         Large-box setup: domain size ~4x sphere radius in each direction,
 //         ambient density = BE profile value at r = rc (pressure-continuous).
+//
+//  IMPORTANT -- this problem generator does NOT run an ideal-gas evolution, despite
+//  <hydro>/eos = adiabatic and gamma = 1.4 in the input file. The problem-specific
+//  unsplit source term ApplyBarotropicCooling (enrolled as Hydro::ProblemSourceUnsplit)
+//  OVERWRITES the total energy in every cell on every stage with
+//
+//      e_th = rho/(gamma-1) * sqrt(1 + (rho/rhocrit)^(2(gamma-1)))
+//
+//  which is a barotropic equation of state, not a cooling rate. Below rhocrit that is
+//  exactly isothermal at c_s = 1 (p = rho); above it the gas stiffens to an adiabat of
+//  index gamma. gamma therefore only sets the stiff branch -- the run is isothermal
+//  everywhere the density is below rhocrit, whatever the EOS block says. The same
+//  source also zeroes the momentum outside r = rc, i.e. it imposes a fixed-velocity
+//  boundary on the ambient medium.
 
-#include <algorithm>
-#include <array>
 #include <cmath>
 #include <fstream>
 #include <iostream>
-#include <random>
 #include <string>
 #include <vector>
 
 #include <parthenon/package.hpp>
 
 #include "../main.hpp"
+#include "../units.hpp"
 #include "pgen.hpp"
 
 namespace collapse_be {
@@ -35,12 +47,17 @@ constexpr Real rc_code = 6.45;         // BE radius in code units
 constexpr Real rcsq_code = 26.0 / 3.0; // BE profile scale^2
 constexpr Real bemass_code = 197.561;  // total mass of critical BE sphere
 
-// Dimensional constants (cgs)
-constexpr Real cs10 = 1.9e4;      // cm/s, sound speed at 10 K
-constexpr Real msun = 1.9891e33;  // g
-constexpr Real au = 1.4959787e13; // cm
-constexpr Real yr = 3.15569e7;    // s
-constexpr Real G = 6.67259e-8;    // cgs
+// Dimensional constants. Everything that is a general physical constant comes from
+// the central Units class (src/units.hpp) rather than being redefined here; only the
+// problem-specific sound-speed normalization lives locally.
+// NOTE: Units' values differ slightly from the ones Athena++'s collapse.cpp uses
+// (G 6.67408e-8 vs 6.67259e-8, Msun 1.98841586e33 vs 1.9891e33), so the derived cgs
+// normalization shifts by ~0.03% relative to that code.
+constexpr Real cs10 = 1.9e4; // cm/s, isothermal sound speed at 10 K
+constexpr Real msun = Units::msun_cgs;
+constexpr Real au = Units::au_cgs;
+constexpr Real yr = Units::yr_cgs;
+constexpr Real G = Units::gravitational_constant_cgs;
 
 // These hold the derived physical parameters for logging and the cooling fn.
 // Parthenon doesn't give us a natural "namespace-scoped globals" pattern like
@@ -57,7 +74,7 @@ struct CollapseParams {
 
 // Approximated BE profile (Tomida 2011 PhD thesis)
 KOKKOS_INLINE_FUNCTION
-Real BEProfile(Real r) { return std::pow(1.0 + r * r / rcsq_code, -1.5); }
+Real BEProfile(Real r) { return Kokkos::pow(1.0 + r * r / rcsq_code, -1.5); }
 
 // ---------------------------------------------------------------------------
 // Problem generator: initialize cons variables on each block.
@@ -76,10 +93,10 @@ Real BEProfile(Real r) { return std::pow(1.0 + r * r / rcsq_code, -1.5); }
 void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *hydro_pkg) {
   const Real gam = pin->GetReal("hydro", "gamma");
 
-  const Real mass_msun = pin->GetReal("problem/collapse_be", "mass");
-  const Real temp_K = pin->GetReal("problem/collapse_be", "temperature");
+  const Real mass_msun = pin->GetReal("problem/collapse_be", "mass_msun");
+  const Real temp_K = pin->GetReal("problem/collapse_be", "temperature_K");
   const Real f = pin->GetReal("problem/collapse_be", "f");
-  const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit");
+  const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit_cgs");
 
   // The normalization below fixes 4*pi*G = 1 in code units, so the self-gravity
   // package must be using the same constant or the two are silently inconsistent.
@@ -101,31 +118,26 @@ void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *hyd
   const Real rhocrit_code = rhocrit_cgs / rho0;
   const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
 
-  if (!hydro_pkg->AllParams().hasKey("collapse_be_rhocrit")) {
-    hydro_pkg->AddParam("collapse_be_rhocrit", rhocrit_code);
-    hydro_pkg->AddParam("collapse_be_mhd", mhd);
-    hydro_pkg->AddParam("collapse_be_rc", rc_code);
-    hydro_pkg->AddParam("collapse_be_gamma", gam);
+  if (!hydro_pkg->AllParams().hasKey("collapse_be/rhocrit")) {
+    hydro_pkg->AddParam("collapse_be/rhocrit", rhocrit_code);
+    hydro_pkg->AddParam("collapse_be/mhd", mhd);
+    hydro_pkg->AddParam("collapse_be/rc", rc_code);
+    hydro_pkg->AddParam("collapse_be/gamma", gam);
 
-    // === Unit conversion factors to cgs ===
-    // Multiply a code-unit value by these to obtain cgs.
+    // Unit conversion factors to cgs, reported once for post-processing. These are
+    // written to the sidecar file only -- nothing in the code reads them back, so they
+    // are deliberately not registered as package parameters.
     const Real code_length_cgs = l0;
     const Real code_time_cgs = t0;
     const Real code_mass_cgs = m0;
     const Real code_density_cgs = rho0;
     const Real code_velocity_cgs = l0 / t0;
     const Real code_energy_cgs = m0 * (l0 / t0) * (l0 / t0);
+    // Heaviside-Lorentz B unit (AthenaPK convention): B_cgs = B_code * sqrt(4 pi) *
+    // this factor if a Gaussian field is wanted.
     const Real code_bfield_cgs = std::sqrt(rho0) * (l0 / t0);
 
-    hydro_pkg->AddParam("units/code_length_cgs", code_length_cgs);
-    hydro_pkg->AddParam("units/code_time_cgs", code_time_cgs);
-    hydro_pkg->AddParam("units/code_mass_cgs", code_mass_cgs);
-    hydro_pkg->AddParam("units/code_density_cgs", code_density_cgs);
-    hydro_pkg->AddParam("units/code_velocity_cgs", code_velocity_cgs);
-    hydro_pkg->AddParam("units/code_energy_cgs", code_energy_cgs);
-    hydro_pkg->AddParam("units/code_bfield_cgs", code_bfield_cgs);
-
-    // Sidecar JSON dump (rank 0 only; once per run).
+    // Sidecar JSON dump (rank 0 only; ProblemInitPackageData runs once per rank).
     if (parthenon::Globals::my_rank == 0) {
       std::ofstream js("units.json");
       js.precision(12);
@@ -150,12 +162,12 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   const Real gm1 = gam - 1.0;
   const Real igm1 = 1.0 / gm1;
 
-  const Real mass_msun = pin->GetReal("problem/collapse_be", "mass");
-  const Real temp_K = pin->GetReal("problem/collapse_be", "temperature");
+  const Real mass_msun = pin->GetReal("problem/collapse_be", "mass_msun");
+  const Real temp_K = pin->GetReal("problem/collapse_be", "temperature_K");
   const Real f = pin->GetReal("problem/collapse_be", "f");
   const Real amp = pin->GetOrAddReal("problem/collapse_be", "amp", 0.0);
   const Real omegatff = pin->GetOrAddReal("problem/collapse_be", "omegatff", 0.0);
-  const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit");
+  const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit_cgs");
 
   const Real m0 = mass_msun * msun / (bemass_code * f);
   const Real v0 = cs10 * std::sqrt(temp_K / 10.0);
@@ -169,7 +181,7 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   const Real rhocrit_code = rhocrit_cgs / rho0;
 
   auto hydro_pkg = pmb->packages.Get("Hydro");
-  const bool mhd = hydro_pkg->Param<bool>("collapse_be_mhd");
+  const bool mhd = hydro_pkg->Param<bool>("collapse_be/mhd");
   const Real B0z = mhd ? pin->GetOrAddReal("problem/collapse_be", "B0z", 0.0) : 0.0;
 
   // Log (rank 0 only)
@@ -203,9 +215,11 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   auto &u_dev = data->Get("cons").data;
   auto u = u_dev.GetHostMirrorAndCopy();
 
-  parthenon::IndexRange ib = pmb->cellbounds.GetBoundsI(parthenon::IndexDomain::entire);
-  parthenon::IndexRange jb = pmb->cellbounds.GetBoundsJ(parthenon::IndexDomain::entire);
-  parthenon::IndexRange kb = pmb->cellbounds.GetBoundsK(parthenon::IndexDomain::entire);
+  // Interior only: ghost zones are filled by the boundary exchange after the problem
+  // generator runs, so writing them here is redundant.
+  parthenon::IndexRange ib = pmb->cellbounds.GetBoundsI(parthenon::IndexDomain::interior);
+  parthenon::IndexRange jb = pmb->cellbounds.GetBoundsJ(parthenon::IndexDomain::interior);
+  parthenon::IndexRange kb = pmb->cellbounds.GetBoundsK(parthenon::IndexDomain::interior);
 
   auto &coords = pmb->coords;
   // Ambient density: BE profile value at r = rc (pressure-continuous)
@@ -257,222 +271,6 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
       }
     }
   }
-  // ============================================================================
-  // Initial-only turbulent velocity field (gated by turb_mach > 0).
-  // Adds a random divergence-free + compressive velocity perturbation on top
-  // of the deterministic IC above. The field is scaled to `turb_mach` via the
-  // ANALYTIC ensemble RMS of the mode spectrum, and the ANALYTIC region-mean
-  // velocity is subtracted so the cloud doesn't translate as a unit (both are
-  // closed-form so every rank/block applies identical factors; see notes below).
-  // ============================================================================
-  const Real turb_mach = pin->GetOrAddReal("problem/collapse_be", "turb_mach", 0.0);
-  if (turb_mach > 0.0) {
-    const int k_min = pin->GetOrAddInteger("problem/collapse_be", "turb_kmin", 2);
-    const int k_max = pin->GetOrAddInteger("problem/collapse_be", "turb_kmax", 6);
-    const int nmodes = pin->GetOrAddInteger("problem/collapse_be", "turb_nmodes", 64);
-    const Real zeta = pin->GetOrAddReal("problem/collapse_be", "turb_zeta", 0.5);
-    const Real alpha_s = pin->GetOrAddReal("problem/collapse_be", "turb_alpha", 2.0);
-    const std::string region =
-        pin->GetOrAddString("problem/collapse_be", "turb_region", std::string("sphere"));
-    const uint32_t seed = static_cast<uint32_t>(
-        pin->GetOrAddInteger("problem/collapse_be", "turb_seed", 12345));
-
-    const Real x1min_ = pin->GetReal("parthenon/mesh", "x1min");
-    const Real x1max_ = pin->GetReal("parthenon/mesh", "x1max");
-    const Real Lbox = x1max_ - x1min_;
-    const Real two_pi_over_L = 2.0 * M_PI / Lbox;
-
-    // Build the SAME mode list on every rank (deterministic with seed).
-    std::mt19937 mrng(seed);
-    std::uniform_real_distribution<Real> uphase(0.0, 2.0 * M_PI);
-    std::uniform_real_distribution<Real> ucos(-1.0, 1.0);
-    std::uniform_real_distribution<Real> uang(0.0, 2.0 * M_PI);
-    std::uniform_real_distribution<Real> ukmag(static_cast<Real>(k_min),
-                                               static_cast<Real>(k_max));
-
-    std::vector<std::array<Real, 3>> k_vec(nmodes), phase(nmodes), eps_sol(nmodes),
-        eps_comp(nmodes);
-    std::vector<Real> t_amp(nmodes);
-
-    for (int m = 0; m < nmodes; ++m) {
-      const Real kmag = ukmag(mrng);
-      const Real cos_t = ucos(mrng);
-      const Real sin_t = std::sqrt(std::max(0.0, 1.0 - cos_t * cos_t));
-      const Real phi_k = uang(mrng);
-      const Real kxh = sin_t * std::cos(phi_k);
-      const Real kyh = sin_t * std::sin(phi_k);
-      const Real kzh = cos_t;
-
-      k_vec[m] = {kmag * two_pi_over_L * kxh, kmag * two_pi_over_L * kyh,
-                  kmag * two_pi_over_L * kzh};
-      t_amp[m] = std::pow(kmag, -0.5 * alpha_s);
-      phase[m] = {uphase(mrng), uphase(mrng), uphase(mrng)};
-
-      // Solenoidal direction: pick non-aligned axis, cross with k_hat.
-      Real ax = 1.0, ay = 0.0, az = 0.0;
-      if (std::fabs(kxh) > std::fabs(kyh) && std::fabs(kxh) > std::fabs(kzh)) {
-        ax = 0.0;
-        ay = 1.0;
-        az = 0.0;
-      }
-      Real sx = ay * kzh - az * kyh;
-      Real sy = az * kxh - ax * kzh;
-      Real sz = ax * kyh - ay * kxh;
-      Real snorm = std::sqrt(sx * sx + sy * sy + sz * sz);
-      if (snorm < 1e-12) snorm = 1.0;
-      eps_sol[m] = {sx / snorm, sy / snorm, sz / snorm};
-      eps_comp[m] = {kxh, kyh, kzh};
-    }
-
-    // Evaluate field on this block's local cells (host scratch).
-    const int nx_loc = ib.e - ib.s + 1;
-    const int ny_loc = jb.e - jb.s + 1;
-    const int nz_loc = kb.e - kb.s + 1;
-    std::vector<Real> v_turb(3 * nx_loc * ny_loc * nz_loc, 0.0);
-    auto vt = [&](int c, int kk, int jj, int ii) -> Real & {
-      return v_turb[((c * nz_loc + (kk - kb.s)) * ny_loc + (jj - jb.s)) * nx_loc +
-                    (ii - ib.s)];
-    };
-
-    for (int k = kb.s; k <= kb.e; ++k) {
-      const Real z = coords.Xc<3>(k);
-      for (int j = jb.s; j <= jb.e; ++j) {
-        const Real y = coords.Xc<2>(j);
-        for (int i = ib.s; i <= ib.e; ++i) {
-          const Real x = coords.Xc<1>(i);
-          Real vx_t = 0.0, vy_t = 0.0, vz_t = 0.0;
-          for (int m = 0; m < nmodes; ++m) {
-            const Real kdotr = k_vec[m][0] * x + k_vec[m][1] * y + k_vec[m][2] * z;
-            const Real w_sol = std::sqrt(zeta) * t_amp[m] * std::cos(kdotr + phase[m][0]);
-            const Real w_comp =
-                std::sqrt(1.0 - zeta) * t_amp[m] * std::cos(kdotr + phase[m][1]);
-            vx_t += w_sol * eps_sol[m][0] + w_comp * eps_comp[m][0];
-            vy_t += w_sol * eps_sol[m][1] + w_comp * eps_comp[m][1];
-            vz_t += w_sol * eps_sol[m][2] + w_comp * eps_comp[m][2];
-          }
-          vt(0, k, j, i) = vx_t;
-          vt(1, k, j, i) = vy_t;
-          vt(2, k, j, i) = vz_t;
-        }
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // Apply analytical normalization to the unscaled mode-sum field.
-    // We do NOT use a mass-weighted RMS reduction across the mesh — that
-    // approach fails when ProblemGenerator is called per-block and block 0
-    // (which prints diagnostics) sits entirely outside the sphere. With
-    // 1 MPI rank the MPI_Allreduce returns this block's own data, not the
-    // global mesh state, so per-block rescaling becomes inconsistent and
-    // outside-sphere blocks silently skip turbulence entirely.
-    //
-    // Instead we compute the field's expected RMS analytically from the
-    // mode spectrum and apply a fixed scale factor identical on every block.
-    //
-    // For an isotropic random field with t_amp[m] = kmag^(-alpha/2),
-    // unit-variance cos terms, and orthogonal sol/comp projections each
-    // unit-norm, the per-component variance is:
-    //   <v_x^2> = sum_m [zeta * <cos^2> * eps_sol_x^2 + (1-zeta) * <cos^2> *
-    //   eps_comp_x^2]
-    //          * t_amp[m]^2
-    // Summed over (x,y,z), the eps^2 components sum to 1 for each mode (since
-    // both eps_sol and eps_comp are unit vectors), so:
-    //   <|v|^2> = sum_m t_amp[m]^2 * <cos^2>(zeta + (1-zeta)) = 0.5 * sum_m t_amp[m]^2
-    // -----------------------------------------------------------------------
-    Real sum_amp_sq = 0.0;
-    for (int m = 0; m < nmodes; ++m) {
-      sum_amp_sq += t_amp[m] * t_amp[m];
-    }
-    const Real vrms_analytic = std::sqrt(0.5 * sum_amp_sq);
-    const Real scale = (vrms_analytic > 0.0) ? (turb_mach / vrms_analytic) : 0.0;
-
-    // -----------------------------------------------------------------------
-    // Analytic mean of the mode-sum field over the application region, subtracted
-    // before scaling so the cloud receives no net momentum kick (for ~64 modes the
-    // sphere-restricted mean is O(a few %) of v_rms). Computed analytically -- so it
-    // is deterministic and identical on every rank -- for the same reason as the RMS
-    // normalization above: a mesh-wide reduction is not per-block consistent here.
-    //   sphere (centered on origin): <cos(k.r + phi)> = cos(phi) * W(|k| rc),
-    //       W(x) = 3 (sin x - x cos x) / x^3   (-> 1 as x -> 0)
-    //   box:  <cos(k.r + phi)> = cos(k.r_c + phi) * prod_d sinc(k_d L/2)
-    // -----------------------------------------------------------------------
-    const bool in_sphere = (region == "sphere");
-    Real vmean[3] = {0.0, 0.0, 0.0};
-    for (int m = 0; m < nmodes; ++m) {
-      Real wcos_sol, wcos_comp; // region-mean of the sol/comp cosine terms
-      if (in_sphere) {
-        const Real kmagp =
-            std::sqrt(k_vec[m][0] * k_vec[m][0] + k_vec[m][1] * k_vec[m][1] +
-                      k_vec[m][2] * k_vec[m][2]);
-        const Real x = kmagp * rc_code;
-        const Real W =
-            (x < 1.0e-4) ? 1.0 : 3.0 * (std::sin(x) - x * std::cos(x)) / (x * x * x);
-        wcos_sol = W * std::cos(phase[m][0]);
-        wcos_comp = W * std::cos(phase[m][1]);
-      } else {
-        // Cubic box; same center in each dimension (matches the k-space setup above).
-        const Real xc = 0.5 * (x1min_ + x1max_);
-        Real sincs = 1.0;
-        Real kdotc = 0.0;
-        for (int d = 0; d < 3; ++d) {
-          const Real arg = 0.5 * k_vec[m][d] * Lbox;
-          sincs *= (std::fabs(arg) < 1.0e-8) ? 1.0 : std::sin(arg) / arg;
-          kdotc += k_vec[m][d] * xc;
-        }
-        wcos_sol = sincs * std::cos(kdotc + phase[m][0]);
-        wcos_comp = sincs * std::cos(kdotc + phase[m][1]);
-      }
-      const Real a_sol = std::sqrt(zeta) * t_amp[m] * wcos_sol;
-      const Real a_comp = std::sqrt(1.0 - zeta) * t_amp[m] * wcos_comp;
-      for (int c = 0; c < 3; ++c) {
-        vmean[c] += a_sol * eps_sol[m][c] + a_comp * eps_comp[m][c];
-      }
-    }
-
-    if (parthenon::Globals::my_rank == 0 && pmb->gid == 0) {
-      std::cout << "\n--- Initial turbulence ---\n"
-                << "Region              : " << region << "\n"
-                << "Target Mach (RMS)   : " << turb_mach << "\n"
-                << "Modes               : " << nmodes << "  k in [" << k_min << ", "
-                << k_max << "]"
-                << "  zeta=" << zeta << "  alpha=" << alpha_s << "\n"
-                << "Analytic vrms       : " << vrms_analytic << " (code v)\n"
-                << "Scale factor        : " << scale << "\n"
-                << "Mean subtracted     : (" << vmean[0] * scale << ", "
-                << vmean[1] * scale << ", " << vmean[2] * scale << ") (code v)"
-                << std::endl;
-    }
-
-    // Apply the scaled, mean-subtracted turbulent velocity to the region's cells.
-    for (int k = kb.s; k <= kb.e; ++k) {
-      const Real z = coords.Xc<3>(k);
-      for (int j = jb.s; j <= jb.e; ++j) {
-        const Real y = coords.Xc<2>(j);
-        for (int i = ib.s; i <= ib.e; ++i) {
-          const Real x = coords.Xc<1>(i);
-          if (in_sphere && (x * x + y * y + z * z) >= rc_code * rc_code) continue;
-          const Real dvx = (vt(0, k, j, i) - vmean[0]) * scale;
-          const Real dvy = (vt(1, k, j, i) - vmean[1]) * scale;
-          const Real dvz = (vt(2, k, j, i) - vmean[2]) * scale;
-          const Real rho = u(IDN, k, j, i);
-          const Real vx_old = u(IM1, k, j, i) / rho;
-          const Real vy_old = u(IM2, k, j, i) / rho;
-          const Real vz_old = u(IM3, k, j, i) / rho;
-          const Real vx_new = vx_old + dvx;
-          const Real vy_new = vy_old + dvy;
-          const Real vz_new = vz_old + dvz;
-          u(IM1, k, j, i) = rho * vx_new;
-          u(IM2, k, j, i) = rho * vy_new;
-          u(IM3, k, j, i) = rho * vz_new;
-          const Real ke_old =
-              0.5 * rho * (vx_old * vx_old + vy_old * vy_old + vz_old * vz_old);
-          const Real ke_new =
-              0.5 * rho * (vx_new * vx_new + vy_new * vy_new + vz_new * vz_new);
-          u(IEN, k, j, i) += (ke_new - ke_old);
-        }
-      }
-    }
-  }
   u_dev.DeepCopy(u);
 }
 
@@ -490,10 +288,10 @@ void ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &tm,
                             const Real beta_dt) {
   auto pm = md->GetParentPointer();
   auto hydro_pkg = pm->packages.Get("Hydro");
-  const Real rhocrit = hydro_pkg->Param<Real>("collapse_be_rhocrit");
-  const Real rc = hydro_pkg->Param<Real>("collapse_be_rc");
-  const Real gam = hydro_pkg->Param<Real>("collapse_be_gamma");
-  const bool mhd = hydro_pkg->Param<bool>("collapse_be_mhd");
+  const Real rhocrit = hydro_pkg->Param<Real>("collapse_be/rhocrit");
+  const Real rc = hydro_pkg->Param<Real>("collapse_be/rc");
+  const Real gam = hydro_pkg->Param<Real>("collapse_be/gamma");
+  const bool mhd = hydro_pkg->Param<bool>("collapse_be/mhd");
   const Real gm1 = gam - 1.0;
   const Real igm1 = 1.0 / gm1;
   const Real rcsq = rc * rc;
@@ -533,7 +331,8 @@ void ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &tm,
                                      cons(IB2, k, j, i) * cons(IB2, k, j, i) +
                                      cons(IB3, k, j, i) * cons(IB3, k, j, i))
                             : 0.0;
-        const Real te = igm1 * rho * std::sqrt(1.0 + std::pow(rho / rhocrit, 2.0 * gm1));
+        const Real te =
+            igm1 * rho * Kokkos::sqrt(1.0 + Kokkos::pow(rho / rhocrit, 2.0 * gm1));
         cons(IEN, k, j, i) = te + ke + me;
       });
 }

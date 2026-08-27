@@ -5,12 +5,12 @@ problem = Bonnor-Ebert sphere collapse, hydro, zero-Dirichlet gravity BCs
 problem_id = collapse_be
 
 <problem/collapse_be>
-mass        = 6.0
-temperature = 10.0
-f           = 5.0
-rhocrit     = 1.0e-13
-amp         = 0.0
-omegatff    = 0.02
+mass_msun     = 6.0      # total cloud mass [Msun]
+temperature_K = 10.0     # initial (isothermal) temperature [K]
+f             = 5.0      # BE density enhancement over the critical sphere
+rhocrit_cgs   = 1.0e-13  # barotropic stiffening density [g/cm^3]
+amp           = 0.0      # m=2 azimuthal density perturbation amplitude
+omegatff      = 0.02     # solid-body rotation, in units of 1/t_ff
 
 <parthenon/mesh>
 refinement = adaptive
