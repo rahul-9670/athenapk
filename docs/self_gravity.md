@@ -30,11 +30,16 @@ Parthenon's geometric-multigrid (GMG) infrastructure.
   in $\Delta t$**, not second, even though the surrounding VL2 scheme is second order.
   Stage-consistency still matters a great deal for the error *coefficient*: evaluating the
   source from the already-updated conserved state instead of the start-of-stage
-  primitives costs a further factor of ~30 in temporal error at fixed CFL. The mechanism
-  behind the order reduction has not been identified; a useful next step is to check
-  whether a non-gravitational source enrolled through the same `ProblemSourceUnsplit`
-  path shows the same behaviour, which would make this a property of the unsplit-source
-  placement rather than of self-gravity.
+  primitives costs a further factor of ~30 in temporal error at fixed CFL.
+
+  This is a property of the source-term formulation, not of this port: Athena++ applies
+  the same Mullen, Hanawa & Gammie (2020) momentum form with the same per-stage
+  $\beta\,\Delta t$ weighting from start-of-stage primitives, and Artemis uses the same
+  expression again. The identical measurement on Athena++'s own `jeans` problem generator
+  with multigrid gravity, matched so that $4\pi G\rho_0/(k^2c_s^2)$ is the same 2.533,
+  gives ratios 2.23 and 2.11 (p = 1.16, 1.08) against AthenaPK's 2.28, 2.15 and 2.08
+  (p = 1.19, 1.10, 1.06) — the same behaviour within the scatter. Reaching second order
+  would require changing the source-term formulation rather than solving more often.
 - The source term writes interior cells only and runs after the stage's boundary
   exchange (the solve is global, so it cannot sit inside the stage task list), so the
   ghost zones are re-communicated before `FillDerived`. Without that, the next stage's
