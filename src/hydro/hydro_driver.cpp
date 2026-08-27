@@ -21,7 +21,6 @@
 #include "../eos/adiabatic_hydro.hpp"
 #include "../pgen/cluster/agn_triggering.hpp"
 #include "../pgen/cluster/magnetic_tower.hpp"
-#include "../pgen/pgen.hpp"
 #include "../self_gravity/self_gravity.hpp"
 #include "../tracers/tracers.hpp"
 #include "diffusion/diffusion.hpp"
@@ -545,20 +544,7 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     auto source_unsplit = tl.AddTask(update, AddUnsplitSources, mu0.get(), tm,
                                      integrator->beta[stage - 1] * integrator->dt);
 
-    // Barotropic cooling for the BE-sphere collapse problem. This is an unsplit
-    // source term applied only when the collapse_be problem generator is active
-    // (detected via a parameter it registers on the Hydro package).
-    auto after_cooling = source_unsplit;
-    {
-      auto hydro_pkg = pmesh->packages.Get("Hydro");
-      if (hydro_pkg->AllParams().hasKey("collapse_be_rhocrit")) {
-        after_cooling =
-            tl.AddTask(source_unsplit, collapse_be::ApplyBarotropicCooling, mu0.get(), tm,
-                       integrator->beta[stage - 1] * integrator->dt);
-      }
-    }
-
-    auto source_split_first_order = after_cooling;
+    auto source_split_first_order = source_unsplit;
 
     if (stage == integrator->nstages) {
       // Add final Strang split source terms, i.e., a dt/2 update

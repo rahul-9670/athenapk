@@ -31,7 +31,6 @@ using namespace parthenon::driver::prelude;
 // Dimensionless constants from Tomida's normalization
 // In code units: 4piG = 1, c_s(T=10K) = 1, central density of BE sphere = 1
 // ---------------------------------------------------------------------------
-constexpr Real four_pi_G_code = 1.0;
 constexpr Real rc_code = 6.45;         // BE radius in code units
 constexpr Real rcsq_code = 26.0 / 3.0; // BE profile scale^2
 constexpr Real bemass_code = 197.561;  // total mass of critical BE sphere
@@ -65,18 +64,31 @@ Real BEProfile(Real r) { return std::pow(1.0 + r * r / rcsq_code, -1.5); }
 // No rotation-vs-ambient distinction — inside sphere has solid-body rotation,
 // outside has zero velocity and ambient density = rho(rc).
 // ---------------------------------------------------------------------------
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
+// ---------------------------------------------------------------------------
+// ProblemInitPackageData: derive the code-unit normalization and register the
+// parameters that ApplyBarotropicCooling needs.
+//
+// IMPORTANT: this must NOT live in ProblemGenerator. Parthenon calls the problem
+// generator only on a fresh start (`Mesh::Initialize(!is_restart, ...)`), so
+// parameters registered there are absent after a restart. ProblemInitPackageData
+// is called from Hydro::Initialize on every startup, restart included.
+// ---------------------------------------------------------------------------
+void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *hydro_pkg) {
   const Real gam = pin->GetReal("hydro", "gamma");
-  const Real gm1 = gam - 1.0;
-  const Real igm1 = 1.0 / gm1;
 
-  // Read problem params
   const Real mass_msun = pin->GetReal("problem/collapse_be", "mass");
   const Real temp_K = pin->GetReal("problem/collapse_be", "temperature");
   const Real f = pin->GetReal("problem/collapse_be", "f");
-  const Real amp = pin->GetOrAddReal("problem/collapse_be", "amp", 0.0);
-  const Real omegatff = pin->GetOrAddReal("problem/collapse_be", "omegatff", 0.0);
   const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit");
+
+  // The normalization below fixes 4*pi*G = 1 in code units, so the self-gravity
+  // package must be using the same constant or the two are silently inconsistent.
+  if (pin->DoesBlockExist("self_gravity")) {
+    const Real four_pi_G = pin->GetOrAddReal("self_gravity", "four_pi_G", 1.0);
+    PARTHENON_REQUIRE(std::fabs(four_pi_G - 1.0) < 1.0e-12,
+                      "The collapse_be normalization assumes 4*pi*G = 1 in code units, "
+                      "but self_gravity/four_pi_G != 1.");
+  }
 
   // Derive normalization units
   const Real m0 =
@@ -86,18 +98,9 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   const Real t0 = 1.0 / std::sqrt(4.0 * M_PI * G * rho0); // code t = 1
   const Real l0 = v0 * t0;
 
-  // Angular velocity: omega * t_ff = omegatff
-  const Real tff_code = std::sqrt(3.0 / (8.0 * f)) * M_PI;
-  const Real omega_code = omegatff / tff_code;
-
-  // rhocrit in code units
   const Real rhocrit_code = rhocrit_cgs / rho0;
-
-  // Stash params in the hydro package for the cooling function to read.
-  // (Only rank 0 prints; all ranks need the params.)
-  auto hydro_pkg = pmb->packages.Get("Hydro");
   const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
-  const Real B0z = mhd ? pin->GetOrAddReal("problem/collapse_be", "B0z", 0.0) : 0.0;
+
   if (!hydro_pkg->AllParams().hasKey("collapse_be_rhocrit")) {
     hydro_pkg->AddParam("collapse_be_rhocrit", rhocrit_code);
     hydro_pkg->AddParam("collapse_be_mhd", mhd);
@@ -137,6 +140,37 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
          << "}\n";
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Problem generator: initialize cons variables on each block (fresh start only).
+// ---------------------------------------------------------------------------
+void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
+  const Real gam = pin->GetReal("hydro", "gamma");
+  const Real gm1 = gam - 1.0;
+  const Real igm1 = 1.0 / gm1;
+
+  const Real mass_msun = pin->GetReal("problem/collapse_be", "mass");
+  const Real temp_K = pin->GetReal("problem/collapse_be", "temperature");
+  const Real f = pin->GetReal("problem/collapse_be", "f");
+  const Real amp = pin->GetOrAddReal("problem/collapse_be", "amp", 0.0);
+  const Real omegatff = pin->GetOrAddReal("problem/collapse_be", "omegatff", 0.0);
+  const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit");
+
+  const Real m0 = mass_msun * msun / (bemass_code * f);
+  const Real v0 = cs10 * std::sqrt(temp_K / 10.0);
+  const Real rho0 = std::pow(v0, 6) / (m0 * m0) / (64.0 * M_PI * M_PI * M_PI * G * G * G);
+  const Real t0 = 1.0 / std::sqrt(4.0 * M_PI * G * rho0);
+  const Real l0 = v0 * t0;
+
+  // Angular velocity: omega * t_ff = omegatff
+  const Real tff_code = std::sqrt(3.0 / (8.0 * f)) * M_PI;
+  const Real omega_code = omegatff / tff_code;
+  const Real rhocrit_code = rhocrit_cgs / rho0;
+
+  auto hydro_pkg = pmb->packages.Get("Hydro");
+  const bool mhd = hydro_pkg->Param<bool>("collapse_be_mhd");
+  const Real B0z = mhd ? pin->GetOrAddReal("problem/collapse_be", "B0z", 0.0) : 0.0;
 
   // Log (rank 0 only)
   if (parthenon::Globals::my_rank == 0 && pmb->gid == 0) {
@@ -452,8 +486,8 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
 //
 // Also zeroes momentum outside the sphere (fixed boundary condition on velocity).
 // ---------------------------------------------------------------------------
-TaskStatus ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &tm,
-                                  const Real dt) {
+void ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &tm,
+                            const Real beta_dt) {
   auto pm = md->GetParentPointer();
   auto hydro_pkg = pm->packages.Get("Hydro");
   const Real rhocrit = hydro_pkg->Param<Real>("collapse_be_rhocrit");
@@ -502,7 +536,6 @@ TaskStatus ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &
         const Real te = igm1 * rho * std::sqrt(1.0 + std::pow(rho / rhocrit, 2.0 * gm1));
         cons(IEN, k, j, i) = te + ke + me;
       });
-  return TaskStatus::complete;
 }
 
 } // namespace collapse_be
