@@ -190,8 +190,14 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     pkg->AddField<grav::rhs>(m);
   }
 
-  // --- FillDerived: compute rhs from density on every timestep ---------------
-  pkg->FillDerivedMesh = FillPoissonRHS;
+  // NOTE: the Poisson RHS is deliberately NOT assembled from FillDerived. It was, and
+  // that made the result depend on package iteration order: Update::FillDerived loops
+  // over Packages::AllPackages(), which is a Dictionary = std::unordered_map, so whether
+  // this package ran before or after Hydro's ConsToPrim -- i.e. whether the RHS saw this
+  // step's or the previous step's density, floored or unfloored -- was decided by hash
+  // order and could silently flip when an unrelated package was registered. The RHS is
+  // now built as an explicit task at the head of AddSolvePoissonTasks, where the task
+  // graph fixes the ordering.
 
   // --- Solver construction ---------------------------------------------------
   using PoissEq = PoissonEquation<grav::phi>;
@@ -231,13 +237,16 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
 
 // FillPoissonRHS: assemble rhs = 4 pi G (rho - rho_mean) from gas density.
 // Runs over ENTIRE (including ghosts) so solver sees consistent ghost values.
-void FillPoissonRHS(MeshData<Real> *md) {
+TaskStatus FillPoissonRHS(MeshData<Real> *md) {
   auto pm = md->GetParentPointer();
   auto &grav_pkg = pm->packages.Get("self_gravity");
   const bool use_swindle = grav_pkg->Param<bool>("use_swindle");
   const Real four_pi_G = grav_pkg->Param<Real>("four_pi_G");
 
-  const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
+  // Density is the same variable in conserved and primitive form (ConsToPrim writes the
+  // floored value back into cons, adiabatic_hydro.hpp), so read it from "cons": that is
+  // current at the point the solve runs, whereas "prim" is one integrator stage behind.
+  const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
   auto &resolved = pm->resolved_packages;
   auto desc_rhs = parthenon::MakePackDescriptor<grav::rhs>(resolved.get());
   auto rhs_pack = desc_rhs.GetPack(md);
@@ -271,10 +280,10 @@ void FillPoissonRHS(MeshData<Real> *md) {
         0, nblocks - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &lmass,
                       Real &lvol) {
-          const auto &coords = prim_pack.GetCoords(b);
+          const auto &coords = cons_pack.GetCoords(b);
           const Real vv = coords.CellVolume(k, j, i);
           lvol += vv;
-          lmass += prim_pack(b, IDN, k, j, i) * vv;
+          lmass += cons_pack(b, IDN, k, j, i) * vv;
         },
         Kokkos::Sum<Real>(total_mass), Kokkos::Sum<Real>(total_volume));
     Kokkos::fence();
@@ -293,9 +302,10 @@ void FillPoissonRHS(MeshData<Real> *md) {
       DEFAULT_LOOP_PATTERN, "SG::SetRHS", parthenon::DevExecSpace(), 0, nblocks - 1,
       kbe.s, kbe.e, jbe.s, jbe.e, ibe.s, ibe.e,
       KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
-        const Real rho = prim_pack(b, IDN, k, j, i);
+        const Real rho = cons_pack(b, IDN, k, j, i);
         rhs_pack(b, te, grav::rhs(), k, j, i) = four_pi_G * (rho - grav_mean_rho);
       });
+  return TaskStatus::complete;
 }
 
 // ApplyGravitySource: momentum += rho * g * dt, energy += flux-weighted work.
@@ -305,9 +315,8 @@ TaskStatus ApplyGravitySource(MeshData<Real> *md, const parthenon::SimTime &tm,
                               const Real beta_dt) {
   auto pm = md->GetParentPointer();
 
-  // Pack hydro cons + prim + phi, and cons-with-fluxes for mass flux access.
+  // Pack hydro cons + phi, and cons-with-fluxes for mass flux access.
   const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
-  const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
   auto &resolved = pm->resolved_packages;
   auto desc_phi = parthenon::MakePackDescriptor<grav::phi>(resolved.get());
   auto phi_pack = desc_phi.GetPack(md);
@@ -334,7 +343,6 @@ TaskStatus ApplyGravitySource(MeshData<Real> *md, const parthenon::SimTime &tm,
       KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
         auto &cons = cons_pack(b);
         auto &cons_flx = cons_flx_pack(b);
-        const auto &prim = prim_pack(b);
         const auto &coords = cons_pack.GetCoords(b);
 
         const Real dx1 = coords.Dxc<1>(k, j, i);
@@ -359,7 +367,7 @@ TaskStatus ApplyGravitySource(MeshData<Real> *md, const parthenon::SimTime &tm,
             three_d ? -(phi_pack(b, te, grav::phi(), k + 1, j, i) - phic) : 0.0;
 
         // Momentum update: rho * g * dt, centered difference of phi.
-        const Real rho = prim(IDN, k, j, i);
+        const Real rho = cons(IDN, k, j, i);
         cons(IM1, k, j, i) += rho * hdtodx1 * (dpl1 + dpr1);
         if (multi_d) cons(IM2, k, j, i) += rho * hdtodx2 * (dpl2 + dpr2);
         if (three_d) cons(IM3, k, j, i) += rho * hdtodx3 * (dpl3 + dpr3);

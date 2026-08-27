@@ -4,8 +4,8 @@ AthenaPK can evolve the gas under its own gravity by solving the Poisson equatio
 
 $$\nabla^2 \phi = 4\pi G\,\rho$$
 
-each timestep and adding the resulting acceleration $-\nabla\phi$ as a source term to
-the momentum and total-energy equations. The solver is a port of the
+on every stage of the integrator and adding the resulting acceleration $-\nabla\phi$ as
+an unsplit source term to the momentum and total-energy equations. The solver is a port of the
 [Artemis](https://github.com/lanl/artemis) self-gravity module and is built on
 Parthenon's geometric-multigrid (GMG) infrastructure.
 
@@ -17,14 +17,17 @@ Parthenon's geometric-multigrid (GMG) infrastructure.
 - The Poisson equation is solved with a **BiCGSTAB Krylov solver preconditioned by
   geometric multigrid** (`parthenon::solvers::BiCGSTABSolver` +
   `MGSolver`), which converges robustly on the block-AMR hierarchy.
-- The solve is submitted **once per timestep**, on the final stage of the integrator
-  (`HydroDriver::MakeTaskCollection`), followed by an Artemis-style flux-weighted
-  gravitational source term (`ApplyGravitySource`) applied with the full `dt` for
-  improved energy conservation under AMR. Note that the potential is therefore *not*
-  re-evaluated at each stage: the intermediate stages do not see the density changes
-  made within the step, so gravity is not coupled in a genuinely unsplit way. A solve
-  per stage would be the consistent choice, at the cost of one elliptic solve per
-  stage; this is a known limitation inherited from the Artemis port.
+- The solve is **stage-consistent**: the Poisson equation is solved from each stage's
+  updated density, and the Artemis-style flux-weighted gravitational source term
+  (`ApplyGravitySource`) carries that stage's $\beta\,\Delta t$ weight, exactly like the
+  hydro flux update and the other unsplit sources. Both the predictor and the corrector
+  of the VL2 integrator therefore feel gravity, which keeps the coupling second order in
+  time; solving once on the final stage with the full $\Delta t$ instead makes it fully
+  operator-split and first order. The cost is one extra elliptic solve per step.
+- The source term writes interior cells only and runs after the stage's boundary
+  exchange (the solve is global, so it cannot sit inside the stage task list), so the
+  ghost zones are re-communicated before `FillDerived`. Without that, the next stage's
+  reconstruction would use ghost values missing one gravitational kick.
 - For fully periodic domains the **Jeans swindle** (`use_swindle`) subtracts the mean
   density so the periodic Poisson problem is well posed.
 
@@ -120,8 +123,14 @@ Two problem generators exercise the solver and ship with matching input decks:
   relation. The deck runs the Jeans-unstable regime; comment/uncomment `cs` for the
   stable one.
 - **`collapse_be`** (`src/pgen/collapse_be.cpp`, `inputs/collapse_be.in`) — collapse of
-  a marginally-stable Bonnor-Ebert sphere with barotropic cooling, driven to
-  first-hydrostatic-core densities.
+  a marginally-stable Bonnor-Ebert sphere, driven to first-hydrostatic-core densities.
+  Note that despite `<hydro> eos = adiabatic`, this setup is **not** an ideal-gas run:
+  its problem-specific unsplit source term overwrites the thermal energy every stage
+  with a barotropic equation of state, $e_{\rm th} = \rho/(\gamma-1)\sqrt{1 +
+  (\rho/\rho_{\rm crit})^{2(\gamma-1)}}$, which is exactly isothermal below
+  $\rho_{\rm crit}$ and stiffens to an adiabat of index $\gamma$ above it. `gamma`
+  therefore only sets the stiff branch. The same source also zeroes the momentum outside
+  the sphere radius, i.e. it imposes a fixed-velocity boundary on the ambient medium.
 
 ## Validation
 

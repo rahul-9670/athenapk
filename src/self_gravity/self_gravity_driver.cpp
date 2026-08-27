@@ -31,7 +31,7 @@ namespace SelfGravity {
 // neighbors received garbage ghost data and the preconditioned solve diverged
 // (grav.phi -> NaN). The pinned Parthenon submodule includes the fix, so no
 // runtime workaround (e.g. CUDA_LAUNCH_BLOCKING=1) is needed.
-void SolvePoisson(TaskCollection &tc, Mesh *pmesh) {
+void AddSolvePoissonTasks(TaskCollection &tc, Mesh *pmesh) {
   using namespace parthenon;
   TaskID none(0);
 
@@ -49,11 +49,17 @@ void SolvePoisson(TaskCollection &tc, Mesh *pmesh) {
     auto &md_phi = pmesh->mesh_data.Add("phi", md, {grav::phi::name()});
     auto &md_rhs = pmesh->mesh_data.Add("rhs", md, {grav::phi::name()});
 
+    // Assemble rhs = 4 pi G (rho - rho_mean) from the current density. This is an
+    // explicit task rather than a FillDerived callback so that its ordering relative to
+    // Hydro's ConsToPrim is fixed by the task graph instead of by the hash order of
+    // Packages::AllPackages().
+    auto fill_rhs = tl.AddTask(none, FillPoissonRHS, md.get());
+
     // The solver expects both "phi" container and "rhs" container to hold
     // fields named grav::phi (it operates on IndependentVars = {grav::phi}).
     // rhs lives in field grav::rhs in md. Copy into grav::phi slot of md_rhs.
     auto copy_rhs = tl.AddTask(
-        none,
+        fill_rhs,
         TF(parthenon::solvers::utils::between_fields::CopyData<grav::rhs, grav::phi>),
         md);
     copy_rhs = tl.AddTask(

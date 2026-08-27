@@ -36,9 +36,11 @@ SG_VARIABLE(grav, rhs);
 // Package registration — called from Hydro::ProcessPackages
 std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin);
 
-// FillDerived function: computes rhs = 4piG * (rho - rho_mean) on every cell
-// including ghosts (ghosts so the solver's boundary logic sees the right values).
-void FillPoissonRHS(MeshData<Real> *md);
+// Assembles rhs = 4piG * (rho - rho_mean) on every cell including ghosts (ghosts so
+// the solver's boundary logic sees the right values). Submitted as the first task of
+// AddSolvePoissonTasks rather than via FillDerived, so that its position relative to
+// Hydro's ConsToPrim is fixed by the task graph rather than by package hash order.
+TaskStatus FillPoissonRHS(MeshData<Real> *md);
 
 // Apply gravitational acceleration to momentum and energy using phi.
 // Flux-weighted energy update (Artemis style) for better AMR energy conservation.
@@ -47,7 +49,7 @@ TaskStatus ApplyGravitySource(MeshData<Real> *md, const parthenon::SimTime &tm,
 
 // Build and submit the Poisson solve into the task collection.
 // Called from HydroDriver::MakeTaskCollection on the final stage.
-void SolvePoisson(TaskCollection &tc, Mesh *pmesh);
+void AddSolvePoissonTasks(TaskCollection &tc, Mesh *pmesh);
 
 } // namespace SelfGravity
 
