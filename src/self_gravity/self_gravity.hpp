@@ -39,7 +39,8 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin);
 // Assembles rhs = 4piG * (rho - rho_mean) on every cell including ghosts (ghosts so
 // the solver's boundary logic sees the right values). Submitted as the first task of
 // AddSolvePoissonTasks rather than via FillDerived, so that its position relative to
-// Hydro's ConsToPrim is fixed by the task graph rather than by package hash order.
+// Hydro's ConsToPrim is fixed by the task graph rather than by package hash order: it
+// therefore always sees the start-of-stage primitives, as an unsplit source should.
 TaskStatus FillPoissonRHS(MeshData<Real> *md);
 
 // Apply gravitational acceleration to momentum and energy using phi.
