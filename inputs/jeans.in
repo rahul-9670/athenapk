@@ -1,12 +1,13 @@
 <comment>
-problem = Jeans dispersion, stable regime (k > k_Jeans): perturbation oscillates
+problem = Jeans dispersion
 
 <job>
 problem_id = jeans
 
 <problem/jeans>
 rho0  = 1.0
-cs    = 1.0
+cs    = 0.1 # unstable regime (k < k_Jeans): perturbation grows
+#cs    = 1.0 # stable regime (k > k_Jeans): perturbation oscillates
 amp   = 1.0e-4
 nwave = 1
 
@@ -40,7 +41,7 @@ nx3 = 4
 <parthenon/time>
 integrator = vl2
 cfl        = 0.3
-tlim       = 4.0
+tlim       = 5.0
 nlim       = -1
 
 <hydro>
@@ -50,15 +51,12 @@ gamma          = 1.666667
 riemann        = hllc
 reconstruction = plm
 
-<physics>
-self_gravity = true
-
 <self_gravity>
-units_override = true
+solver         = multigrid
 four_pi_G      = 1.0
 use_swindle    = true
 
-<self_gravity/solver_params>
+<self_gravity/multigrid_solver_params>
 max_iterations               = 100
 residual_tolerance           = 1.0e-10
 absolute_residual_tolerance  = 1.0e-10

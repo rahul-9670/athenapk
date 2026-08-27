@@ -38,7 +38,7 @@ import utils.test_case
 """ To prevent littering up imported folders with .pyc files or __pycache_ folder"""
 sys.dont_write_bytecode = True
 
-# Problem geometry / units shared by both regimes (must match inputs/jeans_*.in).
+# Problem geometry / units shared by both regimes (must match inputs/jeans.in).
 _LX = 1.0  # box length in x1
 _NWAVE = 1  # perturbation wavelength = _LX / _NWAVE
 _RHO0 = 1.0  # background density

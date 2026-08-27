@@ -64,11 +64,8 @@ njeans = 8
 #   maxdensity_refine_above = 10.0
 #   maxdensity_deref_below  = 5.0
 
-<physics>
-self_gravity = true
-
 <self_gravity>
-units_override = true
+solver         = multigrid
 four_pi_G      = 1.0
 # Zero-Dirichlet on all gravity faces (outflow hydro BCs, isolated gravity).
 use_swindle    = false
@@ -79,7 +76,7 @@ ox2_bc         = zero
 ix3_bc         = zero
 ox3_bc         = zero
 
-<self_gravity/solver_params>
+<self_gravity/multigrid_solver_params>
 max_iterations               = 200
 residual_tolerance           = 1.0e-10
 absolute_residual_tolerance  = 1.0e-10

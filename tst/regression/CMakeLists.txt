@@ -26,7 +26,7 @@ setup_test_both("turbulence" "--driver ${PROJECT_BINARY_DIR}/bin/athenaPK \
   --driver_input ${PROJECT_SOURCE_DIR}/inputs/turbulence.in --num_steps 1" "other")
 
 setup_test_both("jeans" "--driver ${PROJECT_BINARY_DIR}/bin/athenaPK \
-  --driver_input ${PROJECT_SOURCE_DIR}/inputs/jeans_stable.in --num_steps 2" "convergence")
+  --driver_input ${PROJECT_SOURCE_DIR}/inputs/jeans.in --num_steps 2" "convergence")
 
 setup_test_both("convergence" "--driver ${PROJECT_BINARY_DIR}/bin/athenaPK \
   --driver_input ${PROJECT_SOURCE_DIR}/inputs/linear_wave3d.in --num_steps 40" "convergence")

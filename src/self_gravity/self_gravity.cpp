@@ -5,6 +5,7 @@
 //========================================================================================
 
 #include <array>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
@@ -18,6 +19,7 @@
 #include <solvers/solver_utils.hpp>
 
 #include "../main.hpp" // for IDN
+#include "../units.hpp"
 #include "poisson_equation.hpp"
 #include "self_gravity.hpp"
 #include <solvers/internal_prolongation.hpp>
@@ -70,13 +72,20 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                                 "Set it in your input file.");
 
   // --- 4 pi G ----------------------------------------------------------------
-  // v1: require units_override. Integrating with AthenaPK's Units class is a
-  // follow-on. For G in code units, user sets four_pi_G explicitly.
-  const bool units_override = pin->GetOrAddBoolean(block_name, "units_override", true);
-  PARTHENON_REQUIRE(units_override,
-                    "self_gravity/units_override must be true in v1. "
-                    "Compute 4*pi*G in your code units and set four_pi_G directly.");
-  const Real four_pi_G = pin->GetOrAddReal(block_name, "four_pi_G", 1.0);
+  // Two mutually exclusive ways to set the gravitational constant:
+  //   - a <units> block is present: 4 pi G follows from the code units, and
+  //     self_gravity/four_pi_G must NOT be given (it could silently disagree);
+  //   - no <units> block: the problem is posed directly in code units and the
+  //     user sets four_pi_G (default 1, the usual normalization of the Jeans
+  //     and Bonnor-Ebert setups).
+  const bool have_units_block = pin->DoesBlockExist("units");
+  PARTHENON_REQUIRE(
+      !(have_units_block && pin->DoesParameterExist(block_name, "four_pi_G")),
+      "Both a <units> block and self_gravity/four_pi_G are set. With units given, "
+      "4*pi*G is derived from them -- remove self_gravity/four_pi_G.");
+  const Real four_pi_G = have_units_block
+                             ? 4.0 * M_PI * Units(pin).gravitational_constant()
+                             : pin->GetOrAddReal(block_name, "four_pi_G", 1.0);
   pkg->AddParam("four_pi_G", four_pi_G);
 
   // --- Jeans swindle ---------------------------------------------------------
@@ -188,12 +197,12 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   using PoissEq = PoissonEquation<grav::phi>;
   using prolongator_t = parthenon::solvers::ProlongationBlockInteriorZeroDirichlet;
   using preconditioner_t = parthenon::solvers::MGSolver<PoissEq, prolongator_t>;
-  const std::string solver_params_block = block_name + "/solver_params";
+  const std::string solver_params_block = block_name + "/multigrid_solver_params";
   // Runtime-selectable solver. Default "BiCGSTAB" reproduces production behaviour
   // bit-for-bit. "MG" / "Multigrid" uses the *pure* geometric multigrid solver,
   // which has no global inner-products (BiCGSTAB needs ~2 all-reduces/iteration),
   // attacking the latency-bound bottleneck of the GPU self-gravity solve.
-  // NOTE: solver=MG (pure multigrid) needs an adequate smoother on AMR. SRJ1 (one
+  // NOTE: solver_type=MG (pure multigrid) needs an adequate smoother on AMR. SRJ1 (one
   // weighted-Jacobi sweep) is enough on a UNIFORM grid but NOT across AMR fine-coarse
   // boundaries, where the coarse-grid correction injects high-frequency error each
   // V-cycle (the standalone V-cycle then has spectral radius > 1 and diverges). Use
@@ -201,7 +210,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   // ~6 V-cycles. BiCGSTAB tolerates SRJ1 because its Krylov outer loop stabilises a
   // non-contractive preconditioner.
   const std::string solver_type =
-      pin->GetOrAddString(solver_params_block, "solver", "BiCGSTAB");
+      pin->GetOrAddString(solver_params_block, "solver_type", "BiCGSTAB");
   std::shared_ptr<parthenon::solvers::SolverBase> psolver;
   if (solver_type == "MG" || solver_type == "Multigrid") {
     psolver = std::make_shared<parthenon::solvers::MGSolver<PoissEq, prolongator_t>>(
@@ -242,8 +251,20 @@ void FillPoissonRHS(MeshData<Real> *md) {
   const int nblocks = md->NumBlocks();
 
   // --- Mean density (for Jeans swindle) via par_reduce + MPI Allreduce -------
+  // NOTE: FillDerived is called once per MeshData partition, so the reduction below
+  // only covers this partition's blocks while the MPI_Allreduce is collective over
+  // MPI_COMM_WORLD. With more than one partition per rank that is (a) not the global
+  // mean and (b) a deadlock risk, because DefaultNumPartitions() =
+  // ceil(nblocks/pack_size) can differ between ranks under AMR load balancing, so
+  // ranks would enter the collective a different number of times. Guard until the
+  // mean is hoisted into a single-region task (cf. the AGN-triggering pattern in
+  // hydro_driver.cpp, which uses tc.AddRegion(1) for exactly this reason).
   Real grav_mean_rho = 0.0;
   if (use_swindle) {
+    PARTHENON_REQUIRE(
+        pm->DefaultNumPartitions() == 1,
+        "The Jeans swindle currently requires a single MeshData partition per rank; "
+        "unset parthenon/mesh/pack_size (or num_partitions), or disable the swindle.");
     Real total_mass = 0.0, total_volume = 0.0;
     parthenon::par_reduce(
         parthenon::loop_pattern_mdrange_tag, "SG::TotalMass", parthenon::DevExecSpace(),
