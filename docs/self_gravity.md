@@ -67,8 +67,8 @@ Parthenon's geometric-multigrid (GMG) infrastructure.
   Equations 57, 64 and 68) dots the mass flux with the *time-averaged* gravity
   $\tfrac{1}{2}(g^{(0)}+g^{(\ell)})$, which makes the source exactly the divergence of a
   gravitational energy flux and conserves total energy to round-off. Like Athena++, which
-  documents the same limitation in `src/hydro/srcterms/self_gravity.cpp`, this port uses
-  the instantaneous start-of-stage gravity instead, so total energy is not conserved to
+  documents the same limitation in its own `src/hydro/srcterms/self_gravity.cpp`, this
+  port uses the instantaneous start-of-stage gravity instead, so energy is not conserved to
   round-off. The effect is small — on the unstable Jeans mode, removing the energy source
   altogether shifts the final modal amplitude by 2.1e-9 out of 3.06e-3 — but implementing
   the conservative form would need the potential of the *end*-of-stage density and a
