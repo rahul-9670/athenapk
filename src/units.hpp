@@ -15,17 +15,13 @@
 
 class Units {
 
-  // The unit conversions and physical constants below are public so that problem
-  // generators and packages can share a single definition of each constant instead of
-  // redefining their own (which is how they drift apart).
- public:
+ private:
   // CGS unit per X
   static constexpr parthenon::Real kev_cgs = 1.60218e-9;                   // erg
   static constexpr parthenon::Real g_cgs = 1;                              // g
   static constexpr parthenon::Real cm_cgs = 1;                             // cm
   static constexpr parthenon::Real cm_s_cgs = 1;                           // cm/s
   static constexpr parthenon::Real km_s_cgs = 1e5;                         // cm/s
-  static constexpr parthenon::Real au_cgs = 1.495978707e+13;               // cm
   static constexpr parthenon::Real kpc_cgs = 3.0856775809623245e+21;       // cm
   static constexpr parthenon::Real mpc_cgs = 3.0856775809623245e+24;       // cm
   static constexpr parthenon::Real s_cgs = 1.0;                            // s
@@ -50,7 +46,6 @@ class Units {
   // //cm**3/(g*s**2)
   static constexpr parthenon::Real speed_of_light_cgs = 2.99792458e10; // cm/s
 
- private:
   // Specified code scales	in cgs
   // (Multiply code units to get quantities in cgs units)
   // (cgs unit per code unit)
@@ -120,7 +115,6 @@ class Units {
   parthenon::Real km_s() const {
     return km_s_cgs / (code_length_cgs() / code_time_cgs());
   }
-  parthenon::Real au() const { return au_cgs / code_length_cgs(); }
   parthenon::Real kpc() const { return kpc_cgs / code_length_cgs(); }
   parthenon::Real mpc() const { return mpc_cgs / code_length_cgs(); }
   parthenon::Real s() const { return s_cgs / code_time_cgs(); }

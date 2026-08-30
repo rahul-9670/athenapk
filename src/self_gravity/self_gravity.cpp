@@ -1,35 +1,40 @@
 //========================================================================================
-// AthenaPK - Self-gravity package
-// Ported from Artemis (LANL, BSD-licensed).
+// AthenaPK - a performance portable block structured AMR astrophysical MHD code.
+// Copyright (c) 2026, Athena-Parthenon Collaboration. All rights reserved.
 // Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
+//! \file self_gravity.cpp
+//! \brief Self-gravity package: registers the potential and the Poisson right-hand
+//!        side, owns the GMG-based Poisson solver, and applies the gravitational
+//!        source term. Ported from Artemis (LANL).
 
+// C++ headers
 #include <array>
-#include <cmath>
 #include <memory>
 #include <string>
 #include <vector>
 
+// Parthenon headers
 #include <bvals/boundary_conditions_generic.hpp>
 #include <coordinates/coordinates.hpp>
 #include <parthenon/driver.hpp>
 #include <parthenon/package.hpp>
 #include <solvers/bicgstab_solver.hpp>
+#include <solvers/internal_prolongation.hpp>
 #include <solvers/mg_solver.hpp>
 #include <solvers/solver_utils.hpp>
 
+// AthenaPK headers
 #include "../main.hpp" // for IDN
-#include "../units.hpp"
 #include "poisson_equation.hpp"
 #include "self_gravity.hpp"
-#include <solvers/internal_prolongation.hpp>
 
 namespace SelfGravity {
 
 using namespace parthenon::BoundaryFunction;
 using namespace parthenon::package::prelude;
 
-// Selector for BC enrollment — matches any variable in the "grav" namespace.
+// Selector for BC enrollment: matches any variable in the "grav" namespace.
 struct any_grav : public parthenon::variable_names::base_t<true> {
   template <class... Ts>
   KOKKOS_INLINE_FUNCTION any_grav(Ts &&...args)
@@ -72,20 +77,12 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                                 "Set it in your input file.");
 
   // --- 4 pi G ----------------------------------------------------------------
-  // Two mutually exclusive ways to set the gravitational constant:
-  //   - a <units> block is present: 4 pi G follows from the code units, and
-  //     self_gravity/four_pi_G must NOT be given (it could silently disagree);
-  //   - no <units> block: the problem is posed directly in code units and the
-  //     user sets four_pi_G (default 1, the usual normalization of the Jeans
-  //     and Bonnor-Ebert setups).
-  const bool have_units_block = pin->DoesBlockExist("units");
-  PARTHENON_REQUIRE(
-      !(have_units_block && pin->DoesParameterExist(block_name, "four_pi_G")),
-      "Both a <units> block and self_gravity/four_pi_G are set. With units given, "
-      "4*pi*G is derived from them -- remove self_gravity/four_pi_G.");
-  const Real four_pi_G = have_units_block
-                             ? 4.0 * M_PI * Units(pin).gravitational_constant()
-                             : pin->GetOrAddReal(block_name, "four_pi_G", 1.0);
+  // The Poisson solver works entirely in code units: 4*pi*G is a plain input
+  // parameter. The default 1 is the usual normalization of the Jeans and
+  // Bonnor-Ebert setups; a problem posed in physical units simply passes the
+  // corresponding code-unit value here.
+  const Real four_pi_G = pin->GetOrAddReal(block_name, "four_pi_G", 1.0);
+  PARTHENON_REQUIRE_THROWS(four_pi_G > 0.0, "self_gravity/four_pi_G must be positive.");
   pkg->AddParam("four_pi_G", four_pi_G);
 
   // --- Jeans swindle ---------------------------------------------------------
@@ -247,8 +244,11 @@ TaskStatus FillPoissonRHS(MeshData<Real> *md) {
   // note on AddUnsplitSources): at the point this task runs, ConsToPrim last ran in the
   // previous stage's FillDerived, so "prim" holds the state at the START of this stage --
   // the same state the flux divergence and the other unsplit sources are evaluated at.
-  // That consistency is what makes the coupling second order in time; evaluating the
-  // source from the already-updated "cons" instead measurably degrades it to first order.
+  // This is what Mullen, Hanawa & Gammie (2021) require of the momentum source (their
+  // Eqs. 43-45, 63 and 67): the start-of-stage density with the gravity of that same
+  // density, which together with one Poisson solve per integrator stage is second-order
+  // accurate. Evaluating the source from the already-updated "cons" instead measurably
+  // degrades the solution (a factor of ~30 in error at fixed CFL).
   const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
   auto &resolved = pm->resolved_packages;
   auto desc_rhs = parthenon::MakePackDescriptor<grav::rhs>(resolved.get());

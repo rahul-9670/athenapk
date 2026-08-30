@@ -23,23 +23,56 @@ Parthenon's geometric-multigrid (GMG) infrastructure.
   like the hydro flux update and the other unsplit sources. Both the predictor and the
   corrector of the VL2 integrator therefore feel gravity. The cost is one extra elliptic
   solve per step.
-- **Measured temporal order.** On the unstable Jeans mode (128 cells, $c_s=0.1$, $t=5$),
-  Richardson extrapolation of the final modal amplitude over a CFL ladder gives ratios
-  2.28, 2.15, 2.08 for the triples 0.2/0.1/0.05, 0.1/0.05/0.025 and 0.05/0.025/0.0125 —
-  monotonically approaching 2, i.e. **the gravitational coupling converges at first order
-  in $\Delta t$**, not second, even though the surrounding VL2 scheme is second order.
-  Stage-consistency still matters a great deal for the error *coefficient*: evaluating the
-  source from the already-updated conserved state instead of the start-of-stage
-  primitives costs a further factor of ~30 in temporal error at fixed CFL.
+- **Second-order accuracy.** The momentum source is the one derived by
+  [Mullen, Hanawa & Gammie (2021)](https://doi.org/10.3847/1538-4365/abcfbd), their
+  Equations (43)-(45) applied per stage as their (63) and (67): the start-of-stage
+  density multiplied by the face-averaged gravity of that same density,
+  $\rho^{(\ell)}\,\tfrac{1}{2}(g_{i-1/2}+g_{i+1/2})$, weighted by the stage's
+  $\beta\,\Delta t$. With one Poisson solve per stage this is second-order accurate in
+  space and time, and needs only two solves per step for a two-stage integrator.
 
-  This is a property of the source-term formulation, not of this port: Athena++ applies
-  the same Mullen, Hanawa & Gammie (2020) momentum form with the same per-stage
-  $\beta\,\Delta t$ weighting from start-of-stage primitives, and Artemis uses the same
-  expression again. The identical measurement on Athena++'s own `jeans` problem generator
-  with multigrid gravity, matched so that $4\pi G\rho_0/(k^2c_s^2)$ is the same 2.533,
-  gives ratios 2.23 and 2.11 (p = 1.16, 1.08) against AthenaPK's 2.28, 2.15 and 2.08
-  (p = 1.19, 1.10, 1.06) — the same behaviour within the scatter. Reaching second order
-  would require changing the source-term formulation rather than solving more often.
+  Verified on their test problem (§4.2.1): a Jeans-*stable* linear wave with
+  $\lambda/\lambda_J=1/2$ ($c_s=1/\pi$, $\rho_0=1$, $A=10^{-6}$, $\gamma=5/3$,
+  $4\pi G=1$, so $\omega^2=3$), evolved a quarter period to $t=\tfrac{\pi}{2\omega}$ and
+  compared against the analytic linear solution
+  $\rho = \rho_0\,[1 + A\beta\sin kx]$ with
+  $\beta = k^2c_s^2(1-\gamma^{-1})/\omega^2 = 8/15$:
+
+  | $N$ | $L_1(\rho)$ | order | modal-amplitude error | order |
+  |-----|------------|-------|-----------------------|-------|
+  |  32 | 1.807e-09  |   —   | 1.947e-09 |   —   |
+  |  64 | 4.354e-10  | 2.05  | 5.242e-10 | 1.89  |
+  | 128 | 1.002e-10  | 2.12  | 1.325e-10 | 1.98  |
+  | 256 | 2.289e-11  | 2.13  | 3.306e-11 | 2.00  |
+  | 512 | 5.421e-12  | 2.08  | 8.233e-12 | 2.01  |
+
+  A $\Delta t$-only refinement at *fixed* $\Delta x$ is **not** a valid way to measure
+  this, because the PLM slope limiter is not a smooth function of the state: which cells
+  it clips changes with $\Delta t$, so Richardson extrapolation over a CFL ladder does not
+  return a truncation-error order. Measured on the same 128-cell mesh, with successive
+  differences of the final modal amplitude over CFL = 0.1/0.05/0.025/0.0125:
+
+  | reconstruction | gravity | measured "order" |
+  |----------------|---------|------------------|
+  | donor cell     | off     | 1.96, 1.98 |
+  | PLM            | off     | 0.75, 0.88 |
+  | PLM            | on (stable mode)   | 0.79, 0.90 |
+  | PLM            | on (unstable mode) | 1.10, 1.06 |
+
+  With the limiter removed the ladder recovers the expected second order, and with the
+  limiter present it reads below 2 *whether or not gravity is enabled*. The artefact
+  therefore belongs to the diagnostic and to the base scheme, not to the gravity
+  coupling; the resolution ladder above is the meaningful measurement.
+- **Known deviation from the reference scheme.** Mullen et al.'s energy source (their
+  Equations 57, 64 and 68) dots the mass flux with the *time-averaged* gravity
+  $\tfrac{1}{2}(g^{(0)}+g^{(\ell)})$, which makes the source exactly the divergence of a
+  gravitational energy flux and conserves total energy to round-off. Like Athena++, which
+  documents the same limitation in `src/hydro/srcterms/self_gravity.cpp`, this port uses
+  the instantaneous start-of-stage gravity instead, so total energy is not conserved to
+  round-off. The effect is small — on the unstable Jeans mode, removing the energy source
+  altogether shifts the final modal amplitude by 2.1e-9 out of 3.06e-3 — but implementing
+  the conservative form would need the potential of the *end*-of-stage density and a
+  stored $\phi^{(0)}$, i.e. a reordering of the solve.
 - The source term writes interior cells only and runs after the stage's boundary
   exchange (the solve is global, so it cannot sit inside the stage task list), so the
   ghost zones are re-communicated before `FillDerived`. Without that, the next stage's
@@ -58,7 +91,7 @@ multigrid = true          # required by the GMG-preconditioned solver
 
 <self_gravity>
 solver         = multigrid  # "none" (default) disables self-gravity
-four_pi_G      = 1.0        # value of 4*pi*G in code units; omit if a <units> block is given
+four_pi_G      = 1.0        # value of 4*pi*G in code units
 use_swindle    = true       # subtract mean density (default: true iff fully periodic)
 
 # Gravity boundary conditions, per face (ix1_bc/ox1_bc/.../ix3_bc/ox3_bc).
@@ -78,14 +111,10 @@ relative_residual_tolerance  = 1.0e-6
 
 ### The gravitational constant
 
-There are two mutually exclusive ways to set $4\pi G$:
-
-- **A `<units>` block is present.** $4\pi G$ is computed from the code units via
-  AthenaPK's `Units` class, and `self_gravity/four_pi_G` must *not* be set. Setting
-  both is an error, because the two could silently disagree.
-- **No `<units>` block.** The problem is posed directly in code units and
-  `self_gravity/four_pi_G` sets the constant (default `1.0`, the usual normalization
-  of the Jeans and Bonnor-Ebert setups).
+The solver works entirely in code units: `self_gravity/four_pi_G` is the value of
+$4\pi G$ in those units. The default `1.0` is the usual normalization of the Jeans and
+Bonnor-Ebert setups; a problem posed in physical units simply passes the corresponding
+code-unit value.
 
 ### Input parameters
 
@@ -93,7 +122,7 @@ There are two mutually exclusive ways to set $4\pi G$:
 |-------|-----------|---------|---------|
 | `<self_gravity>` | `solver` | `none` | Poisson solver. `multigrid` enables self-gravity via the GMG infrastructure; `none` disables the package. |
 | `<parthenon/mesh>` | `multigrid` | `false` | Must be `true`; enables the GMG hierarchy. |
-| `<self_gravity>` | `four_pi_G` | `1.0` | Value of $4\pi G$ in code units. Must be absent if a `<units>` block is given. |
+| `<self_gravity>` | `four_pi_G` | `1.0` | Value of $4\pi G$ in code units. |
 | `<self_gravity>` | `use_swindle` | periodic? | Subtract the mean density from the RHS. Defaults to `true` for a fully periodic domain, `false` otherwise. |
 | `<self_gravity>` | `{i,o}x{1,2,3}_bc` | `default` | Per-face gravity BC. `default` follows the hydro BC; `zero` = homogeneous Dirichlet. |
 | `<self_gravity>` | `packed_bc` | `true` | Apply the `zero`/`neumann` $\phi$ BCs to a whole `MeshData` in one kernel per face during the solve (large GPU launch-latency saving at deep AMR; bit-identical to the per-block path). Automatically falls back to the per-block path for any other face type. |
@@ -140,6 +169,14 @@ Two problem generators exercise the solver and ship with matching input decks:
   stable one.
 - **`collapse_be`** (`src/pgen/collapse_be.cpp`, `inputs/collapse_be.in`) — collapse of
   a marginally-stable Bonnor-Ebert sphere, driven to first-hydrostatic-core densities.
+  The setup is posed entirely in code units, in the normalization of Tomida (2011):
+  $4\pi G=1$, isothermal sound speed $c_s=1$, and central density of the *critical*
+  Bonnor-Ebert sphere $=1$, which fixes its radius at $6.45$ and its mass at $197.561$.
+  The only free parameters are then the central density `f`, the barotropic stiffening
+  density `rhocrit`, the amplitude `amp` of an $m=2$ perturbation and the rotation rate
+  `omegatff` in units of $1/t_{\rm ff}$; the shipped deck corresponds to a 6 M$_\odot$
+  cloud at 10 K with $\rho_{\rm crit}=10^{-13}\,$g cm$^{-3}$.
+
   Note that despite `<hydro> eos = adiabatic`, this setup is **not** an ideal-gas run:
   its problem-specific unsplit source term overwrites the thermal energy every stage
   with a barotropic equation of state, $e_{\rm th} = \rho/(\gamma-1)\sqrt{1 +

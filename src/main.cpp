@@ -167,5 +167,6 @@ int main(int argc, char *argv[]) {
   pman.ParthenonFinalize();
 
   // MPI and Kokkos can no longer be used
+
   return (0);
 }

@@ -575,10 +575,8 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
   // Solving once on the final stage with a full dt instead makes the coupling fully
   // operator-split and first order in time, because the predictor never feels gravity.
   // Cost is one extra elliptic solve per step for VL2.
-  auto self_gravity_pkg = pmesh->packages.AllPackages().count("self_gravity") > 0
-                              ? pmesh->packages.Get("self_gravity")
-                              : nullptr;
-  if (self_gravity_pkg != nullptr) {
+  const bool use_self_gravity = pmesh->packages.AllPackages().count("self_gravity") > 0;
+  if (use_self_gravity) {
     // Solve Poisson: this adds its own TaskRegion with num_partitions task lists.
     SelfGravity::AddSolvePoissonTasks(tc, pmesh);
 
@@ -598,12 +596,11 @@ TaskCollection HydroDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
   // primitive ghost zones used by the next stage's reconstruction would be missing one
   // gravitational kick, unlike every other source term, all of which are applied before
   // the stage's exchange.
-  const bool sourced_interior = (self_gravity_pkg != nullptr);
   for (int i = 0; i < num_partitions; i++) {
     auto &tl = single_tasklist_per_pack_region_3[i];
     auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
     TaskID pre = none;
-    if (sourced_interior) {
+    if (use_self_gravity) {
       pre = parthenon::AddBoundaryExchangeTasks(none, tl, mu0, pmesh->multilevel);
     }
     auto fill_derived =

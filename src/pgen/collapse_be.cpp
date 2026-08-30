@@ -1,259 +1,178 @@
 //========================================================================================
-// AthenaPK - Bonnor-Ebert sphere collapse problem generator
-// Ported from Athena++'s collapse.cpp (Kengo Tomida).
-// Adapted for AthenaPK's hydrodynamics interface and self-gravity package.
+// AthenaPK - a performance portable block structured AMR astrophysical MHD code.
+// Copyright (c) 2026, Athena-Parthenon Collaboration. All rights reserved.
 // Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
 //! \file collapse_be.cpp
-//  \brief Bonnor-Ebert sphere collapse with zero-Dirichlet gravity BCs
-//         (multipole BCs not yet supported in AthenaPK self-gravity).
-//         Large-box setup: domain size ~4x sphere radius in each direction,
-//         ambient density = BE profile value at r = rc (pressure-continuous).
-//
-//  IMPORTANT -- this problem generator does NOT run an ideal-gas evolution, despite
-//  <hydro>/eos = adiabatic and gamma = 1.4 in the input file. The problem-specific
-//  unsplit source term ApplyBarotropicCooling (enrolled as Hydro::ProblemSourceUnsplit)
-//  OVERWRITES the total energy in every cell on every stage with
-//
-//      e_th = rho/(gamma-1) * sqrt(1 + (rho/rhocrit)^(2(gamma-1)))
-//
-//  which is a barotropic equation of state, not a cooling rate. Below rhocrit that is
-//  exactly isothermal at c_s = 1 (p = rho); above it the gas stiffens to an adiabat of
-//  index gamma. gamma therefore only sets the stiff branch -- the run is isothermal
-//  everywhere the density is below rhocrit, whatever the EOS block says. The same
-//  source also zeroes the momentum outside r = rc, i.e. it imposes a fixed-velocity
-//  boundary on the ambient medium.
+//! \brief Gravitational collapse of a Bonnor-Ebert sphere, ported from Athena++'s
+//!        collapse.cpp (Kengo Tomida).
+//!
+//! The setup is posed entirely in code units, in the normalization of Tomida (2011):
+//! \f$4\pi G = 1\f$, isothermal sound speed \f$c_s = 1\f$, and central density of the
+//! *critical* Bonnor-Ebert sphere \f$= 1\f$. The sphere of radius `rc` sits in a large
+//! box (of order four sphere radii per direction) filled with ambient gas at the
+//! profile value at \f$r = r_c\f$, so that the initial pressure is continuous. Gravity
+//! uses zero-Dirichlet boundary conditions (isolated-mass multipole boundary
+//! conditions are not implemented in AthenaPK).
+//!
+//! IMPORTANT -- this problem generator does NOT run an ideal-gas evolution, despite
+//! `<hydro>/eos = adiabatic` and `gamma = 1.4` in the input file. The problem-specific
+//! unsplit source term ApplyBarotropicCooling (enrolled as Hydro::ProblemSourceUnsplit)
+//! OVERWRITES the total energy in every cell on every stage with
+//!
+//!     e_th = rho/(gamma-1) * sqrt(1 + (rho/rhocrit)^(2(gamma-1)))
+//!
+//! which is a barotropic equation of state, not a cooling rate. Below `rhocrit` that is
+//! exactly isothermal at c_s = 1 (p = rho); above it the gas stiffens to an adiabat of
+//! index gamma. gamma therefore only sets the stiff branch -- the run is isothermal
+//! everywhere the density is below `rhocrit`, whatever the EOS block says. The same
+//! source also zeroes the momentum outside r = rc, i.e. it imposes a fixed-velocity
+//! boundary on the ambient medium.
 
-#include <cmath>
-#include <fstream>
-#include <iostream>
+// C++ headers
+#include <cmath>    // sqrt, atan2, cos
+#include <iostream> // cout
 #include <string>
 #include <vector>
 
+// Parthenon headers
 #include <parthenon/package.hpp>
 
+// AthenaPK headers
 #include "../main.hpp"
-#include "../units.hpp"
 #include "pgen.hpp"
 
 namespace collapse_be {
 using namespace parthenon::driver::prelude;
 
-// ---------------------------------------------------------------------------
-// Dimensionless constants from Tomida's normalization
-// In code units: 4piG = 1, c_s(T=10K) = 1, central density of BE sphere = 1
-// ---------------------------------------------------------------------------
-constexpr Real rc_code = 6.45;         // BE radius in code units
-constexpr Real rcsq_code = 26.0 / 3.0; // BE profile scale^2
-constexpr Real bemass_code = 197.561;  // total mass of critical BE sphere
+// Dimensionless properties of the critical Bonnor-Ebert sphere in the normalization
+// 4*pi*G = 1, c_s = 1, rho_central = 1 (Tomida 2011).
+constexpr Real be_radius = 6.45;          // outer radius
+constexpr Real be_radius_sq = 26.0 / 3.0; // scale radius squared of the fit below
+constexpr Real be_mass = 197.561;         // enclosed mass
 
-// Dimensional constants. Everything that is a general physical constant comes from
-// the central Units class (src/units.hpp) rather than being redefined here; only the
-// problem-specific sound-speed normalization lives locally.
-// NOTE: Units' values differ slightly from the ones Athena++'s collapse.cpp uses
-// (G 6.67408e-8 vs 6.67259e-8, Msun 1.98841586e33 vs 1.9891e33), so the derived cgs
-// normalization shifts by ~0.03% relative to that code.
-constexpr Real cs10 = 1.9e4; // cm/s, isothermal sound speed at 10 K
-constexpr Real msun = Units::msun_cgs;
-constexpr Real au = Units::au_cgs;
-constexpr Real yr = Units::yr_cgs;
-constexpr Real G = Units::gravitational_constant_cgs;
-
-// These hold the derived physical parameters for logging and the cooling fn.
-// Parthenon doesn't give us a natural "namespace-scoped globals" pattern like
-// Athena++, so we stash them in the Hydro package params after problem init.
-struct CollapseParams {
-  Real rho0;    // density normalization (cgs)
-  Real rhocrit; // barotropic transition density in CODE units
-  Real f;       // BE density enhancement factor
-  Real rc;      // sphere radius in code units
-  Real omega;   // angular velocity in code units
-  Real amp;     // m=2 perturbation amplitude
-  Real gamma_eos;
-};
-
-// Approximated BE profile (Tomida 2011 PhD thesis)
+//----------------------------------------------------------------------------------------
+//! \fn Real BEProfile(Real r)
+//! \brief Analytic fit to the density profile of the critical Bonnor-Ebert sphere,
+//!        normalized to unity at the center (Tomida 2011).
 KOKKOS_INLINE_FUNCTION
-Real BEProfile(Real r) { return Kokkos::pow(1.0 + r * r / rcsq_code, -1.5); }
+Real BEProfile(const Real r) { return Kokkos::pow(1.0 + r * r / be_radius_sq, -1.5); }
 
-// ---------------------------------------------------------------------------
-// Problem generator: initialize cons variables on each block.
-// No rotation-vs-ambient distinction — inside sphere has solid-body rotation,
-// outside has zero velocity and ambient density = rho(rc).
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// ProblemInitPackageData: derive the code-unit normalization and register the
-// parameters that ApplyBarotropicCooling needs.
-//
-// IMPORTANT: this must NOT live in ProblemGenerator. Parthenon calls the problem
-// generator only on a fresh start (`Mesh::Initialize(!is_restart, ...)`), so
-// parameters registered there are absent after a restart. ProblemInitPackageData
-// is called from Hydro::Initialize on every startup, restart included.
-// ---------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------
+//! \fn void ProblemInitPackageData(ParameterInput *pin, StateDescriptor *pkg)
+//! \brief Register the problem parameters read by the problem generator and by the
+//!        barotropic source term.
+//!
+//! NOTE: this must NOT live in ProblemGenerator. Parthenon calls the problem generator
+//! only on a fresh start (`Mesh::Initialize(!is_restart, ...)`), so parameters
+//! registered there are absent after a restart, whereas ProblemInitPackageData is
+//! called from Hydro::Initialize on every startup, restart included.
 void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *hydro_pkg) {
-  const Real gam = pin->GetReal("hydro", "gamma");
+  const std::string block = "problem/collapse_be";
 
-  const Real mass_msun = pin->GetReal("problem/collapse_be", "mass_msun");
-  const Real temp_K = pin->GetReal("problem/collapse_be", "temperature_K");
-  const Real f = pin->GetReal("problem/collapse_be", "f");
-  const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit_cgs");
+  const Real f = pin->GetReal(block, "f");
+  const Real rhocrit = pin->GetReal(block, "rhocrit");
+  const Real amp = pin->GetOrAddReal(block, "amp", 0.0);
+  const Real omegatff = pin->GetOrAddReal(block, "omegatff", 0.0);
+  PARTHENON_REQUIRE_THROWS(f > 0.0, "problem/collapse_be/f must be positive.");
+  PARTHENON_REQUIRE_THROWS(rhocrit > 0.0,
+                           "problem/collapse_be/rhocrit must be positive.");
 
-  // The normalization below fixes 4*pi*G = 1 in code units, so the self-gravity
-  // package must be using the same constant or the two are silently inconsistent.
+  // The Bonnor-Ebert constants above are tabulated for 4*pi*G = 1, so the self-gravity
+  // package must use the same normalization or the two are silently inconsistent.
   if (pin->DoesBlockExist("self_gravity")) {
     const Real four_pi_G = pin->GetOrAddReal("self_gravity", "four_pi_G", 1.0);
-    PARTHENON_REQUIRE(std::fabs(four_pi_G - 1.0) < 1.0e-12,
-                      "The collapse_be normalization assumes 4*pi*G = 1 in code units, "
-                      "but self_gravity/four_pi_G != 1.");
+    PARTHENON_REQUIRE_THROWS(std::abs(four_pi_G - 1.0) < 1.0e-12,
+                             "The collapse_be normalization assumes 4*pi*G = 1 in code "
+                             "units, but self_gravity/four_pi_G != 1.");
   }
 
-  // Derive normalization units
-  const Real m0 =
-      mass_msun * msun / (bemass_code * f);        // total mass = bemass*f in code units
-  const Real v0 = cs10 * std::sqrt(temp_K / 10.0); // code c_s = 1
-  const Real rho0 = std::pow(v0, 6) / (m0 * m0) / (64.0 * M_PI * M_PI * M_PI * G * G * G);
-  const Real t0 = 1.0 / std::sqrt(4.0 * M_PI * G * rho0); // code t = 1
-  const Real l0 = v0 * t0;
+  // Free-fall time of the central density f: t_ff = sqrt(3 pi / (32 G rho)) with
+  // G = 1/(4 pi), i.e. t_ff = pi sqrt(3 / (8 f)).
+  const Real tff = M_PI * std::sqrt(3.0 / (8.0 * f));
+  const Real omega = omegatff / tff;
 
-  const Real rhocrit_code = rhocrit_cgs / rho0;
   const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
+  const Real B0z = mhd ? pin->GetOrAddReal(block, "B0z", 0.0) : 0.0;
 
-  if (!hydro_pkg->AllParams().hasKey("collapse_be/rhocrit")) {
-    hydro_pkg->AddParam("collapse_be/rhocrit", rhocrit_code);
-    hydro_pkg->AddParam("collapse_be/mhd", mhd);
-    hydro_pkg->AddParam("collapse_be/rc", rc_code);
-    hydro_pkg->AddParam("collapse_be/gamma", gam);
+  hydro_pkg->AddParam<Real>("collapse_be/f", f);
+  hydro_pkg->AddParam<Real>("collapse_be/rhocrit", rhocrit);
+  hydro_pkg->AddParam<Real>("collapse_be/rc", be_radius);
+  hydro_pkg->AddParam<Real>("collapse_be/amp", amp);
+  hydro_pkg->AddParam<Real>("collapse_be/omega", omega);
+  hydro_pkg->AddParam<Real>("collapse_be/B0z", B0z);
+  hydro_pkg->AddParam<Real>("collapse_be/gamma", pin->GetReal("hydro", "gamma"));
+  hydro_pkg->AddParam<bool>("collapse_be/mhd", mhd);
 
-    // Unit conversion factors to cgs, reported once for post-processing. These are
-    // written to the sidecar file only -- nothing in the code reads them back, so they
-    // are deliberately not registered as package parameters.
-    const Real code_length_cgs = l0;
-    const Real code_time_cgs = t0;
-    const Real code_mass_cgs = m0;
-    const Real code_density_cgs = rho0;
-    const Real code_velocity_cgs = l0 / t0;
-    const Real code_energy_cgs = m0 * (l0 / t0) * (l0 / t0);
-    // Heaviside-Lorentz B unit (AthenaPK convention): B_cgs = B_code * sqrt(4 pi) *
-    // this factor if a Gaussian field is wanted.
-    const Real code_bfield_cgs = std::sqrt(rho0) * (l0 / t0);
-
-    // Sidecar JSON dump (rank 0 only; ProblemInitPackageData runs once per rank).
-    if (parthenon::Globals::my_rank == 0) {
-      std::ofstream js("units.json");
-      js.precision(12);
-      js << "{\n"
-         << "  \"code_length_cgs\":   " << code_length_cgs << ",\n"
-         << "  \"code_time_cgs\":     " << code_time_cgs << ",\n"
-         << "  \"code_mass_cgs\":     " << code_mass_cgs << ",\n"
-         << "  \"code_density_cgs\":  " << code_density_cgs << ",\n"
-         << "  \"code_velocity_cgs\": " << code_velocity_cgs << ",\n"
-         << "  \"code_energy_cgs\":   " << code_energy_cgs << ",\n"
-         << "  \"code_bfield_cgs\":   " << code_bfield_cgs << "\n"
-         << "}\n";
-    }
+  if (parthenon::Globals::my_rank == 0) {
+    std::cout << "---  Bonnor-Ebert collapse (all quantities in code units)  ---\n"
+              << "Sound speed         : 1\n"
+              << "4 pi G              : 1\n"
+              << "Cloud radius        : " << be_radius << "\n"
+              << "Central density     : " << f << "\n"
+              << "Total mass          : " << be_mass * f << "\n"
+              << "Free-fall time      : " << tff << "\n"
+              << "Barotropic rhocrit  : " << rhocrit << "\n"
+              << "m=2 perturbation    : " << amp << "\n"
+              << "Omega * t_ff        : " << omegatff << "\n"
+              << "Omega               : " << omega << std::endl;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Problem generator: initialize cons variables on each block (fresh start only).
-// ---------------------------------------------------------------------------
-void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
-  const Real gam = pin->GetReal("hydro", "gamma");
-  const Real gm1 = gam - 1.0;
-  const Real igm1 = 1.0 / gm1;
-
-  const Real mass_msun = pin->GetReal("problem/collapse_be", "mass_msun");
-  const Real temp_K = pin->GetReal("problem/collapse_be", "temperature_K");
-  const Real f = pin->GetReal("problem/collapse_be", "f");
-  const Real amp = pin->GetOrAddReal("problem/collapse_be", "amp", 0.0);
-  const Real omegatff = pin->GetOrAddReal("problem/collapse_be", "omegatff", 0.0);
-  const Real rhocrit_cgs = pin->GetReal("problem/collapse_be", "rhocrit_cgs");
-
-  const Real m0 = mass_msun * msun / (bemass_code * f);
-  const Real v0 = cs10 * std::sqrt(temp_K / 10.0);
-  const Real rho0 = std::pow(v0, 6) / (m0 * m0) / (64.0 * M_PI * M_PI * M_PI * G * G * G);
-  const Real t0 = 1.0 / std::sqrt(4.0 * M_PI * G * rho0);
-  const Real l0 = v0 * t0;
-
-  // Angular velocity: omega * t_ff = omegatff
-  const Real tff_code = std::sqrt(3.0 / (8.0 * f)) * M_PI;
-  const Real omega_code = omegatff / tff_code;
-  const Real rhocrit_code = rhocrit_cgs / rho0;
-
+//----------------------------------------------------------------------------------------
+//! \fn void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin)
+//! \brief Initialize the Bonnor-Ebert sphere and the ambient medium on this block.
+void ProblemGenerator(MeshBlock *pmb, ParameterInput *pin) {
   auto hydro_pkg = pmb->packages.Get("Hydro");
+  const Real f = hydro_pkg->Param<Real>("collapse_be/f");
+  const Real amp = hydro_pkg->Param<Real>("collapse_be/amp");
+  const Real omega = hydro_pkg->Param<Real>("collapse_be/omega");
+  const Real B0z = hydro_pkg->Param<Real>("collapse_be/B0z");
   const bool mhd = hydro_pkg->Param<bool>("collapse_be/mhd");
-  const Real B0z = mhd ? pin->GetOrAddReal("problem/collapse_be", "B0z", 0.0) : 0.0;
+  const Real igm1 = 1.0 / (hydro_pkg->Param<Real>("collapse_be/gamma") - 1.0);
 
-  // Log (rank 0 only)
-  if (parthenon::Globals::my_rank == 0 && pmb->gid == 0) {
-    std::cout << "\n---  Dimensional parameters of the simulation  ---\n"
-              << "Total mass          : " << mass_msun << " [Msun]\n"
-              << "Initial temperature : " << temp_K << " [K]\n"
-              << "Sound speed         : " << v0 << " [cm/s]\n"
-              << "Central density     : " << rho0 * f << " [g/cm^3]\n"
-              << "Cloud radius        : " << rc_code * l0 / au << " [au]\n"
-              << "Free-fall time      : " << tff_code * t0 / yr << " [yr]\n"
-              << "rhocrit (cgs)       : " << rhocrit_cgs << " [g/cm^3]\n"
-              << "rhocrit (code)      : " << rhocrit_code << "\n"
-              << "Density enhancement : " << f << "\n\n"
-              << "---   Normalization Units    ---\n"
-              << "Mass                : " << m0 / msun << " [Msun]\n"
-              << "Length              : " << l0 / au << " [au]\n"
-              << "Time                : " << t0 / yr << " [yr]\n"
-              << "Density             : " << rho0 << " [g/cm^3]\n\n"
-              << "--- Dimensionless parameters ---\n"
-              << "Total mass          : " << bemass_code * f << "\n"
-              << "Sound speed         : 1.0\n"
-              << "Central density     : 1.0\n"
-              << "Cloud radius        : " << rc_code << "\n"
-              << "Free-fall time      : " << tff_code << "\n"
-              << "m=2 perturbation    : " << amp << "\n"
-              << "Omega * tff         : " << omegatff << std::endl;
-  }
+  // Ambient density: the profile value at r = rc, so the pressure is continuous.
+  const Real rho_amb = f * BEProfile(be_radius);
 
   auto &data = pmb->meshblock_data.Get();
   auto &u_dev = data->Get("cons").data;
   auto u = u_dev.GetHostMirrorAndCopy();
 
-  // Interior only: ghost zones are filled by the boundary exchange after the problem
-  // generator runs, so writing them here is redundant.
-  parthenon::IndexRange ib = pmb->cellbounds.GetBoundsI(parthenon::IndexDomain::interior);
-  parthenon::IndexRange jb = pmb->cellbounds.GetBoundsJ(parthenon::IndexDomain::interior);
-  parthenon::IndexRange kb = pmb->cellbounds.GetBoundsK(parthenon::IndexDomain::interior);
+  // Interior only: the ghost zones are filled by the boundary exchange that follows
+  // problem initialization.
+  IndexRange ib = pmb->cellbounds.GetBoundsI(IndexDomain::interior);
+  IndexRange jb = pmb->cellbounds.GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = pmb->cellbounds.GetBoundsK(IndexDomain::interior);
 
   auto &coords = pmb->coords;
-  // Ambient density: BE profile value at r = rc (pressure-continuous)
-  const Real rho_amb = f * BEProfile(rc_code);
-
   for (int k = kb.s; k <= kb.e; ++k) {
-    Real z = coords.Xc<3>(k);
+    const Real z = coords.Xc<3>(k);
     for (int j = jb.s; j <= jb.e; ++j) {
-      Real y = coords.Xc<2>(j);
+      const Real y = coords.Xc<2>(j);
       for (int i = ib.s; i <= ib.e; ++i) {
-        Real x = coords.Xc<1>(i);
-        Real r = std::sqrt(x * x + y * y + z * z);
+        const Real x = coords.Xc<1>(i);
+        const Real r = std::sqrt(x * x + y * y + z * z);
 
         Real rho, v1, v2, v3;
-        if (r < rc_code) {
-          // Inside sphere: BE profile + m=2 azimuthal perturbation + solid-body rotation
+        if (r < be_radius) {
+          // Inside the sphere: BE profile, an optional m=2 azimuthal perturbation, and
+          // solid-body rotation about the z axis.
           const Real phi = std::atan2(y, x);
           rho = f * BEProfile(r) *
-                (1.0 + amp * (r * r / (rc_code * rc_code)) * std::cos(2.0 * phi));
-          v1 = omega_code * y;
-          v2 = -omega_code * x;
+                (1.0 + amp * (r * r / (be_radius * be_radius)) * std::cos(2.0 * phi));
+          v1 = omega * y;
+          v2 = -omega * x;
           v3 = 0.0;
         } else {
-          // Outside: ambient, at rest
           rho = rho_amb;
           v1 = 0.0;
           v2 = 0.0;
           v3 = 0.0;
         }
 
-        // Pressure: isothermal c_s = 1 (T=10K), so the BE-equilibrium pressure is
-        // p = rho * c_s^2 = rho. This matches the barotropic floor the cooling source
-        // enforces every step (e_th = rho/(gamma-1) for rho << rhocrit  =>  p = rho),
-        // so there is no factor-gamma transient on the first step.
+        // Isothermal at c_s = 1, so the Bonnor-Ebert equilibrium pressure is
+        // p = rho c_s^2 = rho. This is also what the barotropic source enforces every
+        // stage for rho << rhocrit, so there is no transient on the first step.
         const Real p = rho;
 
         u(IDN, k, j, i) = rho;
@@ -266,6 +185,7 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
           u(IB2, k, j, i) = 0.0;
           u(IB3, k, j, i) = B0z;
           u(IPS, k, j, i) = 0.0;
+          // Heaviside-Lorentz units: the magnetic energy density is B^2/2 (no 4 pi).
           u(IEN, k, j, i) += 0.5 * B0z * B0z;
         }
       }
@@ -274,54 +194,50 @@ void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin) {
   u_dev.DeepCopy(u);
 }
 
-// ---------------------------------------------------------------------------
-// Barotropic cooling source term (Masunaga-Inutsuka / Tomida form):
-//   e_th = rho/(gamma-1) * sqrt(1 + (rho/rhocrit)^(2(gamma-1)))
-// For rho << rhocrit: e_th ~ rho/(gamma-1) (isothermal, c_s = 1)
-// For rho >> rhocrit: e_th ~ (rho/(gamma-1)) * (rho/rhocrit)^(gamma-1) (adiabatic)
-// This OVERWRITES the thermal energy every step — it's a barotropic EOS
-// enforcement, not a differential cooling equation.
-//
-// Also zeroes momentum outside the sphere (fixed boundary condition on velocity).
-// ---------------------------------------------------------------------------
+//----------------------------------------------------------------------------------------
+//! \fn void ApplyBarotropicCooling(MeshData<Real> *md, const SimTime &tm, const Real)
+//! \brief Barotropic equation of state (Masunaga & Inutsuka 2000; Tomida 2011), enrolled
+//!        as Hydro::ProblemSourceUnsplit.
+//!
+//! Overwrites the thermal energy of every cell with
+//!     e_th = rho/(gamma-1) * sqrt(1 + (rho/rhocrit)^(2(gamma-1)))
+//! which is isothermal (c_s = 1) for rho << rhocrit and adiabatic of index gamma for
+//! rho >> rhocrit. This is an EOS enforcement, not a differential cooling rate, so it
+//! does not depend on the time step. It also zeroes the momentum outside the sphere,
+//! i.e. it holds the ambient medium at rest.
 void ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &tm,
                             const Real beta_dt) {
-  auto pm = md->GetParentPointer();
-  auto hydro_pkg = pm->packages.Get("Hydro");
+  auto hydro_pkg = md->GetParentPointer()->packages.Get("Hydro");
   const Real rhocrit = hydro_pkg->Param<Real>("collapse_be/rhocrit");
   const Real rc = hydro_pkg->Param<Real>("collapse_be/rc");
-  const Real gam = hydro_pkg->Param<Real>("collapse_be/gamma");
+  const Real gm1 = hydro_pkg->Param<Real>("collapse_be/gamma") - 1.0;
   const bool mhd = hydro_pkg->Param<bool>("collapse_be/mhd");
-  const Real gm1 = gam - 1.0;
   const Real igm1 = 1.0 / gm1;
   const Real rcsq = rc * rc;
 
   const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
 
-  parthenon::IndexRange ib = md->GetBoundsI(parthenon::IndexDomain::interior);
-  parthenon::IndexRange jb = md->GetBoundsJ(parthenon::IndexDomain::interior);
-  parthenon::IndexRange kb = md->GetBoundsK(parthenon::IndexDomain::interior);
-  const int nblocks = md->NumBlocks();
+  IndexRange ib = md->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBoundsK(IndexDomain::interior);
 
   parthenon::par_for(
-      DEFAULT_LOOP_PATTERN, "BEcollapse::BaroCool", parthenon::DevExecSpace(), 0,
-      nblocks - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
-      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+      DEFAULT_LOOP_PATTERN, "collapse_be::ApplyBarotropicCooling",
+      parthenon::DevExecSpace(), 0, cons_pack.GetDim(5) - 1, kb.s, kb.e, jb.s, jb.e, ib.s,
+      ib.e, KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
         auto &cons = cons_pack(b);
         const auto &coords = cons_pack.GetCoords(b);
         const Real x = coords.template Xc<1>(i);
         const Real y = coords.template Xc<2>(j);
         const Real z = coords.template Xc<3>(k);
-        const Real r2 = x * x + y * y + z * z;
 
-        // Outside sphere: zero velocity (fixed BC on momentum)
-        if (r2 > rcsq) {
+        // Outside the sphere: hold the ambient medium at rest.
+        if (x * x + y * y + z * z > rcsq) {
           cons(IM1, k, j, i) = 0.0;
           cons(IM2, k, j, i) = 0.0;
           cons(IM3, k, j, i) = 0.0;
         }
 
-        // Barotropic EOS enforcement (everywhere)
         const Real rho = cons(IDN, k, j, i);
         const Real ke = 0.5 / rho *
                         (cons(IM1, k, j, i) * cons(IM1, k, j, i) +

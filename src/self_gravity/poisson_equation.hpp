@@ -1,12 +1,15 @@
-//========================================================================================
-// AthenaPK - a performance portable block structured AMR astrophysical MHD code.
-// Poisson equation for self-gravity solver.
-// Adapted from parthenon/example/poisson_gmg (C) Triad National Security, LLC.
-// Licensed under the BSD 3-Clause License (the "LICENSE").
-//========================================================================================
 #ifndef SELF_GRAVITY_POISSON_EQUATION_HPP_
 #define SELF_GRAVITY_POISSON_EQUATION_HPP_
+//========================================================================================
+// AthenaPK - a performance portable block structured AMR astrophysical MHD code.
+// Copyright (c) 2026, Athena-Parthenon Collaboration. All rights reserved.
+// Licensed under the BSD 3-Clause License (the "LICENSE").
+//========================================================================================
+//! \file poisson_equation.hpp
+//! \brief Discrete Poisson operator handed to the Parthenon solvers. Adapted from
+//!        parthenon/example/poisson_gmg (C) Triad National Security, LLC.
 
+// C++ headers
 #include <array>
 #include <memory>
 #include <set>
@@ -14,6 +17,7 @@
 #include <unordered_map>
 #include <utility>
 
+// Parthenon headers
 #include <bvals/boundary_conditions.hpp>
 #include <coordinates/coordinates.hpp>
 #include <kokkos_abstraction.hpp>

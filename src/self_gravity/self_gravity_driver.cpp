@@ -1,22 +1,28 @@
 //========================================================================================
-// AthenaPK - Self-gravity solver driver
-// Adapted from Artemis (LANL) and parthenon poisson_gmg example.
+// AthenaPK - a performance portable block structured AMR astrophysical MHD code.
+// Copyright (c) 2026, Athena-Parthenon Collaboration. All rights reserved.
 // Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
+//! \file self_gravity_driver.cpp
+//! \brief Task list of the self-gravity Poisson solve. Adapted from Artemis (LANL)
+//!        and Parthenon's poisson_gmg example.
 
+// C++ headers
 #include <memory>
 #include <string>
 
+// Parthenon headers
 #include <parthenon/driver.hpp>
 #include <parthenon/package.hpp>
-#include <solvers/solver_utils.hpp>
-
-#include "poisson_equation.hpp"
-#include "self_gravity.hpp"
 #include <solvers/bicgstab_solver.hpp>
 #include <solvers/internal_prolongation.hpp>
 #include <solvers/mg_solver.hpp>
 #include <solvers/solver_base.hpp>
+#include <solvers/solver_utils.hpp>
+
+// AthenaPK headers
+#include "poisson_equation.hpp"
+#include "self_gravity.hpp"
 
 using PoissEq = SelfGravity::PoissonEquation<SelfGravity::grav::phi>;
 using prolongator_t = parthenon::solvers::ProlongationBlockInteriorZeroDirichlet;

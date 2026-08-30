@@ -25,18 +25,23 @@ void InitUserMeshData(Mesh *mesh, ParameterInput *pin);
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
 void UserWorkAfterLoop(Mesh *mesh, parthenon::ParameterInput *pin,
                        parthenon::SimTime &tm);
-void ProblemInitPackageData(parthenon::ParameterInput *pin,
-                            parthenon::StateDescriptor *pkg);
+void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
 } // namespace linear_wave_mhd
 
+namespace jeans {
+using namespace parthenon::driver::prelude;
+
+void ProblemGenerator(Mesh *pmesh, ParameterInput *pin, MeshData<Real> *md);
+} // namespace jeans
+
 namespace collapse_be {
-void ProblemInitPackageData(parthenon::ParameterInput *pin,
-                            parthenon::StateDescriptor *pkg);
-void ProblemGenerator(parthenon::MeshBlock *pmb, parthenon::ParameterInput *pin);
-// Unsplit source term (barotropic EOS enforcement), enrolled as
-// Hydro::ProblemSourceUnsplit in main.cpp.
-void ApplyBarotropicCooling(parthenon::MeshData<parthenon::Real> *md,
-                            const parthenon::SimTime &tm, const parthenon::Real beta_dt);
+using namespace parthenon::driver::prelude;
+
+void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
+void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
+// Barotropic EOS enforcement, enrolled as Hydro::ProblemSourceUnsplit in main.cpp.
+void ApplyBarotropicCooling(MeshData<Real> *md, const parthenon::SimTime &tm,
+                            const Real beta_dt);
 } // namespace collapse_be
 
 namespace cpaw {
@@ -89,8 +94,7 @@ namespace field_loop {
 using namespace parthenon::driver::prelude;
 
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void ProblemInitPackageData(parthenon::ParameterInput *pin,
-                            parthenon::StateDescriptor *pkg);
+void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
 } // namespace field_loop
 
 namespace kh {
@@ -109,16 +113,14 @@ namespace rand_blast {
 using namespace parthenon::driver::prelude;
 
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
-void ProblemInitPackageData(parthenon::ParameterInput *pin,
-                            parthenon::StateDescriptor *pkg);
+void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
 void RandomBlasts(MeshData<Real> *md, const parthenon::SimTime &tm, const Real);
 } // namespace rand_blast
 
 namespace cluster {
 using namespace parthenon::driver::prelude;
 
-void ProblemInitPackageData(parthenon::ParameterInput *pin,
-                            parthenon::StateDescriptor *pkg);
+void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
 void InitUserMeshData(ParameterInput *pin);
 void ProblemGenerator(Mesh *pmesh, ParameterInput *pin, MeshData<Real> *md);
 void UserWorkBeforeOutput(MeshBlock *pmb, ParameterInput *pin,
@@ -143,18 +145,11 @@ using namespace parthenon::driver::prelude;
 void ProblemGenerator(MeshBlock *pmb, parthenon::ParameterInput *pin);
 } // namespace sod
 
-namespace jeans {
-using namespace parthenon::driver::prelude;
-
-void ProblemGenerator(Mesh *pmesh, parthenon::ParameterInput *pin, MeshData<Real> *md);
-} // namespace jeans
-
 namespace turbulence {
 using namespace parthenon::driver::prelude;
 
 void ProblemGenerator(Mesh *pm, parthenon::ParameterInput *pin, MeshData<Real> *md);
-void ProblemInitPackageData(parthenon::ParameterInput *pin,
-                            parthenon::StateDescriptor *pkg);
+void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
 void ProblemInitTracerData(ParameterInput *pin, parthenon::StateDescriptor *pkg);
 void Driving(MeshData<Real> *md, const parthenon::SimTime &tm, const Real dt);
 void SetPhases(MeshBlock *pmb, ParameterInput *pin);

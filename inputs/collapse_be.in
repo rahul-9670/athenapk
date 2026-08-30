@@ -1,16 +1,21 @@
 <comment>
 problem = Bonnor-Ebert sphere collapse, hydro, zero-Dirichlet gravity BCs
 
+# Everything below is in code units, in the normalization of Tomida (2011):
+#   4*pi*G = 1, isothermal sound speed c_s = 1, and central density of the *critical*
+#   Bonnor-Ebert sphere = 1, which fixes the sphere radius at 6.45 and its mass at
+#   197.561. The values below correspond to a 6 Msun cloud at 10 K with a barotropic
+#   stiffening density of 1e-13 g/cm^3, i.e. a density unit of 5.467e-19 g/cm^3, a
+#   length unit of 2.806e16 cm and a time unit of 1.477e12 s.
+
 <job>
 problem_id = collapse_be
 
 <problem/collapse_be>
-mass_msun     = 6.0      # total cloud mass [Msun]
-temperature_K = 10.0     # initial (isothermal) temperature [K]
-f             = 5.0      # BE density enhancement over the critical sphere
-rhocrit_cgs   = 1.0e-13  # barotropic stiffening density [g/cm^3]
-amp           = 0.0      # m=2 azimuthal density perturbation amplitude
-omegatff      = 0.02     # solid-body rotation, in units of 1/t_ff
+f        = 5.0      # central density (= enhancement over the critical BE sphere)
+rhocrit  = 1.829e5  # barotropic stiffening density
+amp      = 0.0      # m=2 azimuthal density perturbation amplitude
+omegatff = 0.02     # solid-body rotation, in units of 1/t_ff
 
 <parthenon/mesh>
 refinement = adaptive
