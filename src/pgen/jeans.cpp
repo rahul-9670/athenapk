@@ -1,12 +1,13 @@
 //========================================================================================
-// AthenaPK - Jeans dispersion problem generator for self-gravity validation
+// AthenaPK - a performance portable block structured AMR astrophysical MHD code.
+// Copyright (c) 2026, Athena-Parthenon Collaboration. All rights reserved.
 // Licensed under the BSD 3-Clause License (the "LICENSE").
 //========================================================================================
 //! \file jeans.cpp
-//  \brief Uniform periodic box with a sinusoidal density perturbation of wavelength
-//         equal to the box size in x1, for validating the self-gravity module
-//         against the Jeans dispersion relation:
-//             omega^2 = k^2 c_s^2 - four_pi_G rho0
+//! \brief Uniform periodic box with a sinusoidal density perturbation of wavelength
+//!        equal to the box size in x1, for validating the self-gravity module against
+//!        the Jeans dispersion relation:
+//!            omega^2 = k^2 c_s^2 - four_pi_G rho0
 
 #include <cmath>
 #include <string>

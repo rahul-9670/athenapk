@@ -230,8 +230,8 @@ class PoissonEquation {
   // static method (has_SetBoundary trait) and uses it INSTEAD of the per-block
   // ApplyBoundaryConditionsOnCoarseOrFineMD, which loops over every block and launches a
   // separate tiny physical-BC kernel per (block, face). In the deeply-refined collapse
-  // that per-block dispatch dominates the GPU launch/sync latency (Grete 2026-07: ~7e5
-  // GenericBC launches in a 4-cycle trace). Here we apply the self-gravity phi BCs
+  // that per-block dispatch dominates the GPU launch/sync latency (order 1e5 GenericBC
+  // kernel launches in a handful of cycles). Here we apply the self-gravity phi BCs
   // (zero-Dirichlet / Neumann-outflow, uniform Cartesian) to the WHOLE MeshData in ONE
   // par_for per face, gated by a per-block physical-boundary flag. The per-face iteration
   // space and the FixedFace / outflow ghost formulas are taken verbatim from parthenon's

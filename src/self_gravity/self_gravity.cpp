@@ -201,8 +201,8 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   using prolongator_t = parthenon::solvers::ProlongationBlockInteriorZeroDirichlet;
   using preconditioner_t = parthenon::solvers::MGSolver<PoissEq, prolongator_t>;
   const std::string solver_params_block = block_name + "/multigrid_solver_params";
-  // Runtime-selectable solver. Default "BiCGSTAB" reproduces production behaviour
-  // bit-for-bit. "MG" / "Multigrid" uses the *pure* geometric multigrid solver,
+  // Runtime-selectable solver. "BiCGSTAB" (the default) is the robust choice.
+  // "MG" / "Multigrid" uses the *pure* geometric multigrid solver,
   // which has no global inner-products (BiCGSTAB needs ~2 all-reduces/iteration),
   // attacking the latency-bound bottleneck of the GPU self-gravity solve.
   // NOTE: solver_type=MG (pure multigrid) needs an adequate smoother on AMR. SRJ1 (one
@@ -263,20 +263,24 @@ TaskStatus FillPoissonRHS(MeshData<Real> *md) {
   const int nblocks = md->NumBlocks();
 
   // --- Mean density (for Jeans swindle) via par_reduce + MPI Allreduce -------
-  // NOTE: FillDerived is called once per MeshData partition, so the reduction below
-  // only covers this partition's blocks while the MPI_Allreduce is collective over
+  // NOTE: this task runs once per MeshData partition, so the reduction below only
+  // covers this partition's blocks while the MPI_Allreduce is collective over
   // MPI_COMM_WORLD. With more than one partition per rank that is (a) not the global
   // mean and (b) a deadlock risk, because DefaultNumPartitions() =
   // ceil(nblocks/pack_size) can differ between ranks under AMR load balancing, so
   // ranks would enter the collective a different number of times. Guard until the
   // mean is hoisted into a single-region task (cf. the AGN-triggering pattern in
   // hydro_driver.cpp, which uses tc.AddRegion(1) for exactly this reason).
+  // Both pack_size and packs_per_rank default to one partition per rank, so this
+  // cannot fire unless the user sets one of them; with pack_size set it is checked
+  // every call, since ceil(nblocks/pack_size) can cross 1 as AMR adds blocks.
   Real grav_mean_rho = 0.0;
   if (use_swindle) {
     PARTHENON_REQUIRE(
         pm->DefaultNumPartitions() == 1,
         "The Jeans swindle currently requires a single MeshData partition per rank; "
-        "unset parthenon/mesh/pack_size (or num_partitions), or disable the swindle.");
+        "unset parthenon/mesh/pack_size and parthenon/mesh/packs_per_rank (both default "
+        "to a single partition), or disable the swindle.");
     Real total_mass = 0.0, total_volume = 0.0;
     parthenon::par_reduce(
         parthenon::loop_pattern_mdrange_tag, "SG::TotalMass", parthenon::DevExecSpace(),
