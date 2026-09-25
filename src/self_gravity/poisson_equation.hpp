@@ -124,7 +124,7 @@ class PoissonEquation {
   // the matching negative diagonal). Combined with rhs = +4piG*(rho - rho_mean),
   // the system  A.phi = rhs  solves  grad^2(phi) = 4piG*rho, i.e. the standard
   // Poisson equation (phi < 0 in potential wells). Acceleration = -grad(phi) in
-  // ApplyGravitySource is then correct (pulls toward overdensities).
+  // the momentum and energy sources is then correct (pulls toward overdensities).
   static parthenon::TaskStatus
   CalculateFluxes(std::shared_ptr<parthenon::MeshData<Real>> &md_mat,
                   std::shared_ptr<parthenon::MeshData<Real>> &md) {

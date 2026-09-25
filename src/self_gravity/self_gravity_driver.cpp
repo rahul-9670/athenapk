@@ -55,10 +55,7 @@ void AddSolvePoissonTasks(TaskCollection &tc, Mesh *pmesh) {
     auto &md_phi = pmesh->mesh_data.Add("phi", md, {grav::phi::name()});
     auto &md_rhs = pmesh->mesh_data.Add("rhs", md, {grav::phi::name()});
 
-    // Assemble rhs = 4 pi G (rho - rho_mean) from the current density. This is an
-    // explicit task rather than a FillDerived callback so that its ordering relative to
-    // Hydro's ConsToPrim is fixed by the task graph instead of by the hash order of
-    // Packages::AllPackages().
+    // rhs = 4 pi G (rho - rho_mean) from the current conserved density.
     auto fill_rhs = tl.AddTask(none, FillPoissonRHS, md.get());
 
     // The solver expects both "phi" container and "rhs" container to hold
@@ -76,14 +73,72 @@ void AddSolvePoissonTasks(TaskCollection &tc, Mesh *pmesh) {
     auto setup = psolver->AddSetupTasks(tl, copy_rhs, i, pmesh);
     auto solve = psolver->AddTasks(tl, setup, i, pmesh);
 
-    // Communicate phi ghost cells after solve (so ApplyGravitySource sees full halo).
+    // Communicate phi ghost cells after the solve: the source kernels read phi at i +- 1.
     auto bcs = parthenon::AddBoundaryExchangeTasks(solve, tl, md_phi, pmesh->multilevel);
 
-    // Copy solution from md_phi's grav::phi slot back into md (the base container)
-    // so downstream tasks (ApplyGravitySource) and outputs can find it.
-    tl.AddTask(bcs,
-               TF(parthenon::solvers::utils::CopyData<parthenon::TypeList<grav::phi>>),
-               md_phi, md);
+    // Copy the solution from md_phi back into md (the base container), where the energy
+    // source and the outputs read it, and keep a copy in grav.phi_prev for the next
+    // stage's momentum source. Both copies include the ghosts.
+    auto copy_back = tl.AddTask(
+        bcs, TF(parthenon::solvers::utils::CopyData<parthenon::TypeList<grav::phi>>),
+        md_phi, md);
+    tl.AddTask(copy_back,
+               TF(parthenon::solvers::utils::between_fields::CopyData<grav::phi,
+                                                                      grav::phi_prev>),
+               md);
+  }
+}
+
+void AddStepStartTasks(TaskCollection &tc, Mesh *pmesh, const int ncycle) {
+  using namespace parthenon;
+  TaskID none(0);
+  auto pkg = pmesh->packages.Get("self_gravity");
+
+  // grav.phi_prev normally still holds the potential of the last stage's density, i.e.
+  // of this step's start-of-step density, and a restart file carries it over. It has to
+  // be solved for on a fresh start (nothing has set it yet) and after the mesh changed,
+  // since new blocks only hold interpolated values. Mesh::modified is true at
+  // construction, so it is ignored on the first step of a process -- which is exactly the
+  // restart case, where the stored potential is valid.
+  const bool first_step_of_process = !pkg->Param<bool>("stepped");
+  const bool fresh_start = (ncycle == 0);
+  if (fresh_start || (!first_step_of_process && pmesh->modified)) {
+    AddSolvePoissonTasks(tc, pmesh);
+  }
+  if (first_step_of_process) pkg->UpdateParam("stepped", true);
+
+  // g^(0): the energy source of every stage of this step needs it.
+  const int num_partitions = pmesh->DefaultNumPartitions();
+  TaskRegion &region = tc.AddRegion(num_partitions);
+  for (int i = 0; i < num_partitions; ++i) {
+    auto &md = pmesh->mesh_data.GetOrAdd("base", i);
+    region[i].AddTask(
+        none, TF(solvers::utils::between_fields::CopyData<grav::phi_prev, grav::phi0>),
+        md);
+  }
+}
+
+void AddStageTasks(TaskCollection &tc, Mesh *pmesh, const Real beta_dt) {
+  using namespace parthenon;
+  TaskID none(0);
+  const int num_partitions = pmesh->DefaultNumPartitions();
+
+  // 1. Momentum source from the start-of-stage density and potential. It must run before
+  //    step 2, which overwrites grav.phi_prev.
+  TaskRegion &momentum_region = tc.AddRegion(num_partitions);
+  for (int i = 0; i < num_partitions; ++i) {
+    auto &md = pmesh->mesh_data.GetOrAdd("base", i);
+    momentum_region[i].AddTask(none, ApplyGravityMomentum, md.get(), beta_dt);
+  }
+
+  // 2. Potential of the updated density.
+  AddSolvePoissonTasks(tc, pmesh);
+
+  // 3. Energy source from the stage's mass fluxes and the step-averaged potential.
+  TaskRegion &energy_region = tc.AddRegion(num_partitions);
+  for (int i = 0; i < num_partitions; ++i) {
+    auto &md = pmesh->mesh_data.GetOrAdd("base", i);
+    energy_region[i].AddTask(none, ApplyGravityEnergy, md.get(), beta_dt);
   }
 }
 

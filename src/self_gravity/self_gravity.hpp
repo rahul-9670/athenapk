@@ -33,28 +33,48 @@ namespace SelfGravity {
   }
 
 namespace grav {
-SG_VARIABLE(grav, phi);
-SG_VARIABLE(grav, rhs);
+SG_VARIABLE(grav, phi);      // solver variable; holds the latest solve
+SG_VARIABLE(grav, rhs);      // 4 pi G (rho - rho_mean)
+SG_VARIABLE(grav, phi_prev); // potential of the start-of-stage density
+SG_VARIABLE(grav, phi0);     // potential of the start-of-step density
 } // namespace grav
 
 // Package registration, called from Hydro::ProcessPackages.
 std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin);
 
-// Assembles rhs = 4piG * (rho - rho_mean) on every cell including ghosts (ghosts so
-// the solver's boundary logic sees the right values). Submitted as the first task of
-// AddSolvePoissonTasks rather than via FillDerived, so that its position relative to
-// Hydro's ConsToPrim is fixed by the task graph rather than by package hash order: it
-// therefore always sees the start-of-stage primitives, as an unsplit source should.
+// The coupling follows Mullen, Hanawa & Gammie (2021, ApJS 252, 30), their VL2 algorithm
+// (Sect. 3.1). Within every integrator stage l, after the hydro update:
+//   1. momentum += beta dt rho^(l-1) g^(l-1)      (start-of-stage density and gravity)
+//   2. solve for phi^(l) from the updated density rho^(l)
+//   3. energy   += beta dt F_rho . (g^(0) + g^(l)) / 2
+// Step 3 is exactly the divergence of a gravitational energy flux, so total energy
+// (kinetic + thermal + magnetic + gravitational) is conserved to round-off whenever the
+// last stage restarts from the start-of-step state (vl2, rk1). phi^(l-1) and phi^(0) are
+// kept in grav.phi_prev and grav.phi0, which -- unlike grav.phi -- are neither
+// Independent nor carry fluxes, so the hydro and super-time-stepping updates, which
+// select variables by those flags, never touch them.
+
+// Before the first stage of a step: ensure grav.phi_prev is the potential of the
+// start-of-step density (solving for it on a fresh start and after the mesh changed)
+// and copy it into grav.phi0.
+void AddStepStartTasks(TaskCollection &tc, Mesh *pmesh, const int ncycle);
+
+// Steps 1-3 above, after the stage's hydro update and boundary exchange.
+void AddStageTasks(TaskCollection &tc, Mesh *pmesh, const Real beta_dt);
+
+// Solve for grav.phi from the current conserved density and copy it into grav.phi_prev.
+void AddSolvePoissonTasks(TaskCollection &tc, Mesh *pmesh);
+
+// rhs = 4 pi G (rho - rho_mean) on every cell including ghosts, from the conserved
+// density. An explicit task rather than a FillDerived callback, so its ordering is fixed
+// by the task graph and not by the hash order of the package dictionary.
 TaskStatus FillPoissonRHS(MeshData<Real> *md);
 
-// Apply gravitational acceleration to momentum and energy using phi.
-// Flux-weighted energy update (Artemis style) for better AMR energy conservation.
-TaskStatus ApplyGravitySource(MeshData<Real> *md, const parthenon::SimTime &tm,
-                              const Real beta_dt);
+// Step 1: momentum source from grav.phi_prev and the start-of-stage density ("prim").
+TaskStatus ApplyGravityMomentum(MeshData<Real> *md, const Real beta_dt);
 
-// Build and submit the Poisson solve into the task collection. Called from
-// HydroDriver::MakeTaskCollection once per integrator stage.
-void AddSolvePoissonTasks(TaskCollection &tc, Mesh *pmesh);
+// Step 3: energy source from the stage's mass fluxes and (grav.phi0 + grav.phi) / 2.
+TaskStatus ApplyGravityEnergy(MeshData<Real> *md, const Real beta_dt);
 
 } // namespace SelfGravity
 

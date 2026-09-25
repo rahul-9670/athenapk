@@ -13,16 +13,25 @@ Parthenon's geometric-multigrid (GMG) infrastructure.
 
 - The potential `grav.phi` and the right-hand side `grav.rhs` $= 4\pi G(\rho-\bar\rho)$
   are cell-centered fields registered by the `self_gravity` package. Both are written
-  to output (`hdf5` as well as OpenPMD) when listed in a `variables` line.
+  to output (`hdf5` as well as OpenPMD) when listed in a `variables` line. Two internal
+  copies of the potential, `grav.phi_prev` (start of stage) and `grav.phi0` (start of
+  step), carry it across the hydro update; `grav.phi_prev` is also written to restart
+  files.
 - The Poisson equation is solved with a **BiCGSTAB Krylov solver preconditioned by
   geometric multigrid** (`parthenon::solvers::BiCGSTABSolver` +
   `MGSolver`), which converges robustly on the block-AMR hierarchy.
-- The solve is **stage-consistent**: the Poisson equation is solved once per integrator
-  stage from that stage's density, and the Artemis-style flux-weighted gravitational
-  source term (`ApplyGravitySource`) carries the stage's $\beta\,\Delta t$ weight, exactly
-  like the hydro flux update and the other unsplit sources. Both the predictor and the
-  corrector of the VL2 integrator therefore feel gravity. The cost is one extra elliptic
-  solve per step.
+- The coupling is **stage-consistent** and follows the VL2 algorithm of Mullen, Hanawa &
+  Gammie (2021, their Sect. 3.1). In every integrator stage, after the hydro update and
+  with the stage's $\beta\,\Delta t$ weight:
+  1. momentum $\mathrel{+}= \beta\Delta t\,\rho^{(\ell-1)} g^{(\ell-1)}$, from the
+     start-of-stage density and potential;
+  2. the Poisson equation is solved for $\phi^{(\ell)}$ from the updated density;
+  3. energy $\mathrel{+}= \beta\Delta t\,F_\rho\cdot\tfrac{1}{2}(g^{(0)}+g^{(\ell)})$, from
+     the stage's mass fluxes and the average of the start-of-step and new gravity.
+
+  Both the predictor and the corrector of the VL2 integrator therefore feel gravity. The
+  cost is one elliptic solve per stage, plus one at the start of a fresh run and one
+  after every change of the mesh (new blocks only hold interpolated potentials).
 - **Second-order accuracy.** The momentum source is the one derived by
   [Mullen, Hanawa & Gammie (2021)](https://doi.org/10.3847/1538-4365/abcfbd), their
   Equations (43)-(45) applied per stage as their (63) and (67): the start-of-stage
@@ -46,16 +55,24 @@ Parthenon's geometric-multigrid (GMG) infrastructure.
   | 256 | 2.289e-11  | 2.13  | 3.306e-11 | 2.00  |
   | 512 | 5.421e-12  | 2.08  | 8.233e-12 | 2.01  |
 
-- **Known deviation from the reference scheme.** Mullen et al.'s energy source (their
-  Equations 57, 64 and 68) dots the mass flux with the *time-averaged* gravity
-  $\tfrac{1}{2}(g^{(0)}+g^{(\ell)})$, which makes the source exactly the divergence of a
-  gravitational energy flux and conserves total energy to round-off. Like Athena++, which
-  documents the same limitation in its own `src/hydro/srcterms/self_gravity.cpp`, this
-  port uses the instantaneous start-of-stage gravity instead, so energy is not conserved to
-  round-off. The effect is small — on the unstable Jeans mode, removing the energy source
-  altogether shifts the final modal amplitude by 2.1e-9 out of 3.06e-3 — but implementing
-  the conservative form would need the potential of the *end*-of-stage density and a
-  stored $\phi^{(0)}$, i.e. a reordering of the solve.
+- **Energy conservation.** Step 3 above is exactly the divergence of a gravitational
+  energy flux (Mullen et al. 2021, their Eqs. 57, 64 and 68), so the total energy
+  $E_{\rm kin}+E_{\rm th}+E_{\rm mag}+\tfrac{1}{2}\int(\rho-\bar\rho)\phi\,dV$ is conserved to
+  round-off whenever the Poisson solve is. Measured on their Sect. 4.2.2 problem (the
+  unstable Jeans mode of the regression test, $A=10^{-3}$, run to $t=8$ where the density
+  contrast is 1.5, gravitational energy from an exact FFT solve of the same discrete
+  operator): the change of total energy relative to the gravitational energy released is
+  $\le 1.3\times10^{-9}$ at all times and $1.1\times10^{-14}$ at $t=8$ (absolute changes
+  $\le 7\times10^{-21}$ on a total of $9.4\times10^{-6}$), against a steady
+  $2$-$2.5\times10^{-4}$ for the previous, instantaneous-gravity energy source.
+
+  Two conditions apply. The energy is exact only if the last integrator stage restarts
+  from the start-of-step state, which holds for `vl2` (the default) and `rk1`; with `rk2`
+  and `rk3` the scheme stays second-order accurate but is not exactly conservative. And
+  the Poisson solve has to reach its tolerance: set `absolute_residual_tolerance` above
+  the round-off floor of the residual (about $10^{-13}$ relative to the right-hand side
+  in double precision). A BiCGSTAB solve asked for less keeps iterating on round-off and
+  can return a corrupted potential when it hits `max_iterations`.
 - The source term writes interior cells only and runs after the stage's boundary
   exchange (the solve is global, so it cannot sit inside the stage task list), so the
   ghost zones are re-communicated before `FillDerived`. Without that, the next stage's

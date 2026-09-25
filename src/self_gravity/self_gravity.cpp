@@ -186,6 +186,27 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
                             parthenon::refinement_ops::RestrictAverage>();
     pkg->AddField<grav::rhs>(m);
   }
+  // phi_prev / phi0: copies of the potential that must survive the hydro update of the
+  // next stage (see the note in self_gravity.hpp). OneCopy and without fluxes, so they
+  // are selected by neither the flux-divergence update nor the RKL2 super-time-stepping,
+  // and ghosts/AMR ops so they are valid wherever the kernels read them. phi_prev carries
+  // the potential from one step to the next, so it is also written to restart files.
+  {
+    Metadata m({Metadata::Cell, Metadata::Derived, Metadata::OneCopy, Metadata::FillGhost,
+                Metadata::Restart});
+    m.RegisterRefinementOps<parthenon::refinement_ops::ProlongatePiecewiseConstant,
+                            parthenon::refinement_ops::RestrictAverage>();
+    pkg->AddField<grav::phi_prev>(m);
+  }
+  {
+    Metadata m(
+        {Metadata::Cell, Metadata::Derived, Metadata::OneCopy, Metadata::FillGhost});
+    m.RegisterRefinementOps<parthenon::refinement_ops::ProlongatePiecewiseConstant,
+                            parthenon::refinement_ops::RestrictAverage>();
+    pkg->AddField<grav::phi0>(m);
+  }
+  // Whether this process has taken a step yet; see AddStepStartTasks.
+  pkg->AddParam<bool>("stepped", false, Params::Mutability::Mutable);
 
   // NOTE: the Poisson RHS is deliberately NOT assembled from FillDerived. It was, and
   // that made the result depend on package iteration order: Update::FillDerived loops
@@ -232,7 +253,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   return pkg;
 }
 
-// FillPoissonRHS: assemble rhs = 4 pi G (rho - rho_mean) from gas density.
+// FillPoissonRHS: assemble rhs = 4 pi G (rho - rho_mean) from the conserved density.
 // Runs over ENTIRE (including ghosts) so solver sees consistent ghost values.
 TaskStatus FillPoissonRHS(MeshData<Real> *md) {
   auto pm = md->GetParentPointer();
@@ -240,16 +261,12 @@ TaskStatus FillPoissonRHS(MeshData<Real> *md) {
   const bool use_swindle = grav_pkg->Param<bool>("use_swindle");
   const Real four_pi_G = grav_pkg->Param<Real>("four_pi_G");
 
-  // Read the density from "prim", which is AthenaPK's unsplit-source convention (see the
-  // note on AddUnsplitSources): at the point this task runs, ConsToPrim last ran in the
-  // previous stage's FillDerived, so "prim" holds the state at the START of this stage --
-  // the same state the flux divergence and the other unsplit sources are evaluated at.
-  // This is what Mullen, Hanawa & Gammie (2021) require of the momentum source (their
-  // Eqs. 43-45, 63 and 67): the start-of-stage density with the gravity of that same
-  // density, which together with one Poisson solve per integrator stage is second-order
-  // accurate. Evaluating the source from the already-updated "cons" instead measurably
-  // degrades the solution (a factor of ~30 in error at fixed CFL).
-  const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
+  // Read the density from "cons". This solve runs after the stage's hydro update and
+  // before FillDerived, so "cons" holds the end-of-stage density rho^(l) the algorithm
+  // needs, while "prim" still holds the start-of-stage state. (At the start of a step the
+  // two agree: ConsToPrim writes any floors back into "cons".) The cons ghosts are valid
+  // because the stage's boundary exchange has already run.
+  const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
   auto &resolved = pm->resolved_packages;
   auto desc_rhs = parthenon::MakePackDescriptor<grav::rhs>(resolved.get());
   auto rhs_pack = desc_rhs.GetPack(md);
@@ -287,10 +304,10 @@ TaskStatus FillPoissonRHS(MeshData<Real> *md) {
         0, nblocks - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
         KOKKOS_LAMBDA(const int b, const int k, const int j, const int i, Real &lmass,
                       Real &lvol) {
-          const auto &coords = prim_pack.GetCoords(b);
+          const auto &coords = cons_pack.GetCoords(b);
           const Real vv = coords.CellVolume(k, j, i);
           lvol += vv;
-          lmass += prim_pack(b, IDN, k, j, i) * vv;
+          lmass += cons_pack(b, IDN, k, j, i) * vv;
         },
         Kokkos::Sum<Real>(total_mass), Kokkos::Sum<Real>(total_volume));
     Kokkos::fence();
@@ -309,97 +326,116 @@ TaskStatus FillPoissonRHS(MeshData<Real> *md) {
       DEFAULT_LOOP_PATTERN, "SG::SetRHS", parthenon::DevExecSpace(), 0, nblocks - 1,
       kbe.s, kbe.e, jbe.s, jbe.e, ibe.s, ibe.e,
       KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
-        const Real rho = prim_pack(b, IDN, k, j, i);
+        const Real rho = cons_pack(b, IDN, k, j, i);
         rhs_pack(b, te, grav::rhs(), k, j, i) = four_pi_G * (rho - grav_mean_rho);
       });
   return TaskStatus::complete;
 }
 
-// ApplyGravitySource: momentum += rho * g * dt, energy += flux-weighted work.
-// Flux-weighted energy (Artemis style) uses the hydro mass flux across each face
-// to compute gravitational work. Requires hydro fluxes still be in memory.
-TaskStatus ApplyGravitySource(MeshData<Real> *md, const parthenon::SimTime &tm,
-                              const Real beta_dt) {
+// ApplyGravityMomentum: momentum += beta dt rho^(l-1) g^(l-1) (Mullen et al. 2021, their
+// Eqs. 43-45 applied as in 63 and 67). Both factors are start-of-stage quantities: rho
+// from "prim", which this stage's FillDerived has not yet updated, and g from
+// grav.phi_prev. The face gravity g_{i+1/2} = -(phi_{i+1} - phi_i)/dx is averaged to the
+// cell centre.
+TaskStatus ApplyGravityMomentum(MeshData<Real> *md, const Real beta_dt) {
   auto pm = md->GetParentPointer();
-
-  // Pack hydro cons + prim + phi, and cons-with-fluxes for mass flux access. As for every
-  // other unsplit source, the source is evaluated from "prim" (the state at the start of
-  // this stage) and added into "cons" (already updated from this stage's fluxes).
-  const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
   const auto &prim_pack = md->PackVariables(std::vector<std::string>{"prim"});
-  auto &resolved = pm->resolved_packages;
-  auto desc_phi = parthenon::MakePackDescriptor<grav::phi>(resolved.get());
+  const auto &cons_pack = md->PackVariables(std::vector<std::string>{"cons"});
+  auto desc_phi =
+      parthenon::MakePackDescriptor<grav::phi_prev>(pm->resolved_packages.get());
   auto phi_pack = desc_phi.GetPack(md);
-
-  // Mass flux: pack the "cons" variable AND its fluxes BY NAME (density flux =
-  // component IDN). Packing by name rather than the {Independent} metadata flag
-  // is required here: grav::phi is also Independent + WithFluxes, so selecting by
-  // flag would pull phi into the pack and make the flat IDN index point at phi's
-  // flux instead of the gas mass flux whenever phi sorts ahead of cons.
-  auto cons_flx_pack = md->PackVariablesAndFluxes(std::vector<std::string>{"cons"},
-                                                  std::vector<std::string>{"cons"});
 
   IndexRange ib = md->GetBoundsI(IndexDomain::interior);
   IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
   IndexRange kb = md->GetBoundsK(IndexDomain::interior);
-  const int nblocks = md->NumBlocks();
   const int ndim = pm->ndim;
-  const bool multi_d = (ndim > 1);
-  const bool three_d = (ndim > 2);
 
   parthenon::par_for(
-      DEFAULT_LOOP_PATTERN, "SG::ApplyGravity", parthenon::DevExecSpace(), 0, nblocks - 1,
-      kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+      DEFAULT_LOOP_PATTERN, "SG::ApplyGravityMomentum", parthenon::DevExecSpace(), 0,
+      md->NumBlocks() - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
       KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
         auto &cons = cons_pack(b);
-        auto &cons_flx = cons_flx_pack(b);
-        const auto &prim = prim_pack(b);
+        const Real rho = prim_pack(b, IDN, k, j, i);
         const auto &coords = cons_pack.GetCoords(b);
-
-        const Real dx1 = coords.Dxc<1>(k, j, i);
-        const Real dx2 = multi_d ? coords.Dxc<2>(k, j, i) : 1.0;
-        const Real dx3 = three_d ? coords.Dxc<3>(k, j, i) : 1.0;
-
-        const Real hdtodx1 = 0.5 * beta_dt / dx1;
-        const Real hdtodx2 = multi_d ? 0.5 * beta_dt / dx2 : 0.0;
-        const Real hdtodx3 = three_d ? 0.5 * beta_dt / dx3 : 0.0;
-
-        // phi differences (Artemis convention: dpl = -(phi_c - phi_{c-1}))
-        const Real phic = phi_pack(b, te, grav::phi(), k, j, i);
-        const Real dpl1 = -(phic - phi_pack(b, te, grav::phi(), k, j, i - 1));
-        const Real dpr1 = -(phi_pack(b, te, grav::phi(), k, j, i + 1) - phic);
-        const Real dpl2 =
-            multi_d ? -(phic - phi_pack(b, te, grav::phi(), k, j - 1, i)) : 0.0;
-        const Real dpr2 =
-            multi_d ? -(phi_pack(b, te, grav::phi(), k, j + 1, i) - phic) : 0.0;
-        const Real dpl3 =
-            three_d ? -(phic - phi_pack(b, te, grav::phi(), k - 1, j, i)) : 0.0;
-        const Real dpr3 =
-            three_d ? -(phi_pack(b, te, grav::phi(), k + 1, j, i) - phic) : 0.0;
-
-        // Momentum update: rho * g * dt, centered difference of phi.
-        const Real rho = prim(IDN, k, j, i);
-        cons(IM1, k, j, i) += rho * hdtodx1 * (dpl1 + dpr1);
-        if (multi_d) cons(IM2, k, j, i) += rho * hdtodx2 * (dpl2 + dpr2);
-        if (three_d) cons(IM3, k, j, i) += rho * hdtodx3 * (dpl3 + dpr3);
-
-        // Energy update: flux-weighted work.
-        // mass_flux(face) = cons.flux(IVn, IDN, k, j, i).
-        // Work done by gravity = sum over faces of (mass_flux * dphi/face) * (0.5 dt /
-        // dx).
-        Real de = hdtodx1 * (cons_flx.flux(X1DIR, IDN, k, j, i) * dpl1 +
-                             cons_flx.flux(X1DIR, IDN, k, j, i + 1) * dpr1);
-        if (multi_d) {
-          de += hdtodx2 * (cons_flx.flux(X2DIR, IDN, k, j, i) * dpl2 +
-                           cons_flx.flux(X2DIR, IDN, k, j + 1, i) * dpr2);
+        // rho * (g_{i-1/2} + g_{i+1/2}) / 2 * beta dt, per direction
+        cons(IM1, k, j, i) -= 0.5 * beta_dt * rho *
+                              (phi_pack(b, te, grav::phi_prev(), k, j, i + 1) -
+                               phi_pack(b, te, grav::phi_prev(), k, j, i - 1)) /
+                              coords.Dxc<1>(k, j, i);
+        if (ndim > 1) {
+          cons(IM2, k, j, i) -= 0.5 * beta_dt * rho *
+                                (phi_pack(b, te, grav::phi_prev(), k, j + 1, i) -
+                                 phi_pack(b, te, grav::phi_prev(), k, j - 1, i)) /
+                                coords.Dxc<2>(k, j, i);
         }
-        if (three_d) {
-          de += hdtodx3 * (cons_flx.flux(X3DIR, IDN, k, j, i) * dpl3 +
-                           cons_flx.flux(X3DIR, IDN, k + 1, j, i) * dpr3);
+        if (ndim > 2) {
+          cons(IM3, k, j, i) -= 0.5 * beta_dt * rho *
+                                (phi_pack(b, te, grav::phi_prev(), k + 1, j, i) -
+                                 phi_pack(b, te, grav::phi_prev(), k - 1, j, i)) /
+                                coords.Dxc<3>(k, j, i);
         }
-        cons(IEN, k, j, i) += de;
       });
+  return TaskStatus::complete;
+}
 
+// (phi^(l) + phi^(0)) / 2 at cell (k, j, i) of block b
+template <class Pack>
+KOKKOS_FORCEINLINE_FUNCTION Real PhiAvg(const Pack &p, const int b, const int k,
+                                        const int j, const int i) {
+  return 0.5 * (p(b, te, grav::phi(), k, j, i) + p(b, te, grav::phi0(), k, j, i));
+}
+
+// ApplyGravityEnergy: energy += beta dt sum_faces F_rho . g_avg (Mullen et al. 2021,
+// their Eqs. 57, 63-64 and 67-68), with g_avg the face gravity of
+// phi_avg = (phi^(0) + phi^(l)) / 2 and F_rho the stage's mass flux as used by the
+// continuity equation (so the flux-corrected one at fine-coarse faces). Because this is
+// exactly minus the change of the gravitational energy 1/2 int (rho - rho_mean) phi dV,
+// total energy is conserved to round-off (given a round-off accurate Poisson solve).
+TaskStatus ApplyGravityEnergy(MeshData<Real> *md, const Real beta_dt) {
+  auto pm = md->GetParentPointer();
+  // "cons" together with its fluxes: the arguments are (variables to pack, variables
+  // whose fluxes to pack). Packed by name rather than by the Independent flag, which
+  // grav::phi also carries and which could shift the IDN index.
+  const auto &cons_pack = md->PackVariablesAndFluxes(std::vector<std::string>{"cons"},
+                                                     std::vector<std::string>{"cons"});
+  auto desc_phi =
+      parthenon::MakePackDescriptor<grav::phi, grav::phi0>(pm->resolved_packages.get());
+  auto phi_pack = desc_phi.GetPack(md);
+
+  IndexRange ib = md->GetBoundsI(IndexDomain::interior);
+  IndexRange jb = md->GetBoundsJ(IndexDomain::interior);
+  IndexRange kb = md->GetBoundsK(IndexDomain::interior);
+  const int ndim = pm->ndim;
+
+  parthenon::par_for(
+      DEFAULT_LOOP_PATTERN, "SG::ApplyGravityEnergy", parthenon::DevExecSpace(), 0,
+      md->NumBlocks() - 1, kb.s, kb.e, jb.s, jb.e, ib.s, ib.e,
+      KOKKOS_LAMBDA(const int b, const int k, const int j, const int i) {
+        auto &cons = cons_pack(b);
+        const auto &coords = cons_pack.GetCoords(b);
+        const Real pc = PhiAvg(phi_pack, b, k, j, i);
+        // per direction: (F_{i-1/2} g_{i-1/2} + F_{i+1/2} g_{i+1/2}) / 2, times dt
+        Real de =
+            (cons.flux(X1DIR, IDN, k, j, i) * (PhiAvg(phi_pack, b, k, j, i - 1) - pc) +
+             cons.flux(X1DIR, IDN, k, j, i + 1) *
+                 (pc - PhiAvg(phi_pack, b, k, j, i + 1))) /
+            coords.Dxc<1>(k, j, i);
+        if (ndim > 1) {
+          de +=
+              (cons.flux(X2DIR, IDN, k, j, i) * (PhiAvg(phi_pack, b, k, j - 1, i) - pc) +
+               cons.flux(X2DIR, IDN, k, j + 1, i) *
+                   (pc - PhiAvg(phi_pack, b, k, j + 1, i))) /
+              coords.Dxc<2>(k, j, i);
+        }
+        if (ndim > 2) {
+          de +=
+              (cons.flux(X3DIR, IDN, k, j, i) * (PhiAvg(phi_pack, b, k - 1, j, i) - pc) +
+               cons.flux(X3DIR, IDN, k + 1, j, i) *
+                   (pc - PhiAvg(phi_pack, b, k + 1, j, i))) /
+              coords.Dxc<3>(k, j, i);
+        }
+        cons(IEN, k, j, i) += 0.5 * beta_dt * de;
+      });
   return TaskStatus::complete;
 }
 
