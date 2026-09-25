@@ -46,23 +46,6 @@ Parthenon's geometric-multigrid (GMG) infrastructure.
   | 256 | 2.289e-11  | 2.13  | 3.306e-11 | 2.00  |
   | 512 | 5.421e-12  | 2.08  | 8.233e-12 | 2.01  |
 
-  A $\Delta t$-only refinement at *fixed* $\Delta x$ is **not** a valid way to measure
-  this, because the PLM slope limiter is not a smooth function of the state: which cells
-  it clips changes with $\Delta t$, so Richardson extrapolation over a CFL ladder does not
-  return a truncation-error order. Measured on the same 128-cell mesh, with successive
-  differences of the final modal amplitude over CFL = 0.1/0.05/0.025/0.0125:
-
-  | reconstruction | gravity | measured "order" |
-  |----------------|---------|------------------|
-  | donor cell     | off     | 1.96, 1.98 |
-  | PLM            | off     | 0.75, 0.88 |
-  | PLM            | on (stable mode)   | 0.79, 0.90 |
-  | PLM            | on (unstable mode) | 1.10, 1.06 |
-
-  With the limiter removed the ladder recovers the expected second order, and with the
-  limiter present it reads below 2 *whether or not gravity is enabled*. The artefact
-  therefore belongs to the diagnostic and to the base scheme, not to the gravity
-  coupling; the resolution ladder above is the meaningful measurement.
 - **Known deviation from the reference scheme.** Mullen et al.'s energy source (their
   Equations 57, 64 and 68) dots the mass flux with the *time-averaged* gravity
   $\tfrac{1}{2}(g^{(0)}+g^{(\ell)})$, which makes the source exactly the divergence of a
