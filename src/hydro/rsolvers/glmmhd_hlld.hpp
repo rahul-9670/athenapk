@@ -105,7 +105,14 @@ struct Riemann<Fluid::glmmhd, RiemannSolver::hlld> {
       ul.mx = wli[IV1] * ul.d;
       ul.my = wli[IV2] * ul.d;
       ul.mz = wli[IV3] * ul.d;
-      ul.e = wli[IPR] * igm1 + kel + pbl;
+      // The internal energy follows from the pressure via the EOS. The star state algebra
+      // below does not depend on the EOS, so this is the only place it enters (besides
+      // the signal speeds).
+      if (eos.UseTable()) {
+        ul.e = eos.GetEosTable().EintFromRhoPres(wli[IDN], wli[IPR]) + kel + pbl;
+      } else {
+        ul.e = wli[IPR] * igm1 + kel + pbl;
+      }
       ul.by = wli[IB2];
       ul.bz = wli[IB3];
 
@@ -113,7 +120,11 @@ struct Riemann<Fluid::glmmhd, RiemannSolver::hlld> {
       ur.mx = wri[IV1] * ur.d;
       ur.my = wri[IV2] * ur.d;
       ur.mz = wri[IV3] * ur.d;
-      ur.e = wri[IPR] * igm1 + ker + pbr;
+      if (eos.UseTable()) {
+        ur.e = eos.GetEosTable().EintFromRhoPres(wri[IDN], wri[IPR]) + ker + pbr;
+      } else {
+        ur.e = wri[IPR] * igm1 + ker + pbr;
+      }
       ur.by = wri[IB2];
       ur.bz = wri[IB3];
 

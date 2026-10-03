@@ -5,6 +5,7 @@
 //========================================================================================
 
 #include <algorithm>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -103,6 +104,35 @@ Real CalculateGlobalMinDx(MeshData<Real> *md) {
 // please separate concerns.
 void PreStepMeshUserWorkInLoop(Mesh *pmesh, ParameterInput *pin, SimTime &tm) {
   auto hydro_pkg = pmesh->packages.Get("Hydro");
+
+  // Report lookups outside the tabulated EOS (hydro/eos = hydrogen), which are clamped to
+  // the table edge, i.e., not interpolated. The counts cover the previous cycle.
+  if (hydro_pkg->Param<bool>("eos_table_clamp_report")) {
+    const auto &table = hydro_pkg->Param<AdiabaticGLMMHDEOS>("eos").GetEosTable();
+    constexpr int nctr = EOSTable::EosTable::kNClampCtr;
+    unsigned long long counts[nctr] = {0};
+    if (table.ReadAndResetClampCounts(counts)) {
+#ifdef MPI_PARALLEL
+      PARTHENON_MPI_CHECK(MPI_Allreduce(MPI_IN_PLACE, counts, nctr,
+                                        MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD));
+#endif
+      unsigned long long total = 0;
+      for (int q = 0; q < nctr; ++q) {
+        total += counts[q];
+      }
+      if (total > 0 && parthenon::Globals::my_rank == 0) {
+        Real lr_lo, lr_hi, le_lo, le_hi;
+        table.AxisRanges(lr_lo, lr_hi, le_lo, le_hi);
+        std::cout << "WARNING EOS table: " << total
+                  << " lookups outside the table were clamped to its edge in the "
+                     "previous cycle (log10 rho < "
+                  << lr_lo << ": " << counts[0] << ", log10 rho > " << lr_hi << ": "
+                  << counts[1] << ", log10 esp < " << le_lo << ": " << counts[2]
+                  << ", log10 esp > " << le_hi << ": " << counts[3]
+                  << "; code units). Consider a table that covers the run." << std::endl;
+      }
+    }
+  }
 
   // Calculate hyperbolic divergence cleaning speed
   // TODO(pgrete) Calculating mindx is only required after remeshing. Need to
@@ -496,9 +526,61 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
   }
 
   auto eos_str = pin->GetString("hydro", "eos");
-  if (eos_str == "adiabatic") {
+  if (eos_str == "adiabatic" || eos_str == "hydrogen") {
     Real gamma = pin->GetReal("hydro", "gamma");
     pkg->AddParam<>("AdiabaticIndex", gamma);
+
+    // Tabulated hydrogen/helium EOS (H2 dissociation, H and He ionization), see
+    // src/eos/eos_table.hpp and docs/eos.md. gamma is still read above, as problem
+    // generators use it to set up the initial internal energy.
+    const bool use_eos_table = (eos_str == "hydrogen");
+    EOSTable::EosTable eos_table;
+    if (use_eos_table) {
+      PARTHENON_REQUIRE_THROWS(fluid == Fluid::glmmhd,
+                               "hydro/eos = hydrogen is only implemented for "
+                               "hydro/fluid = glmmhd.");
+      PARTHENON_REQUIRE_THROWS(
+          riemann == RiemannSolver::hlld || riemann == RiemannSolver::none,
+          "hydro/eos = hydrogen requires hydro/riemann = hlld. The other MHD Riemann "
+          "solvers assume an ideal gas.");
+      PARTHENON_REQUIRE_THROWS(
+          !first_order_flux_correct,
+          "hydro/eos = hydrogen does not support first order flux correction, which uses "
+          "the LLF Riemann solver (ideal gas only).");
+      PARTHENON_REQUIRE_THROWS(
+          pin->GetOrAddString("diffusion", "conduction", "none") == "none" &&
+              pin->GetOrAddString("cooling", "enable_cooling", "none") == "none",
+          "hydro/eos = hydrogen cannot be combined with thermal conduction or tabular "
+          "cooling, which compute the temperature from the ideal gas law.");
+      PARTHENON_REQUIRE_THROWS(
+          pin->DoesParameterExist("units", "code_length_cgs") &&
+              pin->DoesParameterExist("units", "code_mass_cgs") &&
+              pin->DoesParameterExist("units", "code_time_cgs"),
+          "hydro/eos = hydrogen requires code units: set code_length_cgs, code_mass_cgs "
+          "and code_time_cgs in the <units> block.");
+      PARTHENON_REQUIRE_THROWS(
+          pin->DoesParameterExist("hydro", "eos_table_file"),
+          "hydro/eos = hydrogen requires hydro/eos_table_file. The table is not part of "
+          "the repository, generate it with src/eos/gen_eos_table.py (see docs/eos.md).");
+      const auto table_file = pin->GetString("hydro", "eos_table_file");
+      const auto units = pkg->Param<Units>("units");
+      eos_table.Load(table_file, units.code_density_cgs(),
+                     units.code_length_cgs() / units.code_time_cgs());
+      eos_table.n_bisect_ = pin->GetOrAddInteger("hydro", "eos_bisections", 20);
+      PARTHENON_REQUIRE_THROWS(eos_table.n_bisect_ >= 10 && eos_table.n_bisect_ <= 60,
+                               "hydro/eos_bisections must be in [10, 60].");
+      if (parthenon::Globals::my_rank == 0) {
+        Real lr_lo, lr_hi, le_lo, le_hi;
+        eos_table.AxisRanges(lr_lo, lr_hi, le_lo, le_hi);
+        std::cout << "Tabulated hydrogen EOS: " << table_file << ", " << eos_table.nr_
+                  << " x " << eos_table.ne_ << " (rho, esp) nodes, log10 rho in ["
+                  << lr_lo << ", " << lr_hi << "], log10 esp in [" << le_lo << ", "
+                  << le_hi << "] (code units)" << std::endl;
+      }
+    }
+    pkg->AddParam<>("eos_table_clamp_report",
+                    use_eos_table &&
+                        pin->GetOrAddBoolean("hydro", "eos_table_clamp_report", true));
 
     if (pin->DoesParameterExist("hydro", "He_mass_fraction") &&
         pkg->AllParams().hasKey("units")) {
@@ -521,6 +603,9 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
     Real Tfloor = pin->GetOrAddReal("hydro", "Tfloor", -1.0);
     Real efloor = Tfloor;
     if (efloor > 0.0) {
+      PARTHENON_REQUIRE_THROWS(!use_eos_table,
+                               "hydro/Tfloor assumes an ideal gas and is not supported "
+                               "with hydro/eos = hydrogen. Use hydro/pfloor instead.");
       if (!pkg->AllParams().hasKey("mbar_over_kb")) {
         PARTHENON_FAIL("Temperature floor requires units and gas composition. "
                        "Either set a 'units' block and the 'hydro/He_mass_fraction' in "
@@ -538,6 +623,9 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
         pin->GetOrAddReal("hydro", "Tceil", std::numeric_limits<Real>::infinity());
     Real eceil = Tceil;
     if (eceil < std::numeric_limits<Real>::infinity()) {
+      PARTHENON_REQUIRE_THROWS(!use_eos_table,
+                               "hydro/Tceil assumes an ideal gas and is not supported "
+                               "with hydro/eos = hydrogen.");
       if (!pkg->AllParams().hasKey("mbar_over_kb")) {
         PARTHENON_FAIL("Temperature ceiling requires units and gas composition. "
                        "Either set a 'units' block and the 'hydro/He_mass_fraction' in "
@@ -719,7 +807,7 @@ std::shared_ptr<StateDescriptor> Initialize(ParameterInput *pin) {
       pkg->FillDerivedMesh = ConsToPrim<AdiabaticHydroEOS>;
       pkg->EstimateTimestepMesh = EstimateTimestep<Fluid::euler>;
     } else if (fluid == Fluid::glmmhd) {
-      AdiabaticGLMMHDEOS eos(pfloor, dfloor, efloor, vceil, eceil, gamma);
+      AdiabaticGLMMHDEOS eos(pfloor, dfloor, efloor, vceil, eceil, gamma, eos_table);
       pkg->AddParam<>("eos", eos);
       pkg->FillDerivedMesh = ConsToPrim<AdiabaticGLMMHDEOS>;
       pkg->EstimateTimestepMesh = EstimateTimestep<Fluid::glmmhd>;

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <limits>
 
+#include "../eos/adiabatic_glmmhd.hpp"
 #include "../hydro/hydro.hpp"
 #include "../main.hpp"
 #include "refinement.hpp"
@@ -26,6 +27,8 @@ using parthenon::IndexRange;
 //   lambda_J = 2*pi * c_s / sqrt(rho)    (hydro)
 //   lambda_J = 2*pi * (c_s + v_A) / sqrt(rho)   (MHD, Athena++ convention)
 // where v_A = sqrt(B^2 / rho) is the Alfven speed (Heaviside-Lorentz, no 4 pi).
+// c_s is sqrt(gamma p / rho) for the ideal gas and the tabulated adiabatic sound speed
+// for hydro/eos = hydrogen.
 // four_pi_G is taken from the self_gravity package, so the criterion stays correct for
 // a normalization other than 4*pi*G = 1. Without self-gravity there is no Jeans length,
 // so the criterion requires the package to be enabled.
@@ -41,6 +44,11 @@ parthenon::AmrTag Jeans(MeshBlockData<Real> *rc) {
   const Real njeans = hydro_pkg->Param<Real>("refinement/njeans");
   const Real gam = pmb->packages.Get("Hydro")->Param<Real>("AdiabaticIndex");
   const bool mhd = (hydro_pkg->Param<Fluid>("fluid") == Fluid::glmmhd);
+  // With the tabulated EOS (MHD only) the sound speed comes from the table.
+  const bool use_table = mhd && hydro_pkg->Param<AdiabaticGLMMHDEOS>("eos").UseTable();
+  const auto eos_table = use_table
+                             ? hydro_pkg->Param<AdiabaticGLMMHDEOS>("eos").GetEosTable()
+                             : EOSTable::EosTable();
 
   // Cubic cells are the norm for collapse problems but are not required, so take the
   // LARGEST spacing: lambda_J/dx is then smallest, i.e. the criterion errs towards
@@ -73,7 +81,12 @@ parthenon::AmrTag Jeans(MeshBlockData<Real> *rc) {
       KOKKOS_LAMBDA(const int k, const int j, const int i, Real &lnjmin) {
         const Real rho = w(IDN, k, j, i);
         const Real p = w(IPR, k, j, i);
-        const Real cs = Kokkos::sqrt(gam * p / rho);
+        Real cs;
+        if (use_table) {
+          cs = Kokkos::sqrt(eos_table.AsqFromRhoPres(rho, p));
+        } else {
+          cs = Kokkos::sqrt(gam * p / rho);
+        }
         Real v = cs;
         if (mhd) {
           const Real bsq = w(IB1, k, j, i) * w(IB1, k, j, i) +

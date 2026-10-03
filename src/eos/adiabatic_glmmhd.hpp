@@ -15,24 +15,37 @@
 // Athena headers
 #include "../main.hpp"
 #include "eos.hpp"
+#include "eos_table.hpp"
 
 using parthenon::MeshBlock;
 using parthenon::MeshBlockData;
 using parthenon::MeshBlockVarPack;
 using parthenon::Real;
 
+// Ideal gas EOS (`hydro/eos = adiabatic`) or, if a loaded table is passed, the tabulated
+// hydrogen/helium EOS (`hydro/eos = hydrogen`, see eos_table.hpp). Without a table every
+// method below takes the ideal gas branch, which is unchanged from the plain adiabatic
+// EOS.
 class AdiabaticGLMMHDEOS : public EquationOfState {
  public:
   AdiabaticGLMMHDEOS(Real pressure_floor, Real density_floor, Real internal_e_floor,
-                     Real velocity_ceiling, Real internal_e_ceiling, Real gamma)
+                     Real velocity_ceiling, Real internal_e_ceiling, Real gamma,
+                     const EOSTable::EosTable &table = EOSTable::EosTable())
       : EquationOfState(pressure_floor, density_floor, internal_e_floor, velocity_ceiling,
                         internal_e_ceiling),
-        gamma_{gamma} {}
+        gamma_{gamma}, use_table_{table.loaded_}, table_{table} {}
 
   void ConservedToPrimitive(MeshData<Real> *md) const override;
 
   KOKKOS_INLINE_FUNCTION
   Real GetGamma() const { return gamma_; }
+
+  // True if the tabulated EOS is active (hydro/eos = hydrogen)
+  KOKKOS_INLINE_FUNCTION
+  bool UseTable() const { return use_table_; }
+
+  KOKKOS_INLINE_FUNCTION
+  const EOSTable::EosTable &GetEosTable() const { return table_; }
 
   //----------------------------------------------------------------------------------------
   // \!fn Real EquationOfState::SoundSpeed(Real prim[NHYDRO])
@@ -40,13 +53,22 @@ class AdiabaticGLMMHDEOS : public EquationOfState {
   // TODO(pgrete): need to fix idx defs
   KOKKOS_INLINE_FUNCTION
   Real SoundSpeed(const Real prim[NHYDRO]) const {
+    if (use_table_) {
+      return std::sqrt(table_.AsqFromRhoPres(prim[IDN], prim[IPR]));
+    }
     return std::sqrt(gamma_ * prim[IPR] / prim[IDN]);
   }
   // fast magnetosonic speed function for adiabatic EOS
   KOKKOS_INLINE_FUNCTION
   Real FastMagnetosonicSpeed(const Real d, const Real p, const Real bx, const Real by,
                              const Real bz) const {
-    Real asq = gamma_ * p;
+    // asq is rho * c_s^2, i.e., gamma * p for the ideal gas
+    Real asq;
+    if (use_table_) {
+      asq = d * table_.AsqFromRhoPres(d, p);
+    } else {
+      asq = gamma_ * p;
+    }
     Real ct2 = by * by + bz * bz;
     Real qsq = bx * bx + ct2 + asq;
     Real tmp = bx * bx + ct2 - asq;
@@ -112,7 +134,15 @@ class AdiabaticGLMMHDEOS : public EquationOfState {
 
     Real e_k = 0.5 * di * (SQR(u_m1) + SQR(u_m2) + SQR(u_m3));
     Real e_B = 0.5 * (SQR(u_b1) + SQR(u_b2) + SQR(u_b3));
-    w_p = gm1 * (u_e - e_k - e_B);
+    const Real e_int = u_e - e_k - e_B;
+    // The table is interpolated in log10(e_int / rho), so a non-positive e_int cannot be
+    // looked up. Use the ideal gas expression for it instead, which gives a non-positive
+    // pressure that is then caught by the check or the floors below.
+    if (use_table_ && e_int > 0.0) {
+      w_p = table_.PresFromRhoEint(u_d, e_int);
+    } else {
+      w_p = gm1 * e_int;
+    }
 
     // apply velocity ceiling. By default ceiling is std::numeric_limits<Real>::infinity()
     const Real w_v2 = SQR(w_vx) + SQR(w_vy) + SQR(w_vz);
@@ -140,9 +170,22 @@ class AdiabaticGLMMHDEOS : public EquationOfState {
     // Pressure floor (if present) takes precedence over temperature floor
     if ((pressure_floor_ > 0.0) && (w_p < pressure_floor_)) {
       // apply pressure floor, correct total energy
-      u_e = (pressure_floor_ / gm1) + e_k + e_B;
-      w_p = pressure_floor_;
+      if (use_table_) {
+        // Store the pressure of the energy that is actually set. The inversion is clamped
+        // to the table edge, so this can be larger than the floor value itself, and
+        // keeping prim consistent with cons makes a second conversion reproduce the
+        // first.
+        const Real e_fl = table_.EintFromRhoPres(u_d, pressure_floor_);
+        u_e = e_fl + e_k + e_B;
+        w_p = table_.PresFromRhoEint(u_d, e_fl);
+      } else {
+        u_e = (pressure_floor_ / gm1) + e_k + e_B;
+        w_p = pressure_floor_;
+      }
     }
+
+    // Note, the temperature floor and ceiling below assume an ideal gas. They are
+    // disabled when the tabulated EOS is used (see Hydro::Initialize).
 
     // temperature (internal energy) based pressure floor
     const Real eff_pressure_floor = gm1 * u_d * e_floor_;
@@ -167,7 +210,9 @@ class AdiabaticGLMMHDEOS : public EquationOfState {
   }
 
  private:
-  Real gamma_; // ratio of specific heats
+  Real gamma_;               // ratio of specific heats
+  bool use_table_;           // tabulated EOS active
+  EOSTable::EosTable table_; // table handles (empty for the ideal gas)
 };
 
 #endif // EOS_ADIABATIC_GLMMHD_HPP_
