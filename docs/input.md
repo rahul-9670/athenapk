@@ -9,6 +9,11 @@ Parameter: `fluid` (string)
 - `euler` for hydrodynamics
 - `glmmhd` for MHD using GLM based divergence cleaning
 
+Parameter: `eos` (string)
+- `adiabatic` for an ideal gas with adiabatic index `gamma` (parameter `gamma`, float)
+- `hydrogen` for a tabulated hydrogen/helium EOS (H2 dissociation, H and He ionization),
+MHD only, see [here](eos.md)
+
 ### Common options
 
 #### Riemann solvers

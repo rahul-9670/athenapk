@@ -14,6 +14,7 @@ The documentation currently includes
 - [Brief notes on developing code for AthenaPK](development.md)
 - [How to add a custom/user problem generator](user_pgen.md)
 - [Self-gravity (Poisson solver, Jeans & Bonnor-Ebert collapse)](self_gravity.md)
+- [Equation of state (ideal gas and tabulated hydrogen EOS)](eos.md)
 - [Units](units.md)
 - [Standard problem generators](standard_pgen.md)
 - Detailed descriptions of more complex problem generators
