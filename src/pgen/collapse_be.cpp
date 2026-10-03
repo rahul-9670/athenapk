@@ -80,6 +80,12 @@ void ProblemInitPackageData(ParameterInput *pin, parthenon::StateDescriptor *hyd
   PARTHENON_REQUIRE_THROWS(f > 0.0, "problem/collapse_be/f must be positive.");
   PARTHENON_REQUIRE_THROWS(rhocrit > 0.0,
                            "problem/collapse_be/rhocrit must be positive.");
+  // The barotropic source term sets the thermal energy from an ideal gas expression, so
+  // it cannot be combined with the tabulated EOS.
+  PARTHENON_REQUIRE_THROWS(
+      pin->GetString("hydro", "eos") == "adiabatic",
+      "problem/collapse_be imposes a barotropic EOS through its source "
+      "term and requires hydro/eos = adiabatic.");
 
   // Free-fall time of the central density f: t_ff = sqrt(3 pi / (32 G rho)) with
   // G = 1/(4 pi), i.e. t_ff = pi sqrt(3 / (8 f)).
