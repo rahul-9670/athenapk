@@ -1,0 +1,2 @@
+# EOS tables are generated with gen_eos_table.py (see docs/eos.md) and not tracked.
+eos_table*.bin
